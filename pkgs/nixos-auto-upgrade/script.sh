@@ -11,11 +11,27 @@ send_notification() {
     local message="$2"
     local urgency="$3"
 
-    local uid
-    uid=$(id -u "${SUDO_USER:-$USER}" 2>/dev/null || echo 1000)
+    local target_user="${SUDO_USER:-}"
+    if [ -z "$target_user" ]; then
+        while IFS=: read -r user _ uid _ _ _ _; do
+            if [ "$uid" -ge 1000 ] && [ "$uid" -lt 65534 ]; then
+                target_user="$user"
+                break
+            fi
+        done < /etc/passwd
+    fi
 
-    $SUDO -u "#$uid" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-        notify-send -u "$urgency" "$title" "$message" 2>/dev/null || true
+    if [ -z "${target_user:-}" ]; then
+        return
+    fi
+
+    local uid
+    uid=$(id -u "$target_user" 2>/dev/null || echo 1000)
+
+    if [ -S "/run/user/$uid/bus" ]; then
+        $SUDO -u "$target_user" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            notify-send -u "$urgency" "$title" "$message" 2>/dev/null || true
+    fi
 }
 
 cd "$FLAKE_DIR"
