@@ -30,5 +30,8 @@ jobs:
       - name: Build 'nixos-flake-update' package
         run: nix build .#nixos-flake-update
 
+      - name: Build 'nixos-auto-upgrade' package
+        run: nix build .#nixos-auto-upgrade
+
       - name: Check flake configuration
         run: nix flake check

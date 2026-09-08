@@ -4,8 +4,13 @@ Directory structure:
     ├── flake.lock
     ├── flake.nix
     ├── LICENSE
+    ├── modules/
+    │   └── auto-upgrade.nix
     ├── pkgs/
     │   ├── hello/
+    │   │   ├── default.nix
+    │   │   └── script.sh
+    │   ├── nixos-auto-upgrade/
     │   │   ├── default.nix
     │   │   └── script.sh
     │   ├── nixos-check-flake-update/
@@ -23,10 +28,11 @@ FILE: README.md
 ================================================
 # NixOS Flakes
 
-Voici une simple collection de scripts et d'utilitaires que j'ai developpé afin de simplifier la gestion de mon système NixOS sur Hyprland.
+Voici une simple collection de scripts et d'utilitaires que j'ai développé afin de simplifier la gestion de mon système NixOS sur Hyprland.
 
 ## Paquets disponibles
 
+- **`nixos-auto-upgrade`** : Met à jour automatiquement le flake et le système avec gestion des erreurs et restauration en cas d'échec.
 - **`nixos-flake-update`** : Met à jour le flake système (`/etc/nixos`) et applique la configuration via `nixos-rebuild`.
 - **`nixos-check-flake-update`** : Vérifie les mises à jour disponibles pour un flake et retourne un format JSON (idéal pour intégrer dans des barres d'état comme Waybar ou Polybar).
 - **`hello`** : Paquet d'exemple pour tester l'environnement.
@@ -42,8 +48,9 @@ nix run github:untypequicode/nixos-flakes#nixos-check-flake-update
 # Vérifier les mises à jour d'un dossier spécifique
 nix run github:untypequicode/nixos-flakes#nixos-check-flake-update -- /chemin/vers/mon/flake
 
-# Mettre à jour le système
+# Mettre à jour le système manuellement
 nix run github:untypequicode/nixos-flakes#nixos-flake-update
+
 ```
 
 ## Installation permanente via Flakes
@@ -61,15 +68,12 @@ Ajoutez le dépôt dans vos `inputs` et passez-le à votre système via `special
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
-    # 1. Ajout du dépôt
     untypequicode-flakes.url = "github:untypequicode/nixos-flakes";
   };
 
   outputs = { self, nixpkgs, untypequicode-flakes, ... }@inputs: {
     nixosConfigurations.mon-pc = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
-
-      # 2. On passe "inputs" pour pouvoir l'utiliser dans configuration.nix
       specialArgs = { inherit inputs; };
 
       modules = [
@@ -78,16 +82,24 @@ Ajoutez le dépôt dans vos `inputs` et passez-le à votre système via `special
     };
   };
 }
+
 ```
 
-### 2. Modifier votre `configuration.nix`
-
-Il ne reste plus qu'à appeler les paquets dans la liste `environment.systemPackages` :
+### 2. Activer les modules et installer les paquets dans `configuration.nix`
 
 ```nix
 { pkgs, inputs, ... }:
 
 {
+  imports = [
+    inputs.untypequicode-flakes.nixosModules.auto-upgrade
+  ];
+
+  services.nixos-auto-upgrade-custom = {
+    enable = true;
+    interval = "daily"; # Fréquence : "daily", "weekly", ou une heure précise (ex: "04:00")
+  };
+
   environment.systemPackages = with pkgs; [
     inputs.untypequicode-flakes.packages.${pkgs.system}.nixos-check-flake-update
     inputs.untypequicode-flakes.packages.${pkgs.system}.nixos-flake-update
@@ -96,7 +108,7 @@ Il ne reste plus qu'à appeler les paquets dans la liste `environment.systemPack
 
 ```
 
-Une fois ces modifications faites, appliquez-les avec un simple :
+Une fois ces modifications faites, appliquez-les avec :
 
 ```bash
 sudo nixos-rebuild switch --flake /etc/nixos
@@ -170,6 +182,7 @@ FILE: flake.nix
           hello = pkgs.callPackage ./pkgs/hello { };
           nixos-check-flake-update = pkgs.callPackage ./pkgs/nixos-check-flake-update { };
           nixos-flake-update = pkgs.callPackage ./pkgs/nixos-flake-update { };
+          nixos-auto-upgrade = pkgs.callPackage ./pkgs/nixos-auto-upgrade { };
 
           default = self.packages.${system}.hello;
         }
@@ -184,11 +197,18 @@ FILE: flake.nix
           type = "app";
           program = "${self.packages.${system}.nixos-flake-update}/bin/nixos-flake-update";
         };
+        nixos-auto-upgrade = {
+          type = "app";
+          program = "${self.packages.${system}.nixos-auto-upgrade}/bin/nixos-auto-upgrade";
+        };
         hello = {
           type = "app";
           program = "${self.packages.${system}.hello}/bin/hello";
         };
       });
+
+      nixosModules.auto-upgrade = import ./modules/auto-upgrade.nix;
+      nixosModules.default = self.nixosModules.auto-upgrade;
     };
 }
 
@@ -875,6 +895,58 @@ Public License instead of this License.  But first, please read
 
 
 ================================================
+FILE: modules/auto-upgrade.nix
+================================================
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+
+let
+  cfg = config.services.nixos-auto-upgrade-custom;
+  autoUpgradePkg = pkgs.callPackage ../pkgs/nixos-auto-upgrade { };
+in
+{
+  options.services.nixos-auto-upgrade-custom = {
+    enable = lib.mkEnableOption "Mise à jour automatique des flakes NixOS";
+
+    interval = lib.mkOption {
+      type = lib.types.str;
+      default = "daily";
+      description = "Fréquence d'exécution de la mise à jour automatique.";
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    environment.systemPackages = [ autoUpgradePkg ];
+
+    systemd.services.nixos-auto-upgrade-custom = {
+      description = "Mise à jour automatique du système NixOS via Flakes";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${autoUpgradePkg}/bin/nixos-auto-upgrade";
+      };
+    };
+
+    systemd.timers.nixos-auto-upgrade-custom = {
+      description = "Timer pour la mise à jour automatique NixOS";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.interval;
+        Persistent = true;
+      };
+    };
+  };
+}
+
+
+
+================================================
 FILE: pkgs/hello/default.nix
 ================================================
 {
@@ -899,6 +971,101 @@ writeShellApplication {
 FILE: pkgs/hello/script.sh
 ================================================
 echo "Hello World !"
+
+
+
+================================================
+FILE: pkgs/nixos-auto-upgrade/default.nix
+================================================
+{
+  lib,
+  writeShellApplication,
+  coreutils,
+  git,
+  nix,
+  nixos-rebuild,
+  libnotify,
+}:
+
+writeShellApplication {
+  name = "nixos-auto-upgrade";
+
+  runtimeInputs = [
+    coreutils
+    git
+    nix
+    nixos-rebuild
+    libnotify
+  ];
+
+  text = builtins.readFile ./script.sh;
+
+  meta = with lib; {
+    description = "Met à jour automatiquement le flake et le système avec gestion des erreurs";
+    license = licenses.mit;
+  };
+}
+
+
+
+================================================
+FILE: pkgs/nixos-auto-upgrade/script.sh
+================================================
+#!/usr/bin/env bash
+set -euo pipefail
+
+FLAKE_DIR="/etc/nixos"
+SUDO="/run/wrappers/bin/sudo"
+LOCK_FILE="$FLAKE_DIR/flake.lock"
+BACKUP_LOCK="$FLAKE_DIR/flake.lock.bak"
+
+# Fonction utilitaire pour envoyer des notifications graphiques à l'utilisateur actif
+send_notification() {
+    local title="$1"
+    local message="$2"
+    local urgency="$3" # normal, critical
+
+    # Trouve l'UID de l'utilisateur connecté graphiquement
+    local uid
+    uid=$(id -u "${SUDO_USER:-$USER}" 2>/dev/null || echo 1000)
+
+    # Exécute notify-send dans la session de l'utilisateur s'il est connecté
+    $SUDO -u "#$uid" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send -u "$urgency" "$title" "$message" 2>/dev/null || true
+}
+
+cd "$FLAKE_DIR"
+cp "$LOCK_FILE" "$BACKUP_LOCK"
+
+cleanup() {
+    rm -f "$BACKUP_LOCK"
+}
+trap cleanup EXIT
+
+echo "Vérification des mises à jour des flakes..."
+
+if ! $SUDO nix flake update --flake "$FLAKE_DIR"; then
+    send_notification "NixOS Update" "Erreur lors du téléchargement des mises à jour." "critical"
+    exit 1
+fi
+
+if git diff --quiet "$LOCK_FILE"; then
+    echo "Tout est déjà à jour."
+    exit 0
+fi
+
+echo "Application des mises à jour..."
+
+if $SUDO nixos-rebuild switch --flake "$FLAKE_DIR"; then
+    send_notification "NixOS Update" "Mise à jour du système réussie avec succès !" "normal"
+else
+    echo "Échec ! Restauration de l'ancien lock..."
+    mv "$BACKUP_LOCK" "$LOCK_FILE"
+    $SUDO nixos-rebuild switch --flake "$FLAKE_DIR" || true
+
+    send_notification "NixOS Update" "Échec de la mise à jour ! Restauration de l'ancienne version." "critical"
+    exit 1
+fi
 
 
 
@@ -1075,6 +1242,9 @@ jobs:
 
       - name: Build 'nixos-flake-update' package
         run: nix build .#nixos-flake-update
+
+      - name: Build 'nixos-auto-upgrade' package
+        run: nix build .#nixos-auto-upgrade
 
       - name: Check flake configuration
         run: nix flake check

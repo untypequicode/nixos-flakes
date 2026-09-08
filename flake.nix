@@ -27,6 +27,7 @@
           hello = pkgs.callPackage ./pkgs/hello { };
           nixos-check-flake-update = pkgs.callPackage ./pkgs/nixos-check-flake-update { };
           nixos-flake-update = pkgs.callPackage ./pkgs/nixos-flake-update { };
+          nixos-auto-upgrade = pkgs.callPackage ./pkgs/nixos-auto-upgrade { };
 
           default = self.packages.${system}.hello;
         }
@@ -41,10 +42,17 @@
           type = "app";
           program = "${self.packages.${system}.nixos-flake-update}/bin/nixos-flake-update";
         };
+        nixos-auto-upgrade = {
+          type = "app";
+          program = "${self.packages.${system}.nixos-auto-upgrade}/bin/nixos-auto-upgrade";
+        };
         hello = {
           type = "app";
           program = "${self.packages.${system}.hello}/bin/hello";
         };
       });
+
+      nixosModules.auto-upgrade = import ./modules/auto-upgrade.nix;
+      nixosModules.default = self.nixosModules.auto-upgrade;
     };
 }
