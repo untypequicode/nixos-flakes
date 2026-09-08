@@ -1,0 +1,34 @@
+name: "Nix CI"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build Nix Packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build 'hello' package
+        run: nix build .#hello
+
+      - name: Build 'nixos-check-flake-update' package
+        run: nix build .#nixos-check-flake-update
+
+      - name: Build 'nixos-flake-update' package
+        run: nix build .#nixos-flake-update
+
+      - name: Check flake configuration
+        run: nix flake check
