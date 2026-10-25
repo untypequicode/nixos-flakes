@@ -5,9 +5,11 @@ src="${1:-/etc/nixos}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-cp -a "$src"/. "$tmpdir"/
+# Seuls flake.nix et flake.lock servent à la mise à jour : copier tout le dépôt
+# (artefacts de build compris) remplissait /tmp quand le script était tué.
+cp "$src/flake.nix" "$src/flake.lock" "$tmpdir"/
 
-if ! nix flake update --flake "$tmpdir" >/dev/null 2>&1; then
+if ! nix flake update --flake "path:$tmpdir" >/dev/null 2>&1; then
   jq -nc \
     --arg text "!" \
     --arg tooltip "Erreur pendant nix flake update" \
