@@ -34,7 +34,7 @@ nix run github:untypequicode/nixos-flakes#nixos-flakes-gui
 nixos-flakes list [--all] [--check]       dépôts suivis (--all : + détectés)
 nixos-flakes scan                         dépôts détectés sous les racines de scan
 nixos-flakes check [PATH] [--waybar]      mises à jour disponibles (sans rien modifier)
-nixos-flakes update [PATH] [--commit]     nix flake update (+ commit de flake.lock seul)
+nixos-flakes update [PATH] [--commit] [--input NOM]   nix flake update (+ commit de flake.lock seul)
 nixos-flakes apply [PATH]                 nixos-rebuild switch via pkexec
 nixos-flakes upgrade [PATH] [--notify]    mise à jour + application, retour arrière si échec
 nixos-flakes track|untrack|ignore PATH    gérer les rôles
@@ -42,6 +42,13 @@ nixos-flakes set-system PATH              définir le dépôt système
 ```
 
 `PATH` vaut par défaut le dépôt système. `--config FICHIER` change le fichier de configuration.
+
+### Mise à jour sélective
+
+Un dépôt flake peut déclarer plusieurs inputs ; tu peux n'en mettre à jour qu'une partie.
+
+- **GUI** : dans l'onglet **Mises à jour**, chaque input a une case à cocher et un bouton propre. Le bouton **Mettre à jour la sélection** ne touche que les inputs cochés.
+- **CLI** : `nixos-flakes update [PATH] --input NOM`, répétable pour plusieurs inputs (`--input nixpkgs --input home-manager`).
 
 ### Waybar
 
@@ -59,6 +66,7 @@ Classes CSS : `uptodate`, `outdated` (texte `❆ N`), `error`.
 
 - Liste des dépôts groupés Système / Suivis / Détectés / Ignorés avec un badge d'état.
 - Détail : diff par input, boutons Vérifier / Mettre à jour / Appliquer / Suivre / Ignorer.
+- Mise à jour d'un sous-ensemble d'inputs : voir [Mise à jour sélective](#mise-à-jour-sélective).
 - Console de logs en direct.
 - **Flux git** : avant la mise à jour, si le dépôt a des modifications non commitées, proposition de les commiter ; après, proposition de commiter `flake.lock` seul. Jamais de push automatique.
 - Réglages : racines de scan, profondeur, tray, fréquence de vérification.
@@ -84,6 +92,10 @@ services.nixos-flakes.githubTokenFile = "/run/secrets/github-token";
 ```
 
 Le fichier peut contenir le jeton seul, `github.com=JETON` ou `access-tokens = github.com=JETON`. Réglages affiche alors « Jeton configuré par la configuration Nix » et la saisie est désactivée. Sans cette option, le jeton se saisit dans l'interface.
+
+Un script NixOS peut aussi écrire le jeton dans `/etc/nix/access-tokens.conf`, au format `extra-access-tokens = github.com=JETON` (mode `600`, propriétaire root) : l'outil le reconnaît. Mais un `nix` lancé par ton utilisateur ne peut pas lire un fichier réservé à root. Pour le rendre lisible, passe-le en `640` avec un groupe accessible, par exemple avec `install -m 640 -g users`, ou enregistre un jeton dans **Réglages**.
+
+Ordre de priorité : `githubTokenFile` (configuration Nix) > jeton saisi dans l'interface > `/etc/nix/access-tokens.conf`.
 
 ### Zone de notification : prérequis par bureau
 
@@ -160,6 +172,8 @@ Si la mise à jour ou le commit depuis la GUI échoue avec `path '/etc/nixos' is
 ```
 
 Cela accorde à `moi` la lecture et l'écriture sur `/etc/nixos` via une ACL (héritée par les nouveaux fichiers) et ajoute ce chemin exact à `safe.directory` de git. Le dépôt reste la propriété de root, et l'application du système passe toujours par `pkexec`. Nécessite un système de fichiers avec ACL (ext4, btrfs, xfs…). Pour un autre chemin que `/etc/nixos`, utilise `services.nixos-flakes.systemRepo.path`.
+
+Sans cette option, la vérification d'un `/etc/nixos` appartenant à root fonctionne quand même, sans reconstruction : seuls `flake.nix` et `flake.lock` sont copiés pour être évalués. Écrire le `flake.lock` (mise à jour) exige en revanche `services.nixos-flakes.systemRepo.owner`.
 
 L'ancien nom `services.nixos-auto-upgrade-custom.{enable,interval}` fonctionne encore (avertissement de renommage).
 

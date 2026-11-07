@@ -29,8 +29,12 @@ Dossier à partir duquel on cherche des dépôts flake.
 _Avoid_: Dossier de recherche
 
 **Mise à jour**:
-Opération qui fait avancer les verrous (`flake.lock`) d'un dépôt flake.
+Opération qui fait avancer les verrous (`flake.lock`) d'un dépôt flake, pour tous ses inputs ou pour une sélection d'inputs.
 _Avoid_: Upgrade, bump
+
+**Input**:
+Dépendance déclarée dans le `flake.nix` d'un dépôt flake, que l'on peut mettre à jour seule ou avec d'autres.
+_Avoid_: Dépendance, dépôt
 
 **Application**:
 Opération qui active la configuration d'un dépôt système sur la machine (`nixos-rebuild switch`).
