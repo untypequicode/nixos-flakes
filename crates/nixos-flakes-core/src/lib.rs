@@ -13,6 +13,7 @@ pub mod notify;
 mod proc;
 pub mod scan;
 pub mod status;
+pub mod token;
 pub mod upgrade;
 pub mod waybar;
 

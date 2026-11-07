@@ -47,7 +47,20 @@ pub(crate) fn run(
     cwd: Option<&Path>,
     out: &mut dyn FnMut(&str),
 ) -> Result<()> {
+    run_env(program, args, cwd, &[], out)
+}
+
+/// Comme `run`, avec des variables d'environnement supplémentaires.
+/// Les valeurs ne sont jamais journalisées ni placées dans les erreurs.
+pub(crate) fn run_env(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    out: &mut dyn FnMut(&str),
+) -> Result<()> {
     let mut cmd = command(program);
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -98,6 +111,44 @@ pub(crate) fn run(
     }
 }
 
+/// Variables `GIT_CONFIG_*` déclarant `repo` comme `safe.directory` (chemin
+/// exact, jamais `*`), à la suite d'un éventuel `GIT_CONFIG_COUNT` existant.
+pub(crate) fn git_safe_env(existing_count: Option<&str>, repo: &Path) -> Vec<(String, String)> {
+    let n: usize = existing_count
+        .and_then(|c| c.trim().parse().ok())
+        .unwrap_or(0);
+    vec![
+        ("GIT_CONFIG_COUNT".into(), (n + 1).to_string()),
+        (format!("GIT_CONFIG_KEY_{n}"), "safe.directory".into()),
+        (
+            format!("GIT_CONFIG_VALUE_{n}"),
+            repo.to_string_lossy().into_owned(),
+        ),
+    ]
+}
+
+/// Valeur de `NIX_CONFIG` portant le jeton GitHub, ajoutée après `existing`.
+pub(crate) fn nix_config_with_token(existing: Option<&str>, token: &str) -> String {
+    let line = format!("access-tokens = github.com={token}");
+    match existing {
+        Some(e) if !e.trim().is_empty() => format!("{}\n{line}\n", e.trim_end_matches('\n')),
+        _ => format!("{line}\n"),
+    }
+}
+
+/// Environnement des sous-processus `nix` : `safe.directory` pour `repo` et,
+/// si fourni, le jeton GitHub via `NIX_CONFIG`.
+pub(crate) fn nix_env(repo: &Path, token: Option<&str>) -> Vec<(String, String)> {
+    let mut env = git_safe_env(std::env::var("GIT_CONFIG_COUNT").ok().as_deref(), repo);
+    if let Some(t) = token {
+        env.push((
+            "NIX_CONFIG".into(),
+            nix_config_with_token(std::env::var("NIX_CONFIG").ok().as_deref(), t),
+        ));
+    }
+    env
+}
+
 fn pump<R: std::io::Read + Send + 'static>(
     reader: R,
     tx: mpsc::Sender<String>,
@@ -136,6 +187,42 @@ mod tests {
             "/a:/run/wrappers/bin"
         );
         assert_eq!(path_with_wrappers(None), "/run/wrappers/bin");
+    }
+
+    #[test]
+    fn git_safe_env_starts_at_zero_and_appends() {
+        let r = Path::new("/etc/nixos");
+        let e = git_safe_env(None, r);
+        assert!(e.contains(&("GIT_CONFIG_COUNT".into(), "1".into())));
+        assert!(e.contains(&("GIT_CONFIG_KEY_0".into(), "safe.directory".into())));
+        assert!(e.contains(&("GIT_CONFIG_VALUE_0".into(), "/etc/nixos".into())));
+        let e = git_safe_env(Some("2"), r);
+        assert!(e.contains(&("GIT_CONFIG_COUNT".into(), "3".into())));
+        assert!(e.contains(&("GIT_CONFIG_KEY_2".into(), "safe.directory".into())));
+        assert!(e.iter().all(|(_, v)| v != "*"));
+    }
+
+    #[test]
+    fn nix_config_preserves_existing() {
+        assert_eq!(
+            nix_config_with_token(None, "tok"),
+            "access-tokens = github.com=tok\n"
+        );
+        assert_eq!(
+            nix_config_with_token(Some("a = b"), "tok"),
+            "a = b\naccess-tokens = github.com=tok\n"
+        );
+    }
+
+    #[test]
+    fn env_reaches_subprocess() {
+        let mut lines = Vec::new();
+        let env = vec![("NF_TEST".to_string(), "valeur".to_string())];
+        run_env("sh", &["-c", "echo $NF_TEST"], None, &env, &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        assert_eq!(lines, vec!["valeur"]);
     }
 
     #[test]
