@@ -47,27 +47,52 @@ fn is_ownership_error(e: &Error) -> bool {
 
 const OWNER_HINT: &str = "Ajoutez `services.nixos-flakes.systemRepo.owner = \"<utilisateur>\";` à la configuration NixOS puis reconstruisez : cela déclare le dépôt dans /etc/gitconfig (safe.directory) et accorde à cet utilisateur une ACL sur le dépôt.";
 
-/// Erreur finale quand le repli `path:` échoue aussi : garde l'erreur de
-/// propriété d'origine et ajoute une piste de correction.
+/// Fichiers seuls nécessaires à `nix flake update` (les sorties ne sont pas évaluées).
+const FLAKE_FILES: [&str; 2] = ["flake.nix", "flake.lock"];
+
+/// Copie `flake.nix` et `flake.lock` (s'ils existent) de `repo` vers `dst`.
+fn copy_flake_files(repo: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(|e| Error::io(dst, e))?;
+    for name in FLAKE_FILES {
+        let src = repo.join(name);
+        match std::fs::copy(&src, dst.join(name)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(src, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Erreur finale quand le repli (copie de flake.nix/flake.lock) échoue aussi :
+/// garde l'erreur de propriété d'origine et ajoute une piste de correction.
+/// Les fichiers illisibles ne sont mentionnés que s'ils sont en cause.
 fn ownership_failure(original: Error, fallback: Error) -> Error {
-    let (
-        Error::Command {
-            program,
-            status,
-            tail: orig_tail,
-        },
-        Error::Command { tail, .. },
-    ) = (&original, &fallback)
+    let Error::Command {
+        program,
+        status,
+        tail: orig_tail,
+    } = &original
     else {
         return fallback;
     };
     let mut msg = format!("{orig_tail}\n");
-    if tail.contains("Permission denied") {
-        msg.push_str(
-            "Repli `path:` : un fichier du dépôt n'est pas lisible par votre utilisateur.\n",
-        );
-    } else {
-        msg.push_str(&format!("Repli `path:` également en échec :\n{tail}\n"));
+    match &fallback {
+        Error::Io { path, source } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            msg.push_str(&format!(
+                "Repli par copie : {} n'est pas lisible par votre utilisateur.\n",
+                path.display()
+            ));
+        }
+        Error::Command { tail, .. } if tail.contains("Permission denied") => {
+            msg.push_str(
+                "Repli par copie : un fichier du dépôt n'est pas lisible par votre utilisateur.\n",
+            );
+        }
+        Error::Command { tail, .. } => {
+            msg.push_str(&format!("Repli par copie également en échec :\n{tail}\n"));
+        }
+        other => msg.push_str(&format!("Repli par copie également en échec : {other}\n")),
     }
     msg.push_str(OWNER_HINT);
     Error::Command {
@@ -102,10 +127,15 @@ pub(crate) fn check_with(nix: &str, repo: &Path, token: Option<&str>) -> Result<
         )
     };
     if let Err(e) = run_check(&repo_s) {
-        // Repli : le libgit2 de nix ignore parfois `safe.directory` ; une
-        // référence `path:` évite git (le dépôt est alors copié tel quel).
+        // Repli : le libgit2 de nix refuse un dépôt d'un autre propriétaire (et
+        // un dépôt root peut contenir des fichiers illisibles). Seuls flake.nix
+        // et flake.lock comptent : on les copie dans un dossier temporaire
+        // hors git, référencé par `path:`.
         if is_ownership_error(&e) {
-            if let Err(e2) = run_check(&format!("path:{repo_s}")) {
+            let copy = tmp.path().join("copie");
+            let res = copy_flake_files(repo, &copy)
+                .and_then(|()| run_check(&format!("path:{}", copy.display())));
+            if let Err(e2) = res {
                 return Err(ownership_failure(e, e2));
             }
         } else {
@@ -120,35 +150,73 @@ pub(crate) fn check_with(nix: &str, repo: &Path, token: Option<&str>) -> Result<
     })
 }
 
+/// Inputs racine du `flake.lock` de `repo` (vide si le verrou est absent).
+pub fn list_inputs(repo: &Path) -> Result<Vec<lock::RootInput>> {
+    let path = repo.join("flake.lock");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => lock::root_inputs(&s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(Error::io(path, e)),
+    }
+}
+
+/// Vérifie que chaque nom est un input racine du verrou (et ne ressemble pas
+/// à une option de la ligne de commande).
+pub fn validate_inputs(repo: &Path, inputs: &[String]) -> Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    if let Some(bad) = inputs.iter().find(|n| n.is_empty() || n.starts_with('-')) {
+        return Err(Error::Config(format!("nom d'input invalide : « {bad} »")));
+    }
+    let known = list_inputs(repo)?;
+    for n in inputs {
+        if !known.iter().any(|k| &k.name == n) {
+            let names: Vec<&str> = known.iter().map(|k| k.name.as_str()).collect();
+            return Err(Error::Config(format!(
+                "input inconnu : « {n} » (inputs du verrou : {})",
+                if names.is_empty() {
+                    "aucun".to_string()
+                } else {
+                    names.join(", ")
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `nix flake update` en utilisateur ; renvoie les changements réels.
 pub fn update(repo: &Path, out: &mut dyn FnMut(&str)) -> Result<UpdateReport> {
+    update_inputs(repo, &[], out)
+}
+
+/// `nix flake update <input>...` ; une liste vide met tout à jour.
+/// Les noms doivent être des inputs racine du `flake.lock` (voir `list_inputs`).
+pub fn update_inputs(
+    repo: &Path,
+    inputs: &[String],
+    out: &mut dyn FnMut(&str),
+) -> Result<UpdateReport> {
     let token = crate::token::load().ok().flatten();
-    update_with("nix", repo, token.as_ref().map(|t| t.expose()), out)
+    update_with("nix", repo, inputs, token.as_ref().map(|t| t.expose()), out)
 }
 
 pub(crate) fn update_with(
     nix: &str,
     repo: &Path,
+    inputs: &[String],
     token: Option<&str>,
     out: &mut dyn FnMut(&str),
 ) -> Result<UpdateReport> {
+    validate_inputs(repo, inputs)?;
     let lock_path = repo.join("flake.lock");
     let old = read_lock(&lock_path)?;
     let repo_s = repo.to_string_lossy().into_owned();
-    proc::run_env(
-        nix,
-        &[
-            FEATURES[0],
-            FEATURES[1],
-            "flake",
-            "update",
-            "--flake",
-            &repo_s,
-        ],
-        None,
-        &proc::nix_env(repo, token),
-        out,
-    )?;
+    let mut args: Vec<&str> = vec![FEATURES[0], FEATURES[1], "flake", "update"];
+    args.extend(inputs.iter().map(String::as_str));
+    args.extend(["--flake", &repo_s]);
+    proc::run_env(nix, &args, None, &proc::nix_env(repo, token), out)?;
     let new = read_lock(&lock_path)?;
     Ok(UpdateReport {
         repo: repo.to_path_buf(),
@@ -257,7 +325,7 @@ if [ -n "$outf" ]; then cp "{src}" "$outf"; else cp "{src}" "$flake/flake.lock";
         fs::write(repo.join("flake.lock"), lock_json(&[("a", "1111111", 1)])).unwrap();
         let nix = fake_nix(d.path(), &lock_json(&[("a", "2222222", 2)]));
         let mut lines = Vec::new();
-        let rep = update_with(&nix, &repo, None, &mut |l| lines.push(l.to_string())).unwrap();
+        let rep = update_with(&nix, &repo, &[], None, &mut |l| lines.push(l.to_string())).unwrap();
         assert_eq!(rep.changes.len(), 1);
         assert!(lines[0].starts_with("mise à jour de"));
         assert!(fs::read_to_string(repo.join("flake.lock"))
@@ -271,7 +339,7 @@ if [ -n "$outf" ]; then cp "{src}" "$outf"; else cp "{src}" "$flake/flake.lock";
         let repo = d.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let nix = fake_nix(d.path(), &lock_json(&[]));
-        assert!(update_with(&nix, &repo, None, &mut |_| {})
+        assert!(update_with(&nix, &repo, &[], None, &mut |_| {})
             .unwrap()
             .changes
             .is_empty());
@@ -380,7 +448,7 @@ esac
         let repo = d.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let nix = picky_nix(d.path());
-        assert!(update_with(&nix, &repo, None, &mut |_| {}).is_err());
+        assert!(update_with(&nix, &repo, &[], None, &mut |_| {}).is_err());
     }
 
     #[test]
@@ -399,11 +467,143 @@ esac
         let _ = update_with(
             script.to_str().unwrap(),
             &repo,
+            &[],
             Some("ghp_secret"),
             &mut |l| lines.push(l.to_string()),
         );
         assert!(lines.contains(&repo.display().to_string()));
         assert!(lines.contains(&"access-tokens = github.com=ghp_secret".to_string()));
+    }
+
+    /// Faux `nix` qui n'accepte `path:` que si le dossier ne contient que flake.nix/flake.lock.
+    fn copy_checking_nix(dir: &Path) -> String {
+        let script = dir.join("copy-nix");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+out=""; flake=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --flake) flake="$2"; shift;;
+    --output-lock-file) out="$2"; shift;;
+  esac
+  shift
+done
+case "$flake" in
+  path:*)
+    d="${flake#path:}"
+    [ "$(ls "$d" | tr "\n" " ")" = "flake.lock flake.nix " ] || { echo "fichiers en trop" >&2; exit 1; }
+    cp "$d/flake.lock" "$out";;
+  *) echo "error: repository path '$flake' is not owned by current user" >&2; exit 1;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn fallback_copies_only_flake_files() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("flake.nix"), "{}").unwrap();
+        fs::write(repo.join("flake.lock"), lock_json(&[("a", "1", 1)])).unwrap();
+        fs::write(repo.join("secret.txt"), "x").unwrap();
+        let nix = copy_checking_nix(d.path());
+        let rep = check_with(&nix, &repo, None).unwrap();
+        assert!(rep.changes.is_empty());
+        assert!(fs::read_to_string(repo.join("flake.lock"))
+            .unwrap()
+            .contains("\"a\""));
+    }
+
+    #[test]
+    fn unreadable_flake_file_is_reported_with_owner_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let f = repo.join("flake.nix");
+        fs::write(&f, "{}").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&f).is_ok() {
+            return; // root : les permissions ne s'appliquent pas
+        }
+        let nix = picky_nix(d.path());
+        let err = check_with(&nix, &repo, None).unwrap_err().to_string();
+        assert!(err.contains("not owned by current user"), "{err}");
+        assert!(err.contains("flake.nix n'est pas lisible"), "{err}");
+        assert!(err.contains("systemRepo.owner"), "{err}");
+    }
+
+    #[test]
+    fn fallback_failure_without_permission_does_not_mention_unreadable() {
+        let d = tempfile::tempdir().unwrap();
+        let nix = failing_both(d.path(), "error: boom");
+        let err = check_with(&nix, d.path(), None).unwrap_err().to_string();
+        assert!(!err.contains("pas lisible"), "{err}");
+    }
+
+    /// Faux `nix` qui écrit ses arguments dans `<repo>/args`.
+    fn args_nix(dir: &Path) -> String {
+        let script = dir.join("args-nix");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > \"{}\"\n",
+                dir.join("args").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn update_inputs_passes_names_and_validates() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        fs::write(
+            repo.join("flake.lock"),
+            lock_json(&[("nixpkgs", "1", 1), ("home", "2", 2)]),
+        )
+        .unwrap();
+        let nix = args_nix(d.path());
+        let mut lines = Vec::new();
+        let names = vec!["home".to_string(), "nixpkgs".to_string()];
+        update_with(&nix, &repo, &names, None, &mut |l| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        let args = fs::read_to_string(d.path().join("args")).unwrap();
+        assert!(args.contains("flake update home nixpkgs --flake"), "{args}");
+        // Vide = tout.
+        update_with(&nix, &repo, &[], None, &mut |_| {}).unwrap();
+        let args = fs::read_to_string(d.path().join("args")).unwrap();
+        assert!(args.contains("flake update --flake"), "{args}");
+        // Invalides : rien n'est lancé.
+        let _ = fs::remove_file(d.path().join("args"));
+        for bad in ["--commit-lock-file", "", "inconnu"] {
+            let r = update_with(&nix, &repo, &[bad.to_string()], None, &mut |_| {});
+            assert!(matches!(r, Err(Error::Config(_))), "{bad}");
+        }
+        assert!(!d.path().join("args").exists());
+    }
+
+    #[test]
+    fn list_inputs_reads_root_inputs() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(list_inputs(d.path()).unwrap().is_empty());
+        fs::write(
+            d.path().join("flake.lock"),
+            lock_json(&[("a", "1234567890", 1)]),
+        )
+        .unwrap();
+        let l = list_inputs(d.path()).unwrap();
+        assert_eq!(l[0].name, "a");
+        assert_eq!(l[0].short_rev.as_deref(), Some("1234567"));
     }
 
     #[test]

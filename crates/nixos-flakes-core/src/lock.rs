@@ -88,6 +88,88 @@ pub fn diff(old: &[LockedInput], new: &[LockedInput]) -> Vec<InputChange> {
     out
 }
 
+/// Input racine d'un `flake.lock` (ceux que `nix flake update <nom>` accepte).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootInput {
+    /// Nom déclaré dans `flake.nix` (clé de `nodes.root.inputs`).
+    pub name: String,
+    /// Nom du nœud verrouillé correspondant (peut différer : `nixpkgs_2`).
+    /// `None` pour un input purement `follows`.
+    pub node: Option<String>,
+    /// Révision verrouillée complète.
+    pub rev: Option<String>,
+    /// Révision abrégée (7 caractères).
+    pub short_rev: Option<String>,
+    pub last_modified: Option<i64>,
+    /// Type de source (`github`, `git`, `path`, `tarball`…).
+    pub kind: Option<String>,
+    pub owner: Option<String>,
+    pub repo: Option<String>,
+    /// Adresse lisible : `github:owner/repo[/ref]`, ou l'URL/le chemin de la source.
+    pub url: Option<String>,
+}
+
+fn str_of(v: Option<&Value>, key: &str) -> Option<String> {
+    v.and_then(|l| l.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Inputs racine d'un `flake.lock`, triés par nom.
+pub fn root_inputs(json: &str) -> Result<Vec<RootInput>> {
+    let v: Value = serde_json::from_str(json).map_err(|e| Error::Lock(e.to_string()))?;
+    let nodes = v
+        .get("nodes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::Lock("champ « nodes » absent".into()))?;
+    let root = v.get("root").and_then(Value::as_str).unwrap_or("root");
+    let Some(inputs) = nodes
+        .get(root)
+        .and_then(|r| r.get("inputs"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<RootInput> = inputs
+        .iter()
+        .map(|(name, target)| {
+            let node = target.as_str().map(str::to_string);
+            let n = node.as_deref().and_then(|k| nodes.get(k));
+            let locked = n.and_then(|n| n.get("locked"));
+            let original = n.and_then(|n| n.get("original"));
+            let kind = str_of(locked, "type").or_else(|| str_of(original, "type"));
+            let rev = str_of(locked, "rev");
+            let owner = str_of(locked, "owner").or_else(|| str_of(original, "owner"));
+            let repo = str_of(locked, "repo").or_else(|| str_of(original, "repo"));
+            let reference = str_of(original, "ref");
+            let url = match (kind.as_deref(), &owner, &repo) {
+                (Some(k @ ("github" | "gitlab" | "sourcehut")), Some(o), Some(r)) => {
+                    Some(match &reference {
+                        Some(f) => format!("{k}:{o}/{r}/{f}"),
+                        None => format!("{k}:{o}/{r}"),
+                    })
+                }
+                _ => str_of(original, "url").or_else(|| str_of(original, "path")),
+            };
+            RootInput {
+                name: name.clone(),
+                node,
+                short_rev: rev.as_ref().map(|r| r.chars().take(7).collect()),
+                rev,
+                last_modified: locked
+                    .and_then(|l| l.get("lastModified"))
+                    .and_then(Value::as_i64),
+                kind,
+                owner,
+                repo,
+                url,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +230,37 @@ mod tests {
         assert_eq!(d[2].name, "new");
         assert_eq!(d[2].old_rev, None);
         assert_eq!(d[2].new_rev.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn root_inputs_lists_only_root_children_with_details() {
+        let json = r#"{"nodes":{
+          "root":{"inputs":{"nixpkgs":"nixpkgs_2","hm":"home-manager","fl":["hm","flake"]}},
+          "nixpkgs_2":{"locked":{"type":"github","owner":"NixOS","repo":"nixpkgs","rev":"abcdef0123456","lastModified":5},
+                       "original":{"type":"github","owner":"NixOS","repo":"nixpkgs","ref":"nixos-unstable"}},
+          "home-manager":{"locked":{"type":"git","rev":"1234567890","lastModified":6},"original":{"type":"git","url":"https://x/y.git"}},
+          "transitif":{"locked":{"type":"github","rev":"z"}}},
+          "root":"root","version":7}"#;
+        let r = root_inputs(json).unwrap();
+        let names: Vec<_> = r.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["fl", "hm", "nixpkgs"]);
+        assert_eq!(r[0].node, None);
+        assert_eq!(r[1].url.as_deref(), Some("https://x/y.git"));
+        assert_eq!(r[2].node.as_deref(), Some("nixpkgs_2"));
+        assert_eq!(r[2].short_rev.as_deref(), Some("abcdef0"));
+        assert_eq!(
+            r[2].url.as_deref(),
+            Some("github:NixOS/nixpkgs/nixos-unstable")
+        );
+        assert_eq!(r[2].owner.as_deref(), Some("NixOS"));
+    }
+
+    #[test]
+    fn root_inputs_without_inputs_is_empty() {
+        assert!(root_inputs(r#"{"nodes":{"root":{}},"root":"root"}"#)
+            .unwrap()
+            .is_empty());
+        assert!(root_inputs("nope").is_err());
     }
 
     #[test]

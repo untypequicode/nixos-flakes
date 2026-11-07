@@ -17,7 +17,12 @@ pub enum UpgradeOutcome {
 
 /// Opérations nécessaires, abstraites pour pouvoir les tester.
 pub(crate) trait Backend {
-    fn update(&mut self, repo: &Path, out: &mut dyn FnMut(&str)) -> Result<UpdateReport>;
+    fn update(
+        &mut self,
+        repo: &Path,
+        inputs: &[String],
+        out: &mut dyn FnMut(&str),
+    ) -> Result<UpdateReport>;
     fn apply(&mut self, repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()>;
     fn rollback(&mut self, out: &mut dyn FnMut(&str)) -> Result<()>;
 }
@@ -25,8 +30,13 @@ pub(crate) trait Backend {
 struct Real(Privilege);
 
 impl Backend for Real {
-    fn update(&mut self, repo: &Path, out: &mut dyn FnMut(&str)) -> Result<UpdateReport> {
-        nix::update(repo, out)
+    fn update(
+        &mut self,
+        repo: &Path,
+        inputs: &[String],
+        out: &mut dyn FnMut(&str),
+    ) -> Result<UpdateReport> {
+        nix::update_inputs(repo, inputs, out)
     }
     fn apply(&mut self, repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
         nix::apply(repo, self.0, out)
@@ -44,7 +54,18 @@ pub fn upgrade(
     privilege: Privilege,
     out: &mut dyn FnMut(&str),
 ) -> Result<UpgradeOutcome> {
-    upgrade_with(&mut Real(privilege), repo, out)
+    upgrade_inputs(repo, &[], privilege, out)
+}
+
+/// Comme `upgrade`, limité aux inputs `inputs` (vide = tous). En cas d'échec
+/// de l'application, le `flake.lock` d'origine est restauré en entier.
+pub fn upgrade_inputs(
+    repo: &Path,
+    inputs: &[String],
+    privilege: Privilege,
+    out: &mut dyn FnMut(&str),
+) -> Result<UpgradeOutcome> {
+    upgrade_with(&mut Real(privilege), repo, inputs, out)
 }
 
 fn restore_lock(path: &Path, backup: &Option<Vec<u8>>) -> Result<()> {
@@ -60,6 +81,7 @@ fn restore_lock(path: &Path, backup: &Option<Vec<u8>>) -> Result<()> {
 pub(crate) fn upgrade_with(
     backend: &mut dyn Backend,
     repo: &Path,
+    inputs: &[String],
     out: &mut dyn FnMut(&str),
 ) -> Result<UpgradeOutcome> {
     let lock_path = repo.join("flake.lock");
@@ -70,7 +92,7 @@ pub(crate) fn upgrade_with(
     };
 
     out("Mise à jour des verrous…");
-    let report = match backend.update(repo, out) {
+    let report = match backend.update(repo, inputs, out) {
         Ok(r) => r,
         Err(e) => {
             let _ = restore_lock(&lock_path, &backup);
@@ -137,7 +159,12 @@ mod tests {
     }
 
     impl Backend for Fake {
-        fn update(&mut self, repo: &Path, _: &mut dyn FnMut(&str)) -> Result<UpdateReport> {
+        fn update(
+            &mut self,
+            repo: &Path,
+            _: &[String],
+            _: &mut dyn FnMut(&str),
+        ) -> Result<UpdateReport> {
             self.calls.push("update");
             fs::write(repo.join("flake.lock"), self.new_lock).unwrap();
             if !self.update_ok {
@@ -184,7 +211,7 @@ mod tests {
     fn up_to_date_does_not_apply() {
         let d = repo_with_lock("ORIGINE");
         let mut f = fake(0, true);
-        let r = upgrade_with(&mut f, d.path(), &mut |_| {}).unwrap();
+        let r = upgrade_with(&mut f, d.path(), &[], &mut |_| {}).unwrap();
         assert_eq!(r, UpgradeOutcome::AlreadyUpToDate);
         assert_eq!(f.calls, ["update"]);
     }
@@ -193,7 +220,7 @@ mod tests {
     fn success_keeps_new_lock() {
         let d = repo_with_lock("ORIGINE");
         let mut f = fake(2, true);
-        let r = upgrade_with(&mut f, d.path(), &mut |_| {}).unwrap();
+        let r = upgrade_with(&mut f, d.path(), &[], &mut |_| {}).unwrap();
         assert!(matches!(r, UpgradeOutcome::Applied(ref rep) if rep.changes.len() == 2));
         assert_eq!(f.calls, ["update", "apply"]);
         assert_eq!(
@@ -207,7 +234,7 @@ mod tests {
         let d = repo_with_lock("ORIGINE");
         let mut f = fake(1, false);
         let mut lines = Vec::new();
-        let r = upgrade_with(&mut f, d.path(), &mut |l| lines.push(l.to_string())).unwrap();
+        let r = upgrade_with(&mut f, d.path(), &[], &mut |l| lines.push(l.to_string())).unwrap();
         match r {
             UpgradeOutcome::RolledBack { report, reason } => {
                 assert_eq!(report.changes.len(), 1);
@@ -228,7 +255,7 @@ mod tests {
         let d = repo_with_lock("ORIGINE");
         let mut f = fake(1, false);
         f.rollback_ok = false;
-        let r = upgrade_with(&mut f, d.path(), &mut |_| {}).unwrap();
+        let r = upgrade_with(&mut f, d.path(), &[], &mut |_| {}).unwrap();
         match r {
             UpgradeOutcome::RolledBack { reason, .. } => {
                 assert!(reason.contains("Retour arrière impossible"))
@@ -241,7 +268,7 @@ mod tests {
     fn missing_lock_is_removed_on_rollback() {
         let d = tempfile::tempdir().unwrap();
         let mut f = fake(1, false);
-        upgrade_with(&mut f, d.path(), &mut |_| {}).unwrap();
+        upgrade_with(&mut f, d.path(), &[], &mut |_| {}).unwrap();
         assert!(!d.path().join("flake.lock").exists());
     }
 
@@ -250,7 +277,7 @@ mod tests {
         let d = repo_with_lock("ORIGINE");
         let mut f = fake(1, true);
         f.update_ok = false;
-        assert!(upgrade_with(&mut f, d.path(), &mut |_| {}).is_err());
+        assert!(upgrade_with(&mut f, d.path(), &[], &mut |_| {}).is_err());
         assert_eq!(f.calls, ["update"]);
         assert_eq!(
             fs::read_to_string(d.path().join("flake.lock")).unwrap(),

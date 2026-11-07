@@ -30,7 +30,11 @@ pub fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::List { all, check } => list(&config, all, check),
         Command::Scan => scan_cmd(&config),
         Command::Check { path, waybar: _ } => check(&config, path.as_deref()),
-        Command::Update { path, commit } => update(&config, path.as_deref(), commit),
+        Command::Update {
+            path,
+            commit,
+            inputs,
+        } => update(&config, path.as_deref(), commit, &inputs),
         Command::Apply { path } => apply(&config, path.as_deref()),
         Command::Upgrade { path, notify, sudo } => {
             upgrade_cmd(&config, path.as_deref(), notify, sudo)
@@ -136,9 +140,15 @@ fn check(config: &Config, path: Option<&Path>) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn update(config: &Config, path: Option<&Path>, commit: bool) -> Result<ExitCode, String> {
+fn update(
+    config: &Config,
+    path: Option<&Path>,
+    commit: bool,
+    inputs: &[String],
+) -> Result<ExitCode, String> {
     let repo = resolve_repo(config, path);
-    let report = nix::update(&repo, &mut stream_to_stderr).map_err(|e| e.to_string())?;
+    let report =
+        nix::update_inputs(&repo, inputs, &mut stream_to_stderr).map_err(|e| e.to_string())?;
     print_summary(&repo, &report);
 
     if commit {
