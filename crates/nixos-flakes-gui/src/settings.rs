@@ -7,6 +7,7 @@ use crate::widgets::{self, action, dim, faint, title, Ui};
 use iced::widget::{column, container, row, scrollable, space, text, text_input, toggler};
 use iced::{Element, Fill, Length};
 use nixos_flakes_core::config::Config;
+use nixos_flakes_core::token::Source;
 use std::path::{Path, PathBuf};
 pub const INTERVALS: [u32; 9] = [5, 15, 30, 60, 120, 240, 480, 720, 1440];
 pub const MIN_DEPTH: u8 = 1;
@@ -28,6 +29,15 @@ pub fn token_status_text(saved: bool) -> &'static str {
         "Jeton enregistré"
     } else {
         "Aucun jeton"
+    }
+}
+
+/// Libellé d'état selon l'origine du jeton (`saved` : le jeton est lisible).
+pub fn token_source_text(source: &Source, saved: bool) -> &'static str {
+    match source {
+        Source::Fichier(_) if saved => "Jeton configuré par la configuration Nix",
+        Source::Fichier(_) => "Jeton configuré par la configuration Nix (fichier absent ou vide)",
+        _ => token_status_text(saved),
     }
 }
 
@@ -197,6 +207,7 @@ pub fn view<'a>(
     tray: &'a TrayStatus,
     token_input: &'a str,
     token_saved: bool,
+    token_source: &'a Source,
 ) -> Element<'a, Message> {
     let tk = ui.tk;
     let roots = cfg
@@ -253,6 +264,50 @@ pub fn view<'a>(
     }
     let tray_diag = container(tray_diag).padding([0, 16]).width(Fill);
 
+    let token_controls: Element<'a, Message> = if let Source::Fichier(p) = token_source {
+        // Géré par Nix : ni saisie, ni Enregistrer, ni Effacer.
+        column![
+            text(token_source_text(token_source, true))
+                .size(13)
+                .color(tk.text),
+            text(p.display().to_string())
+                .size(12)
+                .font(widgets::MONO)
+                .color(tk.text),
+        ]
+        .spacing(3)
+        .into()
+    } else {
+        row![
+            text_input("Coller le jeton (jamais affiché)", token_input)
+                .secure(true)
+                .on_input(|s| Message::Settings(Msg::TokenInput(Secret(s))))
+                .on_submit(Message::Settings(Msg::TokenSave))
+                .style(theme::input_style(tk))
+                .size(13)
+                .padding([7, 10]),
+            action(
+                ui,
+                "token:save",
+                "Enregistrer",
+                Btn::Primary,
+                None,
+                (!token_input.trim().is_empty()).then_some(Message::Settings(Msg::TokenSave))
+            ),
+            action(
+                ui,
+                "token:clear",
+                "Effacer",
+                Btn::Secondary,
+                None,
+                token_saved.then_some(Message::Settings(Msg::TokenClear))
+            ),
+        ]
+        .spacing(8)
+        .align_y(iced::Center)
+        .into()
+    };
+
     let token_block = container(
         column![
             column![
@@ -272,34 +327,8 @@ pub fn view<'a>(
                 ),
             ]
             .spacing(3),
-            row![
-                text_input("Coller le jeton (jamais affiché)", token_input)
-                    .secure(true)
-                    .on_input(|s| Message::Settings(Msg::TokenInput(Secret(s))))
-                    .on_submit(Message::Settings(Msg::TokenSave))
-                    .style(theme::input_style(tk))
-                    .size(13)
-                    .padding([7, 10]),
-                action(
-                    ui,
-                    "token:save",
-                    "Enregistrer",
-                    Btn::Primary,
-                    None,
-                    (!token_input.trim().is_empty()).then_some(Message::Settings(Msg::TokenSave))
-                ),
-                action(
-                    ui,
-                    "token:clear",
-                    "Effacer",
-                    Btn::Secondary,
-                    None,
-                    token_saved.then_some(Message::Settings(Msg::TokenClear))
-                ),
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
-            dim(tk, token_status_text(token_saved)).size(12),
+            token_controls,
+            dim(tk, token_source_text(token_source, token_saved)).size(12),
         ]
         .spacing(12),
     )
@@ -420,6 +449,17 @@ mod tests {
     fn token_texts_never_leak() {
         assert_eq!(token_status_text(true), "Jeton enregistré");
         assert_eq!(token_status_text(false), "Aucun jeton");
+        let nix = Source::Fichier(PathBuf::from("/run/secrets/gh"));
+        assert_eq!(
+            token_source_text(&nix, true),
+            "Jeton configuré par la configuration Nix"
+        );
+        assert!(token_source_text(&nix, false).contains("absent"));
+        assert_eq!(
+            token_source_text(&Source::Interface, true),
+            "Jeton enregistré"
+        );
+        assert_eq!(token_source_text(&Source::Aucun, false), "Aucun jeton");
         let dbg = format!("{:?}", Msg::TokenInput(Secret("ghp_secret".into())));
         assert!(!dbg.contains("ghp_secret"));
     }

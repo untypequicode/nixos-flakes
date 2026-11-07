@@ -21,6 +21,7 @@ use iced::{window, Subscription, Task, Theme};
 use nixos_flakes_core::config::{Config, Role};
 use nixos_flakes_core::git;
 use nixos_flakes_core::status::RepoStatus;
+use nixos_flakes_core::token::Source as TokenSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -144,6 +145,8 @@ pub struct App {
     /// Saisie du jeton GitHub : vidée dès l'enregistrement, jamais journalisée ni écrite en config.
     pub token_input: String,
     pub token_saved: bool,
+    /// Origine du jeton (fichier Nix = lecture seule). Toujours `Aucun`/`Interface` en démo.
+    pub token_source: nixos_flakes_core::token::Source,
     pub new_root: String,
     // -- animation et présentation --
     /// Dernier instant connu (mis à jour à chaque message).
@@ -232,6 +235,15 @@ fn demo_token_saved(demo: bool) -> bool {
     !demo && nixos_flakes_core::token::exists()
 }
 
+/// Origine du jeton ; en démo on ignore l'environnement et le vrai fichier.
+fn demo_token_source(demo: bool) -> nixos_flakes_core::token::Source {
+    if demo {
+        nixos_flakes_core::token::Source::Aucun
+    } else {
+        nixos_flakes_core::token::source()
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -286,6 +298,7 @@ impl App {
             tray_status: TrayStatus::Disabled,
             token_input: String::new(),
             token_saved: demo_token_saved(demo),
+            token_source: demo_token_source(demo),
             new_root: String::new(),
             now,
             epoch: now,
@@ -885,7 +898,7 @@ impl App {
     fn save_token(&mut self) -> Task<Message> {
         let input = std::mem::take(&mut self.token_input);
         let token = input.trim();
-        if token.is_empty() {
+        if token.is_empty() || matches!(self.token_source, TokenSource::Fichier(_)) {
             return Task::none();
         }
         if self.cli.demo {
@@ -895,6 +908,7 @@ impl App {
         match nixos_flakes_core::token::save(token) {
             Ok(()) => {
                 self.token_saved = true;
+                self.token_source = TokenSource::Interface;
                 self.push_log(LogKind::Success, "Jeton GitHub enregistré.");
                 return self.begin_check_all(true);
             }
@@ -905,6 +919,9 @@ impl App {
 
     fn clear_token(&mut self) {
         self.token_input.clear();
+        if matches!(self.token_source, TokenSource::Fichier(_)) {
+            return;
+        }
         if self.cli.demo {
             self.token_saved = false;
             return;
@@ -912,6 +929,7 @@ impl App {
         match nixos_flakes_core::token::clear() {
             Ok(()) => {
                 self.token_saved = false;
+                self.token_source = TokenSource::Aucun;
                 self.push_log(LogKind::Info, "Jeton GitHub effacé.");
             }
             Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non effacé : {e}")),

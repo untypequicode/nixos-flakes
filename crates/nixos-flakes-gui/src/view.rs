@@ -300,6 +300,7 @@ impl App {
                 &self.tray_status,
                 &self.token_input,
                 self.token_saved,
+                &self.token_source,
             ),
             Page::Main => match self.selected_entry() {
                 Some(e) => self.repo_detail(ui, e, narrow, width),
