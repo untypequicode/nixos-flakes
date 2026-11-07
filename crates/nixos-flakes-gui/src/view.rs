@@ -293,7 +293,14 @@ impl App {
         let tk = ui.tk;
         let k = self.panel_t.value(ui.now);
         let content: Element<'_, Message> = match self.page {
-            Page::Settings => settings::view(ui, &self.cfg, &self.new_root, self.tray.is_some()),
+            Page::Settings => settings::view(
+                ui,
+                &self.cfg,
+                &self.new_root,
+                &self.tray_status,
+                &self.token_input,
+                self.token_saved,
+            ),
             Page::Main => match self.selected_entry() {
                 Some(e) => self.repo_detail(ui, e, narrow, width),
                 None => self.no_selection(ui, narrow),

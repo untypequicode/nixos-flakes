@@ -12,7 +12,7 @@ use crate::settings;
 use crate::tasks::{self, Finished, Job, JobEvent, Outcome};
 use crate::theme::{self, Mode, Tokens};
 use crate::toast::{ToastKind, Toasts};
-use crate::tray::{self, TrayEvent, TrayHandle, TrayState};
+use crate::tray::{self, TrayEvent, TrayHandle, TrayState, TrayStatus};
 use crate::widgets::{self, Ui};
 use iced::futures::{stream, Stream, StreamExt};
 use iced::keyboard::{Key, Modifiers};
@@ -140,6 +140,10 @@ pub struct App {
     pub followups: HashMap<PathBuf, Followup>,
     pub tray: Option<TrayHandle>,
     pub tray_pushed: Option<TrayState>,
+    pub tray_status: TrayStatus,
+    /// Saisie du jeton GitHub : vidée dès l'enregistrement, jamais journalisée ni écrite en config.
+    pub token_input: String,
+    pub token_saved: bool,
     pub new_root: String,
     // -- animation et présentation --
     /// Dernier instant connu (mis à jour à chaque message).
@@ -197,11 +201,17 @@ pub fn boot(cli: Cli) -> (App, Task<Message>) {
     let want_tray = app.cli.tray || app.cfg.tray_enabled;
     if want_tray && !app.cli.demo {
         match tray::spawn(TrayState::UpToDate) {
-            Ok(h) => app.tray = Some(h),
-            Err(e) => app.push_log(
-                LogKind::Error,
-                format!("Zone de notification indisponible ({e}) : comportement normal."),
-            ),
+            Ok(h) => {
+                app.tray = Some(h);
+                app.tray_status = TrayStatus::Registered;
+            }
+            Err(e) => {
+                app.push_log(
+                    LogKind::Error,
+                    format!("Zone de notification indisponible : {e}. L'application continue sans icône."),
+                );
+                app.tray_status = TrayStatus::Failed(e);
+            }
         }
     }
     let start_hidden = app.cli.tray && app.tray.is_some();
@@ -215,6 +225,11 @@ pub fn boot(cli: Cli) -> (App, Task<Message>) {
         tasks.push(app.open_window());
     }
     (app, Task::batch(tasks))
+}
+
+/// Un jeton est-il déjà enregistré ? (Jamais en démo : on ne touche pas au vrai fichier.)
+fn demo_token_saved(demo: bool) -> bool {
+    !demo && nixos_flakes_core::token::exists()
 }
 
 fn unix_now() -> i64 {
@@ -268,6 +283,9 @@ impl App {
             followups: HashMap::new(),
             tray: None,
             tray_pushed: None,
+            tray_status: TrayStatus::Disabled,
+            token_input: String::new(),
+            token_saved: demo_token_saved(demo),
             new_root: String::new(),
             now,
             epoch: now,
@@ -729,12 +747,16 @@ impl App {
                     Some(Ok(h)) => {
                         self.tray_pushed = None;
                         self.tray = Some(h);
+                        self.tray_status = TrayStatus::Registered;
                         self.push_log(LogKind::Info, "Icône de notification activée.");
                     }
-                    Some(Err(e)) => self.push_log(
-                        LogKind::Error,
-                        format!("Zone de notification indisponible : {e}"),
-                    ),
+                    Some(Err(e)) => {
+                        self.push_log(
+                            LogKind::Error,
+                            format!("Zone de notification indisponible : {e}"),
+                        );
+                        self.tray_status = TrayStatus::Failed(e);
+                    }
                     None => {}
                 }
                 Task::none()
@@ -847,12 +869,53 @@ impl App {
                     if let Some(h) = self.tray.take() {
                         h.shutdown();
                     }
+                    self.tray_status = TrayStatus::Disabled;
                 }
             }
+            Msg::TokenInput(s) => self.token_input = s.0,
+            Msg::TokenSave => return self.save_token(),
+            Msg::TokenClear => self.clear_token(),
             Msg::Rescan => return self.scan_task(),
             Msg::Back => self.page = Page::Main,
         }
         Task::none()
+    }
+
+    /// Enregistre le jeton saisi (la saisie est vidée dans tous les cas), puis relance une vérification.
+    fn save_token(&mut self) -> Task<Message> {
+        let input = std::mem::take(&mut self.token_input);
+        let token = input.trim();
+        if token.is_empty() {
+            return Task::none();
+        }
+        if self.cli.demo {
+            self.toast(ToastKind::Info, "Mode démo : jeton non enregistré");
+            return Task::none();
+        }
+        match nixos_flakes_core::token::save(token) {
+            Ok(()) => {
+                self.token_saved = true;
+                self.push_log(LogKind::Success, "Jeton GitHub enregistré.");
+                return self.begin_check_all(true);
+            }
+            Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non enregistré : {e}")),
+        }
+        Task::none()
+    }
+
+    fn clear_token(&mut self) {
+        self.token_input.clear();
+        if self.cli.demo {
+            self.token_saved = false;
+            return;
+        }
+        match nixos_flakes_core::token::clear() {
+            Ok(()) => {
+                self.token_saved = false;
+                self.push_log(LogKind::Info, "Jeton GitHub effacé.");
+            }
+            Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non effacé : {e}")),
+        }
     }
 
     fn on_modal_commit(&mut self) -> Task<Message> {

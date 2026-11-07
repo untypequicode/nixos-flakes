@@ -2,6 +2,7 @@
 
 use crate::app::Message;
 use crate::theme::{self, Btn};
+use crate::tray::TrayStatus;
 use crate::widgets::{self, action, dim, faint, title, Ui};
 use iced::widget::{column, container, row, scrollable, space, text, text_input, toggler};
 use iced::{Element, Fill, Length};
@@ -11,6 +12,25 @@ pub const INTERVALS: [u32; 9] = [5, 15, 30, 60, 120, 240, 480, 720, 1440];
 pub const MIN_DEPTH: u8 = 1;
 pub const MAX_DEPTH: u8 = 10;
 
+/// Saisie secrète : `Debug` n'en révèle jamais le contenu.
+#[derive(Clone)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<masqué>)")
+    }
+}
+
+/// Libellé d'état du jeton GitHub.
+pub fn token_status_text(saved: bool) -> &'static str {
+    if saved {
+        "Jeton enregistré"
+    } else {
+        "Aucun jeton"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Msg {
     InputChanged(String),
@@ -19,6 +39,9 @@ pub enum Msg {
     Depth(bool),
     Interval(bool),
     ToggleTray(bool),
+    TokenInput(Secret),
+    TokenSave,
+    TokenClear,
     Rescan,
     Back,
 }
@@ -171,7 +194,9 @@ pub fn view<'a>(
     ui: &Ui<'_>,
     cfg: &'a Config,
     input: &'a str,
-    tray_active: bool,
+    tray: &'a TrayStatus,
+    token_input: &'a str,
+    token_saved: bool,
 ) -> Element<'a, Message> {
     let tk = ui.tk;
     let roots = cfg
@@ -217,11 +242,69 @@ pub fn view<'a>(
     .spacing(8)
     .align_y(iced::Center);
 
-    let tray_hint = if cfg.tray_enabled && !tray_active {
+    let tray_hint = if cfg.tray_enabled && matches!(tray, TrayStatus::Failed(_)) {
         "Zone de notification demandée mais indisponible sur cette session."
     } else {
         "Affiche une icône ; fermer la fenêtre la réduit dans la zone de notification."
     };
+    let mut tray_diag = column![faint(tk, format!("État : {}", tray.text()))].spacing(3);
+    if let Some(h) = tray.hint() {
+        tray_diag = tray_diag.push(faint(tk, h));
+    }
+    let tray_diag = container(tray_diag).padding([0, 16]).width(Fill);
+
+    let token_block = container(
+        column![
+            column![
+                text("Jeton GitHub")
+                    .size(13)
+                    .font(widgets::medium())
+                    .color(tk.text),
+                faint(
+                    tk,
+                    "Sans jeton, GitHub limite l'API à 60 requêtes par heure. Le jeton est \
+                     stocké dans un fichier 0600, hors de la configuration Nix."
+                ),
+                faint(
+                    tk,
+                    "Il sert à la vérification et à la mise à jour ; l'application du \
+                     système (pkexec) n'utilise pas le jeton."
+                ),
+            ]
+            .spacing(3),
+            row![
+                text_input("Coller le jeton (jamais affiché)", token_input)
+                    .secure(true)
+                    .on_input(|s| Message::Settings(Msg::TokenInput(Secret(s))))
+                    .on_submit(Message::Settings(Msg::TokenSave))
+                    .style(theme::input_style(tk))
+                    .size(13)
+                    .padding([7, 10]),
+                action(
+                    ui,
+                    "token:save",
+                    "Enregistrer",
+                    Btn::Primary,
+                    None,
+                    (!token_input.trim().is_empty()).then_some(Message::Settings(Msg::TokenSave))
+                ),
+                action(
+                    ui,
+                    "token:clear",
+                    "Effacer",
+                    Btn::Secondary,
+                    None,
+                    token_saved.then_some(Message::Settings(Msg::TokenClear))
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            dim(tk, token_status_text(token_saved)).size(12),
+        ]
+        .spacing(12),
+    )
+    .padding([14, 16])
+    .width(Fill);
 
     let roots_block = container(
         column![
@@ -270,6 +353,9 @@ pub fn view<'a>(
                 .on_toggle(|on| Message::Settings(Msg::ToggleTray(on)))
                 .style(theme::toggler_style(tk)),
         ),
+        tray_diag,
+        rule(ui),
+        token_block,
         rule(ui),
         setting(
             ui,
@@ -328,6 +414,14 @@ mod tests {
             system_repo: None,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn token_texts_never_leak() {
+        assert_eq!(token_status_text(true), "Jeton enregistré");
+        assert_eq!(token_status_text(false), "Aucun jeton");
+        let dbg = format!("{:?}", Msg::TokenInput(Secret("ghp_secret".into())));
+        assert!(!dbg.contains("ghp_secret"));
     }
 
     #[test]
