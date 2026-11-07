@@ -65,9 +65,32 @@ Classes CSS : `uptodate`, `outdated` (texte `❆ N`), `error`.
 - Design inspiré de Linear : thème sombre/clair selon le système, police Inter, transitions fluides (rien ne tourne au repos).
 - **Clavier** : `Ctrl+K` palette de commandes, `j`/`k` ou flèches pour naviguer, `r` vérifier, `u` mettre à jour, `Échap` fermer.
 - `--demo` : lance l'interface avec de fausses données (rien n'est lu ni écrit), pratique pour essayer.
-- **Tray optionnel** (`nixos-flakes-gui --tray` ou réglage) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter. Nécessite un hôte StatusNotifier (module `tray` de Waybar, par exemple).
+- **Tray optionnel** (`nixos-flakes-gui --tray` ou réglage) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter. Nécessite un hôte StatusNotifier, voir [Zone de notification sous niri](#zone-de-notification-sous-niri).
 
 L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour des verrous se fait toujours avec tes droits, donc `flake.lock` ne devient jamais propriété de root.
+
+### Jeton GitHub
+
+Un jeton GitHub relève la limite de requêtes de GitHub pour les mises à jour des dépôts. Tu peux le saisir dans **Réglages** :
+
+- stocké dans `~/.config/nixos-flakes/github-token`, en `0600` (lisible par toi seul) ;
+- passé à `nix` via la variable `NIX_CONFIG` ;
+- jamais transmis à `pkexec` : l'application du système ne le reçoit pas.
+
+### Zone de notification sous niri
+
+Le tray a besoin d'un **hôte StatusNotifier** pour afficher son icône. Avec niri, il faut donc :
+
+1. une barre qui fournit cet hôte, par exemple le module `tray` de Waybar ;
+2. lancer l'interface dans la session :
+   - avec `niri-session` (qui atteint `graphical-session.target`) et `services.nixos-flakes.gui.tray = true`, le service utilisateur `nixos-flakes-gui-tray` démarre seul ;
+   - avec un simple `niri` lancé depuis un TTY ou un gestionnaire de connexion, le service ne démarre pas : ajoute plutôt dans la configuration de niri (`~/.config/niri/config.kdl`) :
+
+     ```kdl
+     spawn-at-startup "nixos-flakes-gui" "--tray"
+     ```
+
+Si l'icône n'apparaît pas au démarrage, vérifie que la barre tourne déjà et que son module `tray` est activé.
 
 ## Installation sur NixOS
 
@@ -111,6 +134,16 @@ L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour
   };
 }
 ```
+
+Si la mise à jour ou le commit depuis la GUI échoue avec `path '/etc/nixos' is not owned by current user` (le dépôt système appartient à root, et `nix` refuse qu'un autre utilisateur y écrive), ajoute dans `configuration.nix` :
+
+```nix
+{
+  services.nixos-flakes.systemRepo.owner = "moi";
+}
+```
+
+Cela accorde à `moi` la lecture et l'écriture sur `/etc/nixos` via une ACL (héritée par les nouveaux fichiers) et ajoute ce chemin exact à `safe.directory` de git. Le dépôt reste la propriété de root, et l'application du système passe toujours par `pkexec`. Nécessite un système de fichiers avec ACL (ext4, btrfs, xfs…). Pour un autre chemin que `/etc/nixos`, utilise `services.nixos-flakes.systemRepo.path`.
 
 L'ancien nom `services.nixos-auto-upgrade-custom.{enable,interval}` fonctionne encore (avertissement de renommage).
 
