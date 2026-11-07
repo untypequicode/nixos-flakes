@@ -3,9 +3,9 @@
 
 use nixos_flakes_core::config::{Config, Role};
 use nixos_flakes_core::git::GitState;
-use nixos_flakes_core::lock::InputChange;
+use nixos_flakes_core::lock::{InputChange, RootInput};
 use nixos_flakes_core::status::RepoStatus;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Commande longue en cours sur un dépôt.
@@ -469,6 +469,94 @@ pub fn short_rev(rev: &Option<String>) -> String {
         .map_or_else(|| "—".to_string(), |r| r.chars().take(7).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Mises à jour sélectives (par input racine)
+// ---------------------------------------------------------------------------
+
+/// Une mise à jour est-elle disponible pour cet input racine ? Les changements
+/// portent sur les nœuds du verrou (`nixpkgs_2`…) : on compare au nœud de l'input.
+pub fn input_has_update(input: &RootInput, changes: &[InputChange]) -> bool {
+    input
+        .node
+        .as_deref()
+        .is_some_and(|node| changes.iter().any(|c| c.name == node))
+}
+
+/// Changement correspondant à un input racine, s'il y en a un.
+pub fn input_change<'a>(input: &RootInput, changes: &'a [InputChange]) -> Option<&'a InputChange> {
+    let node = input.node.as_deref()?;
+    changes.iter().find(|c| c.name == node)
+}
+
+/// Noms des inputs racine ayant une mise à jour disponible.
+pub fn updatable_names(inputs: &[RootInput], changes: &[InputChange]) -> BTreeSet<String> {
+    inputs
+        .iter()
+        .filter(|i| input_has_update(i, changes))
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// Bascule un input dans la sélection.
+pub fn toggle_selection(sel: &mut BTreeSet<String>, name: &str) {
+    if !sel.remove(name) {
+        sel.insert(name.to_string());
+    }
+}
+
+/// Tous les inputs.
+pub fn select_all(inputs: &[RootInput]) -> BTreeSet<String> {
+    inputs.iter().map(|i| i.name.clone()).collect()
+}
+
+/// Retire de la sélection les inputs qui n'existent plus (après rechargement).
+pub fn prune_selection(sel: &mut BTreeSet<String>, inputs: &[RootInput]) {
+    sel.retain(|n| inputs.iter().any(|i| &i.name == n));
+}
+
+/// Libellé du bouton de mise à jour de la sélection.
+pub fn selection_label(n: usize) -> String {
+    format!("Mettre à jour la sélection ({n})")
+}
+
+/// Texte d'une mise à jour : « nixpkgs, home-manager » ou « tous les inputs ».
+pub fn inputs_text(inputs: &[String]) -> String {
+    if inputs.is_empty() {
+        "tous les inputs".to_string()
+    } else {
+        inputs.join(", ")
+    }
+}
+
+/// Message de fin de mise à jour (journal et toast).
+pub fn update_done_text(name: &str, inputs: &[String], changed: usize) -> String {
+    if inputs.is_empty() {
+        format!("✓ {name} : mise à jour terminée ({changed} input(s) modifié(s))")
+    } else {
+        format!(
+            "✓ {name} : mise à jour de {} terminée ({changed} entrée(s) modifiée(s))",
+            inputs_text(inputs)
+        )
+    }
+}
+
+/// Mises à jour encore disponibles après une mise à jour : tout si elle portait
+/// sur tous les inputs, sinon ce qui n'a pas été touché. `None` reste `None`.
+pub fn remaining_pending(
+    pending: Option<Vec<InputChange>>,
+    inputs: &[String],
+    updated: &[InputChange],
+) -> Option<Vec<InputChange>> {
+    if inputs.is_empty() {
+        return Some(Vec::new());
+    }
+    pending.map(|p| {
+        p.into_iter()
+            .filter(|c| !updated.iter().any(|u| u.name == c.name))
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +870,76 @@ mod tests {
         assert_eq!(short_rev(&Some("abcdef0123".into())), "abcdef0");
         assert_eq!(short_rev(&None), "—");
         assert_eq!(short_name(Path::new("/home/u/nixos")), "nixos");
+    }
+
+    fn root(name: &str, node: Option<&str>) -> RootInput {
+        RootInput {
+            name: name.into(),
+            node: node.map(Into::into),
+            rev: None,
+            short_rev: Some("abc1234".into()),
+            last_modified: None,
+            kind: Some("github".into()),
+            owner: None,
+            repo: None,
+            url: Some(format!("github:o/{name}")),
+        }
+    }
+
+    #[test]
+    fn changes_match_root_nodes_not_transitive_ones() {
+        let inputs = [
+            root("nixpkgs", Some("nixpkgs")),
+            root("hm", Some("home-manager")),
+            root("follower", None),
+        ];
+        let changes = [change("home-manager", "a"), change("nixpkgs_2", "b")];
+        assert!(!input_has_update(&inputs[0], &changes));
+        assert!(input_has_update(&inputs[1], &changes));
+        assert!(!input_has_update(&inputs[2], &changes));
+        assert_eq!(
+            updatable_names(&inputs, &changes),
+            BTreeSet::from(["hm".to_string()])
+        );
+        assert_eq!(
+            input_change(&inputs[1], &changes).map(|c| c.name.as_str()),
+            Some("home-manager")
+        );
+    }
+
+    #[test]
+    fn selection_toggle_all_prune() {
+        let inputs = [root("a", Some("a")), root("b", Some("b"))];
+        let mut sel = BTreeSet::new();
+        toggle_selection(&mut sel, "a");
+        assert_eq!(sel.len(), 1);
+        toggle_selection(&mut sel, "a");
+        assert!(sel.is_empty());
+        sel = select_all(&inputs);
+        assert_eq!(sel.len(), 2);
+        sel.insert("gone".into());
+        prune_selection(&mut sel, &inputs);
+        assert_eq!(sel, select_all(&inputs));
+    }
+
+    #[test]
+    fn selection_and_update_texts() {
+        assert_eq!(selection_label(3), "Mettre à jour la sélection (3)");
+        assert_eq!(inputs_text(&[]), "tous les inputs");
+        assert_eq!(inputs_text(&["a".into(), "b".into()]), "a, b");
+        assert!(update_done_text("r", &[], 2).contains("2 input(s)"));
+        let t = update_done_text("r", &["nixpkgs".into()], 2);
+        assert!(t.contains("nixpkgs") && t.contains("2 entrée(s)"));
+    }
+
+    #[test]
+    fn partial_update_keeps_untouched_pending() {
+        let pending = Some(vec![change("a", "1"), change("b", "2")]);
+        let updated = [change("a", "1")];
+        let left = remaining_pending(pending.clone(), &["a".into()], &updated).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "b");
+        assert_eq!(remaining_pending(pending, &[], &updated), Some(vec![]));
+        assert_eq!(remaining_pending(None, &["a".into()], &updated), None);
     }
 }

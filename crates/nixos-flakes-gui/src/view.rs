@@ -1,7 +1,7 @@
 //! Affichage : barre latérale, panneau de détail, console, dialogue, palette, toasts.
 
 use crate::anim;
-use crate::app::{App, LogKind, Message, Page, Tab, CONSOLE_HEIGHT};
+use crate::app::{App, InputSelect, LogKind, Message, Page, Tab, CONSOLE_HEIGHT};
 use crate::model::{
     self, badge, format_opt_date, format_relative, group_entries, role_singular, role_title,
     short_rev, Badge, Modal, RepoEntry, RoleAction, Tone,
@@ -628,7 +628,135 @@ impl App {
                 ),
             });
         }
+        if let Some(inputs) = self.inputs_section(ui, e) {
+            col = col.push(inputs);
+        }
         col.into()
+    }
+
+    /// Liste des inputs racine : cases à cocher, mise à jour individuelle ou de la sélection.
+    fn inputs_section<'a>(&'a self, ui: &Ui<'_>, e: &'a RepoEntry) -> Option<Element<'a, Message>> {
+        let list = self.inputs.get(&e.path).filter(|l| !l.is_empty())?;
+        if !matches!(e.role, Role::System | Role::Tracked) {
+            return None;
+        }
+        let tk = ui.tk;
+        let a = model::actions(e);
+        let p = &e.path;
+        let pending = e.pending.as_deref().unwrap_or_default();
+        let empty = std::collections::BTreeSet::new();
+        let sel = self.input_sel.get(p).unwrap_or(&empty);
+        let has_updates = list.iter().any(|i| model::input_has_update(i, pending));
+
+        let mut head = row![title(tk, "Inputs", 14.0), faint(tk, list.len().to_string())]
+            .spacing(8)
+            .align_y(iced::Center);
+        head = head.push(space::horizontal());
+        if has_updates {
+            head = head.push(action(
+                ui,
+                "inputs:updatable",
+                "Avec mise à jour",
+                Btn::Ghost,
+                None,
+                Some(Message::SelectInputs(p.clone(), InputSelect::Updatable)),
+            ));
+        }
+        head = head
+            .push(action(
+                ui,
+                "inputs:all",
+                "Tout",
+                Btn::Ghost,
+                None,
+                Some(Message::SelectInputs(p.clone(), InputSelect::All)),
+            ))
+            .push(action(
+                ui,
+                "inputs:none",
+                "Aucun",
+                Btn::Ghost,
+                None,
+                (!sel.is_empty())
+                    .then(|| Message::SelectInputs(p.clone(), InputSelect::NoneSelected)),
+            ));
+
+        let mut rows = column![];
+        for (n, input) in list.iter().enumerate() {
+            let checked = sel.contains(&input.name);
+            let (pp, nm) = (p.clone(), input.name.clone());
+            let boxed = iced::widget::checkbox(checked)
+                .on_toggle(move |_| Message::ToggleInput(pp.clone(), nm.clone()))
+                .size(16);
+            let mut info = row![text(input.name.clone())
+                .size(13)
+                .font(medium())
+                .color(tk.text)]
+            .spacing(8)
+            .align_y(iced::Center);
+            if model::input_has_update(input, pending) {
+                info = info.push(pill(ui, "mise à jour", Tone::Info));
+            }
+            let mut revs = row![rev_chip(ui, short_rev(&input.short_rev), false)]
+                .spacing(6)
+                .align_y(iced::Center);
+            if let Some(c) = model::input_change(input, pending) {
+                revs = revs.push(text("→").size(12).color(tk.text3)).push(rev_chip(
+                    ui,
+                    short_rev(&c.new_rev),
+                    true,
+                ));
+            }
+            let url = input.url.clone().unwrap_or_else(|| "—".to_string());
+            let line = row![
+                boxed,
+                column![info, faint(tk, url).size(11)]
+                    .spacing(2)
+                    .width(Fill),
+                revs,
+                action(
+                    ui,
+                    &format!("input:upd:{n}"),
+                    "Mettre à jour",
+                    Btn::Secondary,
+                    None,
+                    a.update
+                        .then(|| Message::UpdateInputs(p.clone(), vec![input.name.clone()])),
+                ),
+            ]
+            .spacing(12)
+            .padding([8, 16])
+            .align_y(iced::Center);
+            rows = rows.push(line).push(hairline(ui));
+        }
+        let table = container(rows)
+            .width(Fill)
+            .clip(true)
+            .style(theme::outlined(tk));
+
+        let footer = row![
+            faint(
+                tk,
+                if sel.is_empty() {
+                    "Cochez des inputs pour les mettre à jour sans toucher aux autres.".to_string()
+                } else {
+                    format!("{} input(s) sélectionné(s)", sel.len())
+                }
+            ),
+            space::horizontal(),
+            action(
+                ui,
+                "inputs:update-sel",
+                &model::selection_label(sel.len()),
+                Btn::Primary,
+                None,
+                (a.update && !sel.is_empty()).then(|| Message::UpdateSelection(p.clone())),
+            ),
+        ]
+        .spacing(12)
+        .align_y(iced::Center);
+
+        Some(column![head, table, footer].spacing(10).into())
     }
 
     fn git_tab<'a>(&'a self, ui: &Ui<'_>, e: &'a RepoEntry) -> Element<'a, Message> {
