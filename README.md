@@ -77,6 +77,22 @@ Un jeton GitHub relève la limite de requêtes de GitHub pour les mises à jour 
 - passé à `nix` via la variable `NIX_CONFIG` ;
 - jamais transmis à `pkexec` : l'application du système ne le reçoit pas.
 
+Si ta configuration NixOS gère déjà un fichier de jeton, indique son chemin sans jamais écrire le jeton dans la configuration Nix :
+
+```nix
+services.nixos-flakes.githubTokenFile = "/run/secrets/github-token";
+```
+
+Le fichier peut contenir le jeton seul, `github.com=JETON` ou `access-tokens = github.com=JETON`. Réglages affiche alors « Jeton configuré par la configuration Nix » et la saisie est désactivée. Sans cette option, le jeton se saisit dans l'interface.
+
+### Zone de notification : prérequis par bureau
+
+L'icône utilise le standard StatusNotifierItem, sans code propre à un bureau. Il faut un hôte qui l'affiche :
+
+- **KDE Plasma** : natif, rien à ajouter ;
+- **GNOME** : installer l'extension AppIndicator / KStatusNotifierItem ;
+- **Hyprland, niri** et autres compositeurs : une barre avec hôte StatusNotifier, par exemple le module `tray` de Waybar.
+
 ### Zone de notification sous niri
 
 Le tray a besoin d'un **hôte StatusNotifier** pour afficher son icône. Avec niri, il faut donc :

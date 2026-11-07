@@ -45,6 +45,38 @@ fn is_ownership_error(e: &Error) -> bool {
     matches!(e, Error::Command { tail, .. } if tail.contains("not owned by current user"))
 }
 
+const OWNER_HINT: &str = "Ajoutez `services.nixos-flakes.systemRepo.owner = \"<utilisateur>\";` à la configuration NixOS puis reconstruisez : cela déclare le dépôt dans /etc/gitconfig (safe.directory) et accorde à cet utilisateur une ACL sur le dépôt.";
+
+/// Erreur finale quand le repli `path:` échoue aussi : garde l'erreur de
+/// propriété d'origine et ajoute une piste de correction.
+fn ownership_failure(original: Error, fallback: Error) -> Error {
+    let (
+        Error::Command {
+            program,
+            status,
+            tail: orig_tail,
+        },
+        Error::Command { tail, .. },
+    ) = (&original, &fallback)
+    else {
+        return fallback;
+    };
+    let mut msg = format!("{orig_tail}\n");
+    if tail.contains("Permission denied") {
+        msg.push_str(
+            "Repli `path:` : un fichier du dépôt n'est pas lisible par votre utilisateur.\n",
+        );
+    } else {
+        msg.push_str(&format!("Repli `path:` également en échec :\n{tail}\n"));
+    }
+    msg.push_str(OWNER_HINT);
+    Error::Command {
+        program: program.clone(),
+        status: status.clone(),
+        tail: msg,
+    }
+}
+
 pub(crate) fn check_with(nix: &str, repo: &Path, token: Option<&str>) -> Result<UpdateReport> {
     let repo_s = repo.to_string_lossy().into_owned();
     let tmp = tempfile::tempdir().map_err(|e| Error::io(std::env::temp_dir(), e))?;
@@ -73,7 +105,9 @@ pub(crate) fn check_with(nix: &str, repo: &Path, token: Option<&str>) -> Result<
         // Repli : le libgit2 de nix ignore parfois `safe.directory` ; une
         // référence `path:` évite git (le dépôt est alors copié tel quel).
         if is_ownership_error(&e) {
-            run_check(&format!("path:{repo_s}"))?;
+            if let Err(e2) = run_check(&format!("path:{repo_s}")) {
+                return Err(ownership_failure(e, e2));
+            }
         } else {
             return Err(e);
         }
@@ -284,6 +318,60 @@ esac
         fs::create_dir(&repo).unwrap();
         let nix = picky_nix(d.path());
         assert!(check_with(&nix, &repo, None).is_ok());
+    }
+
+    /// Faux `nix` : refuse le dépôt (propriétaire) ; `path:` échoue avec `fallback_msg`.
+    fn failing_both(dir: &Path, fallback_msg: &str) -> String {
+        let script = dir.join("both-fail-nix");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+flake=""
+while [ $# -gt 0 ]; do
+  case "$1" in --flake) flake="$2"; shift;; esac
+  shift
+done
+case "$flake" in
+  path:*) echo "{fallback_msg}" >&2; exit 1;;
+  *) echo "error: repository path '$flake' is not owned by current user" >&2; exit 1;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn failed_fallback_keeps_original_error_and_hints_owner_option() {
+        let d = tempfile::tempdir().unwrap();
+        let nix = failing_both(d.path(), "error: boom");
+        let err = check_with(&nix, d.path(), None).unwrap_err().to_string();
+        assert!(err.contains("not owned by current user"), "{err}");
+        assert!(err.contains("error: boom"), "{err}");
+        assert!(
+            err.contains("services.nixos-flakes.systemRepo.owner"),
+            "{err}"
+        );
+        assert!(
+            err.contains("safe.directory") && err.contains("ACL"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn permission_denied_fallback_explains_unreadable_file() {
+        let d = tempfile::tempdir().unwrap();
+        let nix = failing_both(d.path(), "error: opening file: Permission denied");
+        let err = check_with(&nix, d.path(), None).unwrap_err().to_string();
+        assert!(err.contains("n'est pas lisible"), "{err}");
+        assert!(err.contains("not owned by current user"), "{err}");
+        assert!(
+            err.contains("services.nixos-flakes.systemRepo.owner"),
+            "{err}"
+        );
     }
 
     #[test]
