@@ -6,6 +6,7 @@ Recueil d'outils Nix/NixOS écrits en Rust. Le premier outil gère les **flakes 
 | --- | --- | --- |
 | CLI | `nixos-flakes` | Vérifier, mettre à jour, appliquer, mise à niveau automatique, sortie Waybar |
 | GUI | `nixos-flakes-gui` | Interface moderne (iced) avec icône de zone de notification optionnelle |
+| Extension Firefox/Zen | `firefox-image-downloader-visible` | Liste et télécharge les images/vidéos visibles à l'écran (voir [la section dédiée](#extension-firefoxzen--image-downloader-visible)) |
 
 D'autres outils viendront dans `crates/` : tout crate binaire est automatiquement exposé par le flake (voir [Ajouter un outil](#ajouter-un-outil)).
 
@@ -145,6 +146,134 @@ nix build .#mon-outil     # paquet et app générés automatiquement
 ```
 
 Réutilise `nixos-flakes-core` si besoin (`nixos-flakes-core = { path = "../nixos-flakes-core" }`). Pour un module NixOS dédié, ajoute `modules/mon-outil.nix`.
+
+## Extension Firefox/Zen : Image Downloader Visible
+
+Le dossier `pkgs/firefox-image-downloader-visible/src` contient le code source
+de l'extension (manifest V3). Elle liste toutes les images et vidéos
+*visibles à l'écran* sur l'onglet actif (y compris les images de fond CSS, le
+contenu de `<canvas>`, le Shadow DOM…) et permet de les prévisualiser, les
+ouvrir, les copier ou les télécharger, individuellement ou en masse.
+
+Contrairement à la version d'origine, elle n'injecte plus de script en
+permanence sur `<all_urls>` : le code d'analyse (`content.js`) n'est exécuté
+qu'à la demande, sur l'onglet actif, quand vous ouvrez le popup
+(`browser.scripting.executeScript` + permission `activeTab`). C'est plus
+respectueux de la vie privée et plus léger.
+
+### ⚠️ Signature Mozilla : ce qu'il faut savoir
+
+Firefox et Zen (basés tous les deux sur le canal *release* de Gecko)
+**refusent d'installer en permanence une extension qui n'est pas signée par
+Mozilla**, y compris via les policies entreprise (`ExtensionSettings`). Seuls
+les canaux ESR, Nightly et Developer Edition permettent de désactiver cette
+vérification. Deux chemins sont donc proposés :
+
+#### Option A — Mode dev / ESR (100 % reproductible, aucun secret nécessaire)
+
+Le paquet `firefox-image-downloader-visible` construit un `.xpi` **non
+signé** directement depuis les sources, à chaque build. Utilisable seulement
+avec `pkgs.firefox-esr` (ou Nightly/Developer Edition), en désactivant la
+vérification de signature :
+
+```nix
+{ pkgs, inputs, ... }:
+{
+  programs.firefox = {
+    enable = true;
+    package = pkgs.firefox-esr;
+    policies = {
+      Preferences."xpinstall.signatures.required" = {
+        Value = false;
+        Status = "locked";
+      };
+    } // {
+      ExtensionSettings =
+        inputs.untypequicode-flakes.lib.mkImageDownloaderExtensionSettings {
+          system = pkgs.system;
+          useSigned = false;
+        };
+    };
+  };
+}
+```
+
+#### Option B — Mode production (Firefox release + Zen)
+
+1. Créez un compte sur [addons.mozilla.org](https://addons.mozilla.org),
+   récupérez une clé API (JWT issuer/secret) dans vos paramètres développeur.
+2. Depuis `pkgs/firefox-image-downloader-visible/src`, générez le `.xpi`
+   signé (une seule fois, à chaque nouvelle version) :
+
+   ```bash
+   npx web-ext sign \
+     --channel=unlisted \
+     --api-key=$AMO_JWT_ISSUER \
+     --api-secret=$AMO_JWT_SECRET \
+     --source-dir=pkgs/firefox-image-downloader-visible/src \
+     --artifacts-dir=/tmp/web-ext-artifacts
+   ```
+
+3. Copiez le fichier généré dans le repo et committez-le :
+
+   ```bash
+   cp /tmp/web-ext-artifacts/*.xpi \
+     pkgs/firefox-image-downloader-visible-signed/image-downloader-visible-signed.xpi
+   ```
+
+4. Le paquet `firefox-image-downloader-visible-signed` (et le module
+   `nixosModules.image-downloader-visible`) deviennent automatiquement
+   disponibles — Nix ne fait plus que copier ce `.xpi` déjà signé, sans appel
+   réseau au moment du build.
+
+**Pour Firefox**, via le module fourni :
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.untypequicode-flakes.nixosModules.image-downloader-visible ];
+
+  programs.firefox.enable = true;
+  programs.image-downloader-visible.enable = true; # useSigned = true par défaut
+}
+```
+
+**Pour Zen Browser**, en réutilisant la même fonction partagée via l'override
+`extraPolicies` exposé par `youwen5/zen-browser-flake` :
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [
+    (inputs.zen-browser.packages.${pkgs.stdenv.hostPlatform.system}.default.override {
+      extraPolicies = {
+        ExtensionSettings =
+          inputs.untypequicode-flakes.lib.mkImageDownloaderExtensionSettings {
+            system = pkgs.stdenv.hostPlatform.system;
+            useSigned = true;
+          };
+      };
+    })
+  ];
+}
+```
+
+### Développement / test rapide sans signer
+
+Pour itérer sur le code sans passer par la signature à chaque fois, chargez
+l'extension temporairement (elle disparaît au redémarrage de Firefox, mais ne
+nécessite ni policy ni signature) :
+
+1. Ouvrez `about:debugging#/runtime/this-firefox`.
+2. Cliquez sur « Charger un module complémentaire temporaire… ».
+3. Sélectionnez `pkgs/firefox-image-downloader-visible/src/manifest.json`.
+
+Ou en une commande, via `web-ext` :
+
+```bash
+nix run nixpkgs#nodePackages.web-ext -- run \
+  --source-dir=pkgs/firefox-image-downloader-visible/src
+```
 
 ## Licence
 

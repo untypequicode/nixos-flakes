@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Téléchargeur d'Images Visibles",
+  "version": "1.2",
+  "description": "Gérez et téléchargez les images et vidéos visibles à l'écran.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "image-downloader-visible@untypequicode.dev",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting",
+    "clipboardWrite"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Voir les images",
+    "default_icon": "icon.svg"
+  },
+  "icons": {
+    "48": "icon.svg",
+    "128": "icon.svg"
+  }
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <link rel="stylesheet" href="popup.css" />
+    </head>
+    <body>
+        <div id="header">
+            <span id="title-text">Recherche...</span>
+            <button id="download-all" style="display: none">
+                Tout télécharger
+            </button>
+        </div>
+        <div id="toolbar" style="display: none">
+            <label>
+                Trier :
+                <select id="sort-select">
+                    <option value="default">Ordre d'apparition</option>
+                    <option value="size-desc">Plus grand d'abord</option>
+                    <option value="size-asc">Plus petit d'abord</option>
+                </select>
+            </label>
+            <label>
+                Taille min (px) :
+                <input type="number" id="min-size" min="0" step="10" placeholder="0" />
+            </label>
+        </div>
+        <div id="gallery">
+            <div id="loading" class="message">
+                Analyse de la page en cours...
+            </div>
+        </div>
+        <script src="popup.js"></script>
+    </body>
+</html>
