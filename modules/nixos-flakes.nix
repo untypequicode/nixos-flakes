@@ -91,6 +91,24 @@ in
       };
     };
 
+    githubTokenFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/github-token";
+      description = ''
+        Chemin d'un fichier contenant le jeton GitHub (jeton brut, `github.com=JETON` ou
+        `access-tokens = github.com=JETON`), par exemple géré par sops-nix ou agenix.
+        Exporté dans `NIXOS_FLAKES_GITHUB_TOKEN_FILE` (session, service de la zone de
+        notification et mise à niveau automatique) : l'interface, la CLI, la zone de
+        notification et la mise à niveau l'utilisent en lecture seule.
+        Le type est `str` et non `path` pour qu'un chemin d'exécution ne soit pas copié dans
+        le store : le contenu du fichier n'est jamais écrit dans la configuration Nix.
+        Le fichier doit être lisible par chaque utilisateur concerné ; pour le service
+        de mise à niveau (root), root doit pouvoir le lire.
+        `null` : jeton géré depuis l'interface (`~/.config/nixos-flakes/github-token`).
+      '';
+    };
+
     gui = {
       enable = mkEnableOption "l'interface graphique nixos-flakes-gui";
 
@@ -120,11 +138,15 @@ in
           pkgs.nixos-rebuild
           pkgs.libnotify
         ];
-        environment = lib.mkIf (cfg.autoUpgrade.user != null) {
-          GIT_CONFIG_COUNT = "1";
-          GIT_CONFIG_KEY_0 = "safe.directory";
-          GIT_CONFIG_VALUE_0 = "*";
-        };
+        environment =
+          lib.optionalAttrs (cfg.autoUpgrade.user != null) {
+            GIT_CONFIG_COUNT = "1";
+            GIT_CONFIG_KEY_0 = "safe.directory";
+            GIT_CONFIG_VALUE_0 = "*";
+          }
+          // lib.optionalAttrs (cfg.githubTokenFile != null) {
+            NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
+          };
         serviceConfig = {
           Type = "oneshot";
           ExecStart = "${lib.getExe cfg.package} upgrade --notify ${lib.escapeShellArg cfg.autoUpgrade.flakePath}";
@@ -156,6 +178,9 @@ in
         wantedBy = [ "graphical-session.target" ];
         partOf = [ "graphical-session.target" ];
         after = [ "graphical-session.target" ];
+        environment = lib.optionalAttrs (cfg.githubTokenFile != null) {
+          NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
+        };
         serviceConfig = {
           ExecStart = "${lib.getExe' cfg.guiPackage "nixos-flakes-gui"} --tray";
           Restart = "on-failure";
@@ -176,6 +201,10 @@ in
         enable = true;
         config.safe.directory = [ cfg.systemRepo.path ];
       };
+    })
+
+    (lib.mkIf (cfg.githubTokenFile != null) {
+      environment.sessionVariables.NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
     })
 
     {
