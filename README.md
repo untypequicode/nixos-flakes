@@ -61,6 +61,9 @@ Classes CSS : `uptodate`, `outdated` (texte `❆ N`), `error`.
 - Console de logs en direct.
 - **Flux git** : avant la mise à jour, si le dépôt a des modifications non commitées, proposition de les commiter ; après, proposition de commiter `flake.lock` seul. Jamais de push automatique.
 - Réglages : racines de scan, profondeur, tray, fréquence de vérification.
+- Design inspiré de Linear : thème sombre/clair selon le système, police Inter, transitions fluides (rien ne tourne au repos).
+- **Clavier** : `Ctrl+K` palette de commandes, `j`/`k` ou flèches pour naviguer, `r` vérifier, `u` mettre à jour, `Échap` fermer.
+- `--demo` : lance l'interface avec de fausses données (rien n'est lu ni écrit), pratique pour essayer.
 - **Tray optionnel** (`nixos-flakes-gui --tray` ou réglage) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter. Nécessite un hôte StatusNotifier (module `tray` de Waybar, par exemple).
 
 L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour des verrous se fait toujours avec tes droits, donc `flake.lock` ne devient jamais propriété de root.
