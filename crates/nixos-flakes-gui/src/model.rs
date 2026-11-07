@@ -5,7 +5,7 @@ use nixos_flakes_core::config::{Config, Role};
 use nixos_flakes_core::git::GitState;
 use nixos_flakes_core::lock::InputChange;
 use nixos_flakes_core::status::RepoStatus;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Commande longue en cours sur un dépôt.
@@ -116,18 +116,6 @@ impl Badge {
             Badge::Dirty => Tone::Warning,
             Badge::UpToDate => Tone::Success,
             Badge::Unchecked => Tone::Neutral,
-        }
-    }
-
-    /// Pastille d'état (un caractère).
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Badge::Busy(_) => "◔",
-            Badge::Error => "✕",
-            Badge::Updates(_) => "↑",
-            Badge::Dirty => "●",
-            Badge::UpToDate => "✓",
-            Badge::Unchecked => "○",
         }
     }
 }
@@ -445,6 +433,36 @@ pub fn format_opt_date(ts: Option<i64>) -> String {
     ts.map_or_else(|| "—".to_string(), format_date)
 }
 
+/// Date relative en français (« hier », « il y a 3 j »…) par rapport à `now` (secondes Unix).
+pub fn format_relative(ts: i64, now: i64) -> String {
+    let d = now - ts;
+    if d < 0 {
+        return "à venir".to_string();
+    }
+    let (min, hour, day) = (60, 3_600, 86_400);
+    match d {
+        _ if d < min => "à l'instant".to_string(),
+        _ if d < hour => format!("il y a {} min", d / min),
+        _ if d < day => format!("il y a {} h", d / hour),
+        _ if d < 2 * day => "hier".to_string(),
+        _ if d < 30 * day => format!("il y a {} j", d / day),
+        _ if d < 365 * day => format!("il y a {} mois", d / (30 * day)),
+        _ => {
+            let y = d / (365 * day);
+            format!("il y a {y} an{}", if y > 1 { "s" } else { "" })
+        }
+    }
+}
+
+/// Ordre de parcours des dépôts dans la barre latérale (groupes repliés exclus).
+pub fn nav_order(entries: &[RepoEntry], collapsed: &HashSet<Role>) -> Vec<PathBuf> {
+    group_entries(entries)
+        .into_iter()
+        .filter(|(role, _)| !collapsed.contains(role))
+        .flat_map(|(_, idx)| idx.into_iter().map(|i| entries[i].path.clone()))
+        .collect()
+}
+
 /// Révision abrégée (7 caractères) ou « — ».
 pub fn short_rev(rev: &Option<String>) -> String {
     rev.as_deref()
@@ -484,6 +502,34 @@ mod tests {
             dirty: vec!["a.nix".into()],
             lock_dirty: false,
         }
+    }
+
+    #[test]
+    fn relative_dates() {
+        let now = 100 * 86_400;
+        assert_eq!(format_relative(now - 5, now), "à l'instant");
+        assert_eq!(format_relative(now - 600, now), "il y a 10 min");
+        assert_eq!(format_relative(now - 7_300, now), "il y a 2 h");
+        assert_eq!(format_relative(now - 86_400 - 10, now), "hier");
+        assert_eq!(format_relative(now - 5 * 86_400, now), "il y a 5 j");
+        assert_eq!(format_relative(now - 65 * 86_400, now), "il y a 2 mois");
+        assert_eq!(format_relative(now - 800 * 86_400, now), "il y a 2 ans");
+        assert_eq!(format_relative(now + 10, now), "à venir");
+    }
+
+    #[test]
+    fn nav_order_follows_groups_and_skips_collapsed() {
+        let es = vec![
+            entry("/t2", Role::Tracked),
+            entry("/s", Role::System),
+            entry("/t1", Role::Tracked),
+            entry("/d", Role::Detected),
+        ];
+        let all = nav_order(&es, &HashSet::new());
+        let names: Vec<_> = all.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(names, ["/s", "/t1", "/t2", "/d"]);
+        let some = nav_order(&es, &HashSet::from([Role::Tracked]));
+        assert_eq!(some, [PathBuf::from("/s"), PathBuf::from("/d")]);
     }
 
     #[test]

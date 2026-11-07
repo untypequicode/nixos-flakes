@@ -13,16 +13,24 @@ pub struct Cli {
     pub help: bool,
     /// `--version` / `-V`.
     pub version: bool,
+    /// `--demo` : faux dépôts et commandes simulées (aucun dépôt réel n'est touché).
+    pub demo: bool,
+    /// `--demo-view <vues>` : états à ouvrir au démarrage en mode démo (séparés par des virgules).
+    pub demo_view: Vec<String>,
 }
 
 pub const USAGE: &str = "\
 Usage : nixos-flakes-gui [OPTIONS]
 
 Options :
-      --tray            Active l'icône de notification (démarre masqué si elle est disponible)
+      --tray              Active l'icône de notification (démarre masqué si elle est disponible)
       --config <FICHIER>  Utilise ce fichier de configuration
-  -h, --help            Affiche cette aide
-  -V, --version         Affiche la version";
+      --demo              Mode démonstration : faux dépôts et commandes simulées, rien n'est modifié
+      --demo-view <VUES>  Avec --demo, ouvre au démarrage des vues (séparées par des virgules) :
+                          palette, recherche, modal, reglages, verif, git, erreur, site,
+                          replie, toasts, clair
+  -h, --help              Affiche cette aide
+  -V, --version           Affiche la version";
 
 /// Analyse les arguments (sans le nom du programme).
 pub fn parse<I, S>(args: I) -> Result<Cli, String>
@@ -35,6 +43,14 @@ where
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--tray" => cli.tray = true,
+            "--demo" => cli.demo = true,
+            "--demo-view" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--demo-view attend une liste de vues".to_string())?;
+                cli.demo = true;
+                cli.demo_view = v.split(',').map(str::to_string).collect();
+            }
             "-h" | "--help" => cli.help = true,
             "-V" | "--version" => cli.version = true,
             "--config" => {
@@ -74,6 +90,15 @@ mod tests {
     fn help_and_version() {
         assert!(parse(["-h"]).unwrap().help);
         assert!(parse(["--version"]).unwrap().version);
+    }
+
+    #[test]
+    fn demo_flags() {
+        assert!(parse(["--demo"]).unwrap().demo);
+        let c = parse(["--demo-view", "palette,clair"]).unwrap();
+        assert!(c.demo);
+        assert_eq!(c.demo_view, ["palette", "clair"]);
+        assert!(parse(["--demo-view"]).is_err());
     }
 
     #[test]

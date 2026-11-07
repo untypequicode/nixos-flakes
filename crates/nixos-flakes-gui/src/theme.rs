@@ -1,7 +1,12 @@
-//! Thème personnalisé (clair/sombre) et styles des composants.
+//! Jetons de design (clair/sombre) et styles des composants, façon Linear :
+//! surfaces sombres en couches, filets à ~7 % de blanc, un seul accent indigo.
+//!
+//! Tout est dérivé de [`Tokens`] ; l'interpolation entre deux jeux de jetons
+//! ([`Tokens::mix`]) anime le changement de thème.
 
+use crate::anim::{lerp, lerp_color};
 use crate::model::Tone;
-use iced::widget::{button, container, text_input};
+use iced::widget::{button, container, scrollable, text_editor, text_input, toggler};
 use iced::{border, Background, Border, Color, Shadow, Theme, Vector};
 use std::process::Command;
 
@@ -26,33 +31,155 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
 
-pub fn palette(mode: Mode) -> iced::theme::Palette {
+const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
+    Color::from_rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a)
+}
+
+/// Jetons de couleur d'un thème.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tokens {
+    /// Fond de l'application (barre latérale).
+    pub bg: Color,
+    /// Panneau principal.
+    pub panel: Color,
+    /// Éléments surélevés (cartes, champs, menus).
+    pub raised: Color,
+    /// Voile de survol (translucide).
+    pub hover: Color,
+    /// Voile de sélection (translucide).
+    pub selected: Color,
+    /// Filet de 1 px.
+    pub border: Color,
+    /// Filet appuyé (champs, boutons).
+    pub border_strong: Color,
+    pub text: Color,
+    pub text2: Color,
+    pub text3: Color,
+    pub accent: Color,
+    pub accent_hover: Color,
+    pub on_accent: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub danger: Color,
+    /// Voile derrière les dialogues (alpha maximal).
+    pub scrim: Color,
+}
+
+pub fn tokens(mode: Mode) -> Tokens {
     match mode {
-        Mode::Dark => iced::theme::Palette {
-            background: rgb(0x14, 0x16, 0x1b),
-            text: rgb(0xe6, 0xe8, 0xee),
-            primary: rgb(0x7c, 0x8c, 0xff),
-            success: rgb(0x4a, 0xc2, 0x8a),
-            warning: rgb(0xe8, 0xb2, 0x4a),
-            danger: rgb(0xf0, 0x6a, 0x6a),
+        Mode::Dark => Tokens {
+            bg: rgb(0x0F, 0x10, 0x11),
+            panel: rgb(0x15, 0x16, 0x18),
+            raised: rgb(0x1B, 0x1C, 0x1F),
+            hover: rgba(255, 255, 255, 0.045),
+            selected: rgba(255, 255, 255, 0.085),
+            border: rgba(255, 255, 255, 0.07),
+            border_strong: rgba(255, 255, 255, 0.12),
+            text: rgb(0xED, 0xED, 0xEF),
+            text2: rgb(0x8A, 0x8F, 0x98),
+            text3: rgb(0x62, 0x66, 0x6D),
+            accent: rgb(0x5E, 0x6A, 0xD2),
+            accent_hover: rgb(0x6F, 0x7B, 0xE0),
+            on_accent: rgb(0xFF, 0xFF, 0xFF),
+            success: rgb(0x4C, 0xA8, 0x7A),
+            warning: rgb(0xD1, 0xA1, 0x4A),
+            danger: rgb(0xE0, 0x6C, 0x66),
+            scrim: rgba(0, 0, 0, 0.60),
         },
-        Mode::Light => iced::theme::Palette {
-            background: rgb(0xf3, 0xf4, 0xf8),
-            text: rgb(0x1c, 0x1f, 0x2a),
-            primary: rgb(0x4a, 0x5b, 0xe0),
-            success: rgb(0x1a, 0x8a, 0x5c),
-            warning: rgb(0xb7, 0x7a, 0x12),
-            danger: rgb(0xc7, 0x3a, 0x3a),
+        Mode::Light => Tokens {
+            bg: rgb(0xF4, 0xF5, 0xF6),
+            panel: rgb(0xFC, 0xFC, 0xFD),
+            raised: rgb(0xFF, 0xFF, 0xFF),
+            hover: rgba(0, 0, 0, 0.04),
+            selected: rgba(0, 0, 0, 0.07),
+            border: rgba(0, 0, 0, 0.08),
+            border_strong: rgba(0, 0, 0, 0.14),
+            text: rgb(0x1F, 0x20, 0x23),
+            text2: rgb(0x62, 0x66, 0x6D),
+            text3: rgb(0x8A, 0x8F, 0x98),
+            accent: rgb(0x5E, 0x6A, 0xD2),
+            accent_hover: rgb(0x4F, 0x5B, 0xC4),
+            on_accent: rgb(0xFF, 0xFF, 0xFF),
+            success: rgb(0x2E, 0x8B, 0x5E),
+            warning: rgb(0xA8, 0x70, 0x0E),
+            danger: rgb(0xC4, 0x44, 0x3E),
+            scrim: rgba(20, 22, 30, 0.38),
         },
     }
 }
 
-pub fn theme(mode: Mode) -> Theme {
-    let name = match mode {
-        Mode::Dark => "Flakes sombre",
-        Mode::Light => "Flakes clair",
-    };
-    Theme::custom(name.to_string(), palette(mode))
+impl Tokens {
+    /// Interpolation champ par champ (animation du thème).
+    pub fn mix(a: Tokens, b: Tokens, t: f32) -> Tokens {
+        let m = |x: Color, y: Color| lerp_color(x, y, t);
+        Tokens {
+            bg: m(a.bg, b.bg),
+            panel: m(a.panel, b.panel),
+            raised: m(a.raised, b.raised),
+            hover: m(a.hover, b.hover),
+            selected: m(a.selected, b.selected),
+            border: m(a.border, b.border),
+            border_strong: m(a.border_strong, b.border_strong),
+            text: m(a.text, b.text),
+            text2: m(a.text2, b.text2),
+            text3: m(a.text3, b.text3),
+            accent: m(a.accent, b.accent),
+            accent_hover: m(a.accent_hover, b.accent_hover),
+            on_accent: m(a.on_accent, b.on_accent),
+            success: m(a.success, b.success),
+            warning: m(a.warning, b.warning),
+            danger: m(a.danger, b.danger),
+            scrim: m(a.scrim, b.scrim),
+        }
+    }
+
+    /// Couleur associée à un ton sémantique.
+    pub fn tone(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Neutral => self.text3,
+            Tone::Success => self.success,
+            Tone::Info => self.accent,
+            Tone::Warning => self.warning,
+            Tone::Danger => self.danger,
+        }
+    }
+
+    /// Teinte lisible d'un ton pour du texte (l'accent est éclairci sur fond sombre).
+    pub fn tone_text(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Neutral => self.text2,
+            Tone::Info => lerp_color(self.accent, self.text, 0.35),
+            other => self.tone(other),
+        }
+    }
+
+    /// Thème iced (palette) cohérent avec les jetons, pour les widgets non stylés.
+    pub fn iced_theme(&self, name: &str) -> Theme {
+        Theme::custom(
+            name.to_string(),
+            iced::theme::Palette {
+                background: self.bg,
+                text: self.text,
+                primary: self.accent,
+                success: self.success,
+                warning: self.warning,
+                danger: self.danger,
+            },
+        )
+    }
+
+    pub fn is_dark(&self) -> bool {
+        (self.bg.r + self.bg.g + self.bg.b) / 3.0 < 0.5
+    }
+}
+
+pub fn with_alpha(c: Color, a: f32) -> Color {
+    Color { a, ..c }
+}
+
+/// Multiplie l'opacité d'une couleur.
+pub fn fade(c: Color, k: f32) -> Color {
+    Color { a: c.a * k, ..c }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,129 +240,147 @@ pub fn detect_system_mode() -> Mode {
 }
 
 // ---------------------------------------------------------------------------
-// Styles
+// Styles de conteneurs
 // ---------------------------------------------------------------------------
 
-pub fn with_alpha(c: Color, a: f32) -> Color {
-    Color { a, ..c }
-}
-
-pub fn muted(theme: &Theme) -> Color {
-    with_alpha(theme.palette().text, 0.6)
-}
-
-pub fn tone_color(theme: &Theme, tone: Tone) -> Color {
-    let p = theme.palette();
-    match tone {
-        Tone::Neutral => with_alpha(p.text, 0.55),
-        Tone::Success => p.success,
-        Tone::Info => p.primary,
-        Tone::Warning => p.warning,
-        Tone::Danger => p.danger,
+fn hairline(c: Color, radius: f32) -> Border {
+    Border {
+        color: c,
+        width: 1.0,
+        radius: radius.into(),
     }
 }
 
-fn outline(theme: &Theme) -> Color {
-    with_alpha(theme.palette().text, 0.10)
+/// Fond de l'application / barre latérale.
+pub fn sidebar(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.bg)),
+        ..container::Style::default()
+    }
 }
 
-pub fn surface(theme: &Theme) -> Color {
-    theme.extended_palette().background.weak.color
+/// Panneau principal, filet à gauche simulé par la bordure.
+pub fn panel(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.panel)),
+        border: hairline(tk.border, 0.0),
+        ..container::Style::default()
+    }
 }
 
-/// Carte arrondie.
-pub fn card(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(surface(theme))),
-        border: Border {
-            color: outline(theme),
-            width: 1.0,
-            radius: 14.0.into(),
-        },
+/// Carte surélevée aux filets fins.
+pub fn card(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.raised)),
+        border: hairline(tk.border, 10.0),
+        ..container::Style::default()
+    }
+}
+
+/// Bloc plat (tableaux) : fond du panneau, filet fin.
+pub fn outlined(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: None,
+        border: hairline(tk.border, 8.0),
+        ..container::Style::default()
+    }
+}
+
+/// Fenêtre flottante (dialogue, palette) : carte avec ombre portée.
+pub fn floating(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.raised)),
+        border: hairline(tk.border_strong, 12.0),
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.12),
-            offset: Vector::new(0.0, 2.0),
-            blur_radius: 8.0,
+            color: Color::from_rgba(0.0, 0.0, 0.0, if tk.is_dark() { 0.55 } else { 0.18 }),
+            offset: Vector::new(0.0, 14.0),
+            blur_radius: 36.0,
         },
         ..container::Style::default()
     }
 }
 
-/// Fond de la barre latérale.
-pub fn sidebar(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(
-            theme.extended_palette().background.base.color,
-        )),
-        border: Border {
-            color: outline(theme),
-            width: 1.0,
-            radius: 0.0.into(),
+/// Info-bulle.
+pub fn tooltip(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.raised)),
+        text_color: Some(tk.text),
+        border: hairline(tk.border_strong, 6.0),
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
         },
         ..container::Style::default()
     }
 }
 
-/// Console : fond légèrement plus sombre que la base.
-pub fn console(theme: &Theme) -> container::Style {
-    let base = theme.extended_palette().background.base.color;
-    let dark = crate::theme::is_dark(theme);
-    let bg = if dark {
-        Color::from_rgb(base.r * 0.7, base.g * 0.7, base.b * 0.7)
-    } else {
-        Color::from_rgb(base.r * 0.96, base.g * 0.96, base.b * 0.96)
-    };
-    container::Style {
-        background: Some(Background::Color(bg)),
-        border: Border {
-            color: outline(theme),
-            width: 1.0,
-            radius: 0.0.into(),
-        },
+/// Voile derrière un dialogue ; `k` ∈ [0, 1] règle l'opacité.
+pub fn scrim(tk: Tokens, k: f32) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(fade(tk.scrim, k))),
         ..container::Style::default()
     }
 }
 
-pub fn is_dark(theme: &Theme) -> bool {
-    let b = theme.palette().background;
-    (b.r + b.g + b.b) / 3.0 < 0.5
+/// Aplat d'une couleur (voiles de fondu, séparateurs, pastilles).
+pub fn flat(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(color)),
+        border: border::rounded(radius),
+        ..container::Style::default()
+    }
 }
 
-/// Pastille discrète colorée selon le ton.
-pub fn badge(tone: Tone) -> impl Fn(&Theme) -> container::Style {
-    move |theme| {
-        let c = tone_color(theme, tone);
+/// Pastille (pilule) discrète teintée selon le ton : texte coloré, fond à ~12 %.
+pub fn pill(tk: Tone, t: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| {
+        let c = t.tone(tk);
         container::Style {
-            background: Some(Background::Color(with_alpha(c, 0.16))),
-            text_color: Some(c),
-            border: border::rounded(999),
+            background: Some(Background::Color(with_alpha(c, 0.13))),
+            text_color: Some(t.tone_text(tk)),
+            border: Border {
+                color: with_alpha(c, 0.22),
+                width: 1.0,
+                radius: 999.0.into(),
+            },
             ..container::Style::default()
         }
     }
 }
 
-/// Voile derrière un dialogue.
-pub fn scrim(_: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
+/// Chip de révision (monospace) ou raccourci clavier.
+pub fn chip(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.hover)),
+        text_color: Some(tk.text2),
+        border: hairline(tk.border, 5.0),
         ..container::Style::default()
     }
 }
 
 /// Bandeau d'erreur.
-pub fn error_banner(theme: &Theme) -> container::Style {
-    let c = theme.palette().danger;
-    container::Style {
-        background: Some(Background::Color(with_alpha(c, 0.12))),
-        text_color: Some(c),
-        border: Border {
-            color: with_alpha(c, 0.4),
-            width: 1.0,
-            radius: 10.0.into(),
-        },
+pub fn error_banner(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(with_alpha(tk.danger, 0.10))),
+        text_color: Some(tk.danger),
+        border: hairline(with_alpha(tk.danger, 0.30), 8.0),
         ..container::Style::default()
     }
 }
+
+/// Console : plus profonde que le panneau.
+pub fn console(tk: Tokens) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(tk.bg)),
+        border: hairline(tk.border, 0.0),
+        ..container::Style::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Boutons
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Btn {
@@ -245,102 +390,214 @@ pub enum Btn {
     Ghost,
 }
 
-fn disabled_style(theme: &Theme, base: button::Style) -> button::Style {
-    button::Style {
-        background: base
-            .background
-            .map(|_| Background::Color(with_alpha(theme.palette().text, 0.06))),
-        text_color: with_alpha(theme.palette().text, 0.3),
-        ..base
-    }
-}
-
-/// Style de bouton.
-pub fn button_style(kind: Btn) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = theme.palette();
-        let (bg, fg) = match kind {
-            Btn::Primary => (Some(p.primary), readable_on(p.primary)),
-            Btn::Secondary => (Some(with_alpha(p.text, 0.08)), p.text),
-            Btn::Danger => (Some(with_alpha(p.danger, 0.14)), p.danger),
-            Btn::Ghost => (None, p.text),
+/// Style de bouton ; `hover` ∈ [0, 1] est le niveau animé de survol.
+pub fn button_style(
+    tk: Tokens,
+    kind: Btn,
+    hover: f32,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let (rest, over, fg, edge) = match kind {
+            Btn::Primary => (tk.accent, tk.accent_hover, tk.on_accent, Color::TRANSPARENT),
+            Btn::Secondary => (
+                with_alpha(tk.raised, 1.0),
+                lerp_color(tk.raised, tk.text, 0.07),
+                tk.text,
+                tk.border_strong,
+            ),
+            Btn::Danger => (
+                with_alpha(tk.danger, 0.10),
+                with_alpha(tk.danger, 0.20),
+                tk.danger,
+                with_alpha(tk.danger, 0.28),
+            ),
+            Btn::Ghost => (Color::TRANSPARENT, tk.hover, tk.text2, Color::TRANSPARENT),
+        };
+        let h = match status {
+            button::Status::Pressed => 1.3,
+            _ => hover,
+        };
+        let mut bg = lerp_color(rest, over, h.min(1.0));
+        if h > 1.0 {
+            // Pression : un cran plus marqué que le survol.
+            bg = lerp_color(bg, tk.text, 0.05);
+        }
+        let fg = if kind == Btn::Ghost {
+            lerp_color(fg, tk.text, hover.min(1.0))
+        } else {
+            fg
         };
         let base = button::Style {
-            background: bg.map(Background::Color),
+            background: Some(Background::Color(bg)),
             text_color: fg,
-            border: Border {
-                color: if kind == Btn::Ghost {
-                    outline(theme)
-                } else {
-                    Color::TRANSPARENT
-                },
-                width: 1.0,
-                radius: 10.0.into(),
-            },
+            border: hairline(edge, 7.0),
             ..button::Style::default()
         };
         match status {
-            button::Status::Active => base,
-            button::Status::Hovered => button::Style {
-                background: Some(Background::Color(match (kind, bg) {
-                    (Btn::Primary, Some(c)) => with_alpha(c, 0.88),
-                    (_, Some(c)) => with_alpha(c, (c.a + 0.08).min(1.0)),
-                    (_, None) => with_alpha(p.text, 0.07),
-                })),
+            button::Status::Disabled => button::Style {
+                background: match kind {
+                    Btn::Primary | Btn::Secondary => Some(Background::Color(tk.hover)),
+                    _ => None,
+                },
+                text_color: tk.text3,
+                border: hairline(with_alpha(edge, edge.a * 0.5), 7.0),
                 ..base
             },
-            button::Status::Pressed => button::Style {
-                background: Some(Background::Color(match bg {
-                    Some(c) => with_alpha(c, (c.a + 0.16).min(1.0)),
-                    None => with_alpha(p.text, 0.12),
-                })),
-                ..base
-            },
-            button::Status::Disabled => disabled_style(theme, base),
+            _ => base,
         }
     }
 }
 
-fn readable_on(c: Color) -> Color {
-    if (c.r * 0.299 + c.g * 0.587 + c.b * 0.114) > 0.62 {
-        Color::BLACK
-    } else {
-        Color::WHITE
-    }
-}
-
-/// Ligne cliquable de la barre latérale.
-pub fn row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let p = theme.palette();
-        let bg = match (selected, status) {
-            (true, _) => Some(with_alpha(p.primary, 0.18)),
-            (false, button::Status::Hovered | button::Status::Pressed) => {
-                Some(with_alpha(p.text, 0.06))
-            }
-            _ => None,
-        };
+/// Ligne cliquable (barre latérale, palette) : fond animé par survol et sélection.
+pub fn row_style(
+    tk: Tokens,
+    hover: f32,
+    selected: f32,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, _| {
+        let bg = lerp_color(
+            Color::TRANSPARENT,
+            lerp_color(tk.hover, tk.selected, selected),
+            hover.max(selected).min(1.0),
+        );
         button::Style {
-            background: bg.map(Background::Color),
-            text_color: p.text,
-            border: Border {
-                color: if selected {
-                    with_alpha(p.primary, 0.5)
-                } else {
-                    Color::TRANSPARENT
-                },
-                width: 1.0,
-                radius: 10.0.into(),
-            },
+            background: Some(Background::Color(bg)),
+            text_color: lerp_color(tk.text2, tk.text, hover.max(selected).min(1.0)),
+            border: border::rounded(6),
             ..button::Style::default()
         }
     }
 }
 
-pub fn input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let mut s = text_input::default(theme, status);
-    s.border.radius = 10.0.into();
-    s
+/// Onglet : texte plus vif quand actif ou survolé, sans fond.
+pub fn tab_style(
+    tk: Tokens,
+    active: bool,
+    hover: f32,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, _| button::Style {
+        background: Some(Background::Color(lerp_color(
+            Color::TRANSPARENT,
+            tk.hover,
+            if active { 0.0 } else { hover },
+        ))),
+        text_color: if active {
+            tk.text
+        } else {
+            lerp_color(tk.text2, tk.text, hover)
+        },
+        border: border::rounded(6),
+        ..button::Style::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Champs, défilement, interrupteur
+// ---------------------------------------------------------------------------
+
+pub fn input_style(tk: Tokens) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |_, status| {
+        let edge = match status {
+            text_input::Status::Focused { .. } => tk.accent,
+            text_input::Status::Hovered => tk.text3,
+            _ => tk.border_strong,
+        };
+        text_input::Style {
+            background: Background::Color(tk.panel),
+            border: hairline(edge, 7.0),
+            icon: tk.text2,
+            placeholder: tk.text3,
+            value: tk.text,
+            selection: with_alpha(tk.accent, 0.35),
+        }
+    }
+}
+
+/// Champ de la palette : sans bordure, intégré à la fenêtre.
+pub fn bare_input_style(tk: Tokens) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |_, _| text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: border::rounded(0),
+        icon: tk.text2,
+        placeholder: tk.text3,
+        value: tk.text,
+        selection: with_alpha(tk.accent, 0.35),
+    }
+}
+
+pub fn editor_style(tk: Tokens) -> impl Fn(&Theme, text_editor::Status) -> text_editor::Style {
+    move |_, status| {
+        let edge = match status {
+            text_editor::Status::Focused { .. } => tk.accent,
+            text_editor::Status::Hovered => tk.text3,
+            _ => tk.border_strong,
+        };
+        text_editor::Style {
+            background: Background::Color(tk.panel),
+            border: hairline(edge, 7.0),
+            placeholder: tk.text3,
+            value: tk.text,
+            selection: with_alpha(tk.accent, 0.35),
+        }
+    }
+}
+
+pub fn scroll_style(tk: Tokens) -> impl Fn(&Theme, scrollable::Status) -> scrollable::Style {
+    move |theme, status| {
+        let mut s = scrollable::default(theme, status);
+        let active = match status {
+            scrollable::Status::Active { .. } => 0.0,
+            scrollable::Status::Hovered { .. } => 0.5,
+            scrollable::Status::Dragged { .. } => 1.0,
+        };
+        let rail = scrollable::Rail {
+            background: None,
+            border: border::rounded(4),
+            scroller: scrollable::Scroller {
+                background: Background::Color(lerp_color(
+                    with_alpha(tk.text, 0.10),
+                    with_alpha(tk.text, 0.30),
+                    active,
+                )),
+                border: border::rounded(4),
+            },
+        };
+        s.container = container::Style::default();
+        s.vertical_rail = rail;
+        s.horizontal_rail = rail;
+        s.gap = None;
+        s
+    }
+}
+
+pub fn toggler_style(tk: Tokens) -> impl Fn(&Theme, toggler::Status) -> toggler::Style {
+    move |_, status| {
+        let on = match status {
+            toggler::Status::Active { is_toggled }
+            | toggler::Status::Hovered { is_toggled }
+            | toggler::Status::Disabled { is_toggled } => is_toggled,
+        };
+        toggler::Style {
+            background: Background::Color(if on { tk.accent } else { tk.selected }),
+            background_border_width: 1.0,
+            background_border_color: if on {
+                Color::TRANSPARENT
+            } else {
+                tk.border_strong
+            },
+            foreground: Background::Color(if on { tk.on_accent } else { tk.text2 }),
+            foreground_border_width: 0.0,
+            foreground_border_color: Color::TRANSPARENT,
+            text_color: Some(tk.text),
+            border_radius: None,
+            padding_ratio: 0.2,
+        }
+    }
+}
+
+/// Opacité animée d'un voile de fondu : `1 - k`.
+pub fn veil(k: f32) -> f32 {
+    lerp(1.0, 0.0, k.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -370,7 +627,58 @@ mod tests {
 
     #[test]
     fn themes_have_expected_darkness() {
-        assert!(is_dark(&theme(Mode::Dark)));
-        assert!(!is_dark(&theme(Mode::Light)));
+        assert!(tokens(Mode::Dark).is_dark());
+        assert!(!tokens(Mode::Light).is_dark());
+    }
+
+    #[test]
+    fn token_mix_hits_both_ends() {
+        let (d, l) = (tokens(Mode::Dark), tokens(Mode::Light));
+        assert_eq!(Tokens::mix(d, l, 0.0), d);
+        assert_eq!(Tokens::mix(d, l, 1.0), l);
+        let mid = Tokens::mix(d, l, 0.5);
+        assert!(mid.bg.r > d.bg.r && mid.bg.r < l.bg.r);
+    }
+
+    #[test]
+    fn dark_surfaces_are_layered() {
+        let t = tokens(Mode::Dark);
+        let lum = |c: Color| c.r + c.g + c.b;
+        assert!(lum(t.bg) < lum(t.panel) && lum(t.panel) < lum(t.raised));
+        assert!(lum(t.text3) < lum(t.text2) && lum(t.text2) < lum(t.text));
+    }
+
+    #[test]
+    fn text_hierarchy_has_readable_contrast() {
+        // Le texte principal et secondaire restent lisibles sur le panneau (WCAG AA ≥ 4,5).
+        fn lin(c: f32) -> f32 {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn lum(c: Color) -> f32 {
+            0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+        }
+        fn ratio(a: Color, b: Color) -> f32 {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+        for mode in [Mode::Dark, Mode::Light] {
+            let t = tokens(mode);
+            assert!(ratio(t.text, t.panel) >= 7.0, "{mode:?} texte");
+            assert!(ratio(t.text2, t.panel) >= 4.5, "{mode:?} texte secondaire");
+            assert!(
+                ratio(t.on_accent, t.accent) >= 4.0,
+                "{mode:?} bouton primaire"
+            );
+        }
+    }
+
+    #[test]
+    fn veil_goes_from_opaque_to_clear() {
+        assert_eq!(veil(0.0), 1.0);
+        assert_eq!(veil(1.0), 0.0);
     }
 }

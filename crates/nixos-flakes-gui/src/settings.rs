@@ -1,12 +1,12 @@
 //! Page de réglages : logique pure (édition de la config) et vue.
 
-use crate::theme::Btn;
-use crate::widgets::{self, bold, muted, SPACE};
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input, toggler};
-use iced::{Element, Length};
+use crate::app::Message;
+use crate::theme::{self, Btn};
+use crate::widgets::{self, action, dim, faint, title, Ui};
+use iced::widget::{column, container, row, scrollable, space, text, text_input, toggler};
+use iced::{Element, Fill, Length};
 use nixos_flakes_core::config::Config;
 use std::path::{Path, PathBuf};
-
 pub const INTERVALS: [u32; 9] = [5, 15, 30, 60, 120, 240, 480, 720, 1440];
 pub const MIN_DEPTH: u8 = 1;
 pub const MAX_DEPTH: u8 = 10;
@@ -96,63 +96,126 @@ pub fn interval_label(minutes: u32) -> String {
     }
 }
 
-fn stepper<'a>(value: String, on: fn(bool) -> Msg) -> Element<'a, Msg> {
+fn stepper<'a>(ui: &Ui<'_>, key: &str, value: String, on: fn(bool) -> Msg) -> Element<'a, Message> {
+    let tk = ui.tk;
     row![
-        widgets::action("−", Btn::Secondary, Some(on(false))),
-        container(text(value).font(bold())).padding([0, 10]),
-        widgets::action("+", Btn::Secondary, Some(on(true))),
+        action(
+            ui,
+            &format!("{key}:minus"),
+            "−",
+            Btn::Secondary,
+            None,
+            Some(Message::Settings(on(false)))
+        ),
+        container(
+            text(value)
+                .size(13)
+                .font(widgets::semibold())
+                .color(tk.text)
+        )
+        .padding([0, 10])
+        .center_x(Length::Shrink),
+        action(
+            ui,
+            &format!("{key}:plus"),
+            "+",
+            Btn::Secondary,
+            None,
+            Some(Message::Settings(on(true)))
+        ),
     ]
     .spacing(6)
     .align_y(iced::Center)
     .into()
 }
 
-fn section<'a>(
-    title: &'a str,
-    hint: &'a str,
-    body: impl Into<Element<'a, Msg>>,
-) -> Element<'a, Msg> {
+/// Ligne de réglage : intitulé et aide à gauche, contrôle à droite.
+fn setting<'a>(
+    ui: &Ui<'_>,
+    heading: &str,
+    hint: &str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let tk = ui.tk;
     container(
-        column![
-            text(title).size(16).font(bold()),
-            muted(hint).size(12),
-            body.into()
+        row![
+            column![
+                text(heading.to_string())
+                    .size(13)
+                    .font(widgets::medium())
+                    .color(tk.text),
+                faint(tk, hint.to_string()),
+            ]
+            .spacing(3)
+            .width(Fill),
+            control.into(),
         ]
-        .spacing(8),
+        .spacing(16)
+        .align_y(iced::Center),
     )
-    .padding(16)
-    .width(Length::Fill)
-    .style(crate::theme::card)
+    .padding([14, 16])
+    .width(Fill)
     .into()
 }
 
+fn rule<'a>(ui: &Ui<'_>) -> Element<'a, Message> {
+    container(space::horizontal())
+        .width(Fill)
+        .height(1)
+        .style(theme::flat(ui.tk.border, 0.0))
+        .into()
+}
+
 /// Vue de la page de réglages.
-pub fn view<'a>(cfg: &'a Config, input: &'a str, tray_active: bool) -> Element<'a, Msg> {
+pub fn view<'a>(
+    ui: &Ui<'_>,
+    cfg: &'a Config,
+    input: &'a str,
+    tray_active: bool,
+) -> Element<'a, Message> {
+    let tk = ui.tk;
     let roots = cfg
         .scan_roots
         .iter()
         .enumerate()
-        .fold(column![].spacing(6), |col, (i, r)| {
+        .fold(column![].spacing(2), |col, (i, r)| {
             col.push(
                 row![
-                    text(r.display().to_string()).size(13).width(Length::Fill),
-                    button(text("Retirer").size(12))
-                        .padding([4, 10])
-                        .style(crate::theme::button_style(Btn::Danger))
-                        .on_press(Msg::RemoveRoot(i)),
+                    text(r.display().to_string())
+                        .size(12)
+                        .font(widgets::MONO)
+                        .color(tk.text)
+                        .width(Fill),
+                    action(
+                        ui,
+                        &format!("root:rm:{i}"),
+                        "Retirer",
+                        Btn::Ghost,
+                        None,
+                        Some(Message::Settings(Msg::RemoveRoot(i)))
+                    ),
                 ]
                 .align_y(iced::Center),
             )
         });
     let add = row![
         text_input("/chemin/absolu ou ~/dossier", input)
-            .on_input(Msg::InputChanged)
-            .on_submit(Msg::AddRoot)
-            .style(crate::theme::input_style)
-            .padding(8),
-        widgets::action("Ajouter", Btn::Primary, Some(Msg::AddRoot)),
+            .on_input(|s| Message::Settings(Msg::InputChanged(s)))
+            .on_submit(Message::Settings(Msg::AddRoot))
+            .style(theme::input_style(tk))
+            .size(13)
+            .padding([7, 10]),
+        action(
+            ui,
+            "root:add",
+            "Ajouter",
+            Btn::Primary,
+            Some("↵"),
+            Some(Message::Settings(Msg::AddRoot))
+        ),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(iced::Center);
 
     let tray_hint = if cfg.tray_enabled && !tray_active {
         "Zone de notification demandée mais indisponible sur cette session."
@@ -160,54 +223,98 @@ pub fn view<'a>(cfg: &'a Config, input: &'a str, tray_active: bool) -> Element<'
         "Affiche une icône ; fermer la fenêtre la réduit dans la zone de notification."
     };
 
-    let content = column![
-        row![
-            widgets::action("← Retour", Btn::Ghost, Some(Msg::Back)),
-            text("Réglages").size(24).font(bold()),
-        ]
-        .spacing(SPACE)
-        .align_y(iced::Center),
-        section(
-            "Racines de scan",
-            "Dossiers à partir desquels on cherche des dépôts flake.",
+    let roots_block = container(
+        column![
             column![
-                roots,
-                add,
-                widgets::action("Rescanner maintenant", Btn::Secondary, Some(Msg::Rescan))
+                text("Racines de scan")
+                    .size(13)
+                    .font(widgets::medium())
+                    .color(tk.text),
+                faint(
+                    tk,
+                    "Dossiers à partir desquels on cherche des dépôts flake."
+                ),
             ]
-            .spacing(10),
-        ),
-        section(
+            .spacing(3),
+            roots,
+            add,
+            row![action(
+                ui,
+                "root:rescan",
+                "Rescanner maintenant",
+                Btn::Secondary,
+                None,
+                Some(Message::Settings(Msg::Rescan))
+            )],
+        ]
+        .spacing(12),
+    )
+    .padding([14, 16])
+    .width(Fill);
+
+    let card = container(column![
+        roots_block,
+        rule(ui),
+        setting(
+            ui,
             "Profondeur de scan",
             "Nombre maximal de niveaux de sous-dossiers explorés.",
-            stepper(cfg.scan_depth.to_string(), Msg::Depth),
+            stepper(ui, "depth", cfg.scan_depth.to_string(), Msg::Depth),
         ),
-        section(
+        rule(ui),
+        setting(
+            ui,
             "Zone de notification",
             tray_hint,
             toggler(cfg.tray_enabled)
-                .label("Activer l'icône de notification")
-                .on_toggle(Msg::ToggleTray),
+                .on_toggle(|on| Message::Settings(Msg::ToggleTray(on)))
+                .style(theme::toggler_style(tk)),
         ),
-        section(
+        rule(ui),
+        setting(
+            ui,
             "Intervalle de vérification",
             "Fréquence de la vérification automatique (zone de notification active).",
-            stepper(interval_label(cfg.check_interval_minutes), |up| {
-                Msg::Interval(up)
-            }),
+            stepper(
+                ui,
+                "interval",
+                interval_label(cfg.check_interval_minutes),
+                |up| { Msg::Interval(up) }
+            ),
         ),
+    ])
+    .width(Fill)
+    .style(theme::outlined(tk));
+
+    let content = column![
+        row![
+            action(
+                ui,
+                "settings:back",
+                "← Retour",
+                Btn::Ghost,
+                Some("Échap"),
+                Some(Message::Settings(Msg::Back))
+            ),
+            title(tk, "Réglages", 18.0),
+        ]
+        .spacing(10)
+        .align_y(iced::Center),
+        card,
         row![
             space::horizontal(),
-            muted("Les réglages sont enregistrés automatiquement.").size(12)
+            dim(tk, "Les réglages sont enregistrés automatiquement.").size(12),
+            space::horizontal()
         ],
     ]
-    .spacing(SPACE)
-    .padding(20)
+    .spacing(16)
+    .padding([20, 24])
     .max_width(760);
 
-    scrollable(container(content).center_x(Length::Fill))
-        .width(Length::Fill)
-        .height(Length::Fill)
+    scrollable(container(content).center_x(Fill))
+        .width(Fill)
+        .height(Fill)
+        .style(theme::scroll_style(tk))
         .into()
 }
 
