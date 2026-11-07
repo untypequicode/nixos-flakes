@@ -1,0 +1,17 @@
+[package]
+name = "nixos-flakes"
+description = "CLI de gestion des flakes Nix de la machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nixos-flakes"
+path = "src/main.rs"
+
+[dependencies]
+nixos-flakes-core = { path = "../nixos-flakes-core" }
+clap = { version = "4", features = ["derive"] }
