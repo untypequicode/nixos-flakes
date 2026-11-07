@@ -39,3 +39,15 @@ _Avoid_: Rebuild, déploiement
 **Mise à niveau automatique**:
 Mise à jour suivie d'une application du dépôt système, lancée périodiquement et avec retour arrière en cas d'échec.
 _Avoid_: Auto-upgrade
+
+**Jeton GitHub**:
+Secret personnel saisi dans l'interface qui authentifie les accès à GitHub pour relever la limite de requêtes ; il ne figure jamais dans la configuration Nix.
+_Avoid_: Token, clé API
+
+**Zone de notification**:
+Zone de la barre où l'outil affiche son icône d'état.
+_Avoid_: Tray, systray
+
+**Droits système**:
+Élévation de privilèges demandée uniquement pour l'application du système et le retour arrière.
+_Avoid_: Sudo, root

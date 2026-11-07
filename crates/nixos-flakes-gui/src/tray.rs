@@ -44,12 +44,86 @@ impl TrayState {
         }
     }
 
+    /// Couleur (RGB) de la pastille de repli.
+    fn color(self) -> [u8; 3] {
+        match self {
+            TrayState::UpToDate => [0x2e, 0xa0, 0x43],
+            TrayState::Updates(_) => [0xe0, 0x8a, 0x1e],
+            TrayState::Error => [0xd1, 0x34, 0x38],
+        }
+    }
+
+    /// Pastilles ARGB32 de repli, pour les thèmes sans icônes `-symbolic`.
+    pub fn pixmaps(self) -> Vec<ksni::Icon> {
+        [22, 32].into_iter().map(|n| pixmap(self, n)).collect()
+    }
+
     pub fn tooltip(self) -> String {
         match self {
             TrayState::UpToDate => "Tout est à jour".into(),
             TrayState::Updates(1) => "1 mise à jour disponible".into(),
             TrayState::Updates(n) => format!("{n} mises à jour disponibles"),
             TrayState::Error => "Erreur lors de la dernière vérification".into(),
+        }
+    }
+}
+
+/// Disque plein de `size` pixels, bord lissé, au format ARGB32 (ordre réseau).
+pub fn pixmap(state: TrayState, size: i32) -> ksni::Icon {
+    let [r, g, b] = state.color();
+    let n = usize::try_from(size.max(1)).unwrap_or(1);
+    let c = n as f32 / 2.0;
+    let radius = c - 1.0;
+    let mut data = Vec::with_capacity(n * n * 4);
+    for y in 0..n {
+        for x in 0..n {
+            let dx = x as f32 + 0.5 - c;
+            let dy = y as f32 + 0.5 - c;
+            let d = (dx * dx + dy * dy).sqrt();
+            let a = (radius + 0.5 - d).clamp(0.0, 1.0);
+            data.extend_from_slice(&[(a * 255.0).round() as u8, r, g, b]);
+        }
+    }
+    ksni::Icon {
+        width: size,
+        height: size,
+        data,
+    }
+}
+
+/// Résultat de l'enregistrement de l'icône, affiché dans les réglages.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TrayStatus {
+    #[default]
+    Disabled,
+    Registered,
+    Failed(String),
+}
+
+impl TrayStatus {
+    /// Libellé d'état pour les réglages.
+    pub fn text(&self) -> String {
+        match self {
+            TrayStatus::Disabled => "désactivée.".into(),
+            TrayStatus::Registered => {
+                "icône enregistrée sur le bus D-Bus (StatusNotifierItem).".into()
+            }
+            TrayStatus::Failed(e) => format!("échec de l'enregistrement : {e}"),
+        }
+    }
+
+    /// Conseil affiché quand l'icône est active ou en échec.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            TrayStatus::Disabled => None,
+            TrayStatus::Registered => Some(
+                "Si rien n'apparaît : il faut un hôte StatusNotifier (ex. module tray de waybar) ; \
+                 sous niri, lancer via niri-session ou spawn-at-startup.",
+            ),
+            TrayStatus::Failed(_) => Some(
+                "Nécessite un hôte StatusNotifier (ex. module tray de waybar) ; \
+                 sous niri, lancer via niri-session ou spawn-at-startup.",
+            ),
         }
     }
 }
@@ -79,10 +153,14 @@ impl ksni::Tray for FlakeTray {
         self.state.icon_name().into()
     }
 
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.state.pixmaps()
+    }
+
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             icon_name: self.state.icon_name().into(),
-            icon_pixmap: vec![],
+            icon_pixmap: self.state.pixmaps(),
             title: "Gestion des flakes".into(),
             description: self.state.tooltip(),
         }
@@ -190,6 +268,29 @@ mod tests {
             events,
             [TrayEvent::Open, TrayEvent::CheckNow, TrayEvent::Quit]
         );
+    }
+
+    #[test]
+    fn pixmap_is_argb_disc() {
+        let p = pixmap(TrayState::Error, 22);
+        assert_eq!((p.width, p.height), (22, 22));
+        assert_eq!(p.data.len(), 22 * 22 * 4);
+        // Coin transparent, centre opaque et de la couleur d'erreur.
+        assert_eq!(p.data[0], 0);
+        let mid = (11 * 22 + 11) * 4;
+        assert_eq!(&p.data[mid..mid + 4], &[255, 0xd1, 0x34, 0x38]);
+        assert_eq!(TrayState::UpToDate.pixmaps().len(), 2);
+    }
+
+    #[test]
+    fn status_texts() {
+        assert_eq!(TrayStatus::default(), TrayStatus::Disabled);
+        assert!(TrayStatus::Failed("boom".into()).text().contains("boom"));
+        assert!(TrayStatus::Registered
+            .hint()
+            .unwrap()
+            .contains("StatusNotifier"));
+        assert!(TrayStatus::Disabled.hint().is_none());
     }
 
     #[test]
