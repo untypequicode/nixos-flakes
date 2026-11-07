@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["untypequicode"]
-repository = "https://github.com/untypequicode/nixos-flake"
+repository = "https://github.com/untypequicode/nixos-flakes"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -23,8 +23,8 @@ La configuration est dans `~/.config/nixos-flakes/config.toml` (racines de scan,
 ## Essayer sans installer
 
 ```bash
-nix run github:untypequicode/nixos-flake#nixos-flakes -- list --all
-nix run github:untypequicode/nixos-flake#nixos-flakes-gui
+nix run github:untypequicode/nixos-flakes#nixos-flakes -- list --all
+nix run github:untypequicode/nixos-flakes#nixos-flakes-gui
 ```
 
 ## CLI
@@ -73,7 +73,7 @@ L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour
 {
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    nixos-flakes.url = "github:untypequicode/nixos-flake";
+    nixos-flakes.url = "github:untypequicode/nixos-flakes";
     nixos-flakes.inputs.nixpkgs.follows = "nixpkgs";
   };
 
