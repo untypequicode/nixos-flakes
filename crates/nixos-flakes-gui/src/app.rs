@@ -919,7 +919,10 @@ impl App {
 
     fn clear_token(&mut self) {
         self.token_input.clear();
-        if matches!(self.token_source, TokenSource::Fichier(_)) {
+        if matches!(
+            self.token_source,
+            TokenSource::Fichier(_) | TokenSource::Systeme { .. }
+        ) {
             return;
         }
         if self.cli.demo {
@@ -928,8 +931,9 @@ impl App {
         }
         match nixos_flakes_core::token::clear() {
             Ok(()) => {
-                self.token_saved = false;
-                self.token_source = TokenSource::Aucun;
+                // Le fichier système peut reprendre le relais une fois le jeton effacé.
+                self.token_saved = nixos_flakes_core::token::exists();
+                self.token_source = nixos_flakes_core::token::source();
                 self.push_log(LogKind::Info, "Jeton GitHub effacé.");
             }
             Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non effacé : {e}")),
