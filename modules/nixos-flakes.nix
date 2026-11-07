@@ -68,10 +68,40 @@ in
       };
     };
 
+    systemRepo = {
+      owner = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "alice";
+        description = ''
+          Utilisateur autorisé à écrire dans le dépôt système (`systemRepo.path`) sans
+          être root, par exemple pour que la GUI lance `nix flake update` et valide
+          `flake.lock`. Le dépôt reste la propriété de root : on accorde une ACL
+          (lecture/écriture, héritée par les nouveaux fichiers) via systemd-tmpfiles,
+          et git accepte ce dépôt (`safe.directory`, chemin exact, jamais `*`).
+          Nécessite un système de fichiers avec ACL (ext4, btrfs, xfs…).
+          `null` : aucune modification des droits.
+        '';
+      };
+
+      path = mkOption {
+        type = types.str;
+        default = "/etc/nixos";
+        description = "Chemin du dépôt système concerné par `systemRepo.owner`.";
+      };
+    };
+
     gui = {
       enable = mkEnableOption "l'interface graphique nixos-flakes-gui";
 
-      tray = mkEnableOption "le lancement automatique de l'interface dans la zone de notification (`nixos-flakes-gui --tray`)";
+      tray = mkEnableOption ''
+        le lancement automatique de l'interface dans la zone de notification (`nixos-flakes-gui --tray`).
+        Le service est lié à `graphical-session.target` : celui-ci n'est atteint que si la session
+        le démarre (`niri-session`, ou tout lanceur de session qui active `graphical-session.target`
+        et importe `WAYLAND_DISPLAY` dans l'environnement systemd utilisateur). Avec un simple
+        `niri` lancé depuis un TTY ou un gestionnaire de connexion, le service ne démarre pas :
+        lancez plutôt `nixos-flakes-gui --tray` via `spawn-at-startup` dans la configuration de niri
+        '';
     };
   };
 
@@ -129,7 +159,22 @@ in
         serviceConfig = {
           ExecStart = "${lib.getExe' cfg.guiPackage "nixos-flakes-gui"} --tray";
           Restart = "on-failure";
+          # Si WAYLAND_DISPLAY n'est pas encore importé, on retente un peu plus tard.
+          RestartSec = 2;
         };
+      };
+    })
+
+    (lib.mkIf (cfg.systemRepo.owner != null) {
+      systemd.tmpfiles.rules = [
+        # `A+` : ACL récursive (X = exécution sur les dossiers seulement) ; `d:` = ACL par défaut
+        # héritée par les nouveaux fichiers.
+        "A+ ${cfg.systemRepo.path} - - - - u:${cfg.systemRepo.owner}:rwX,d:u:${cfg.systemRepo.owner}:rwX"
+      ];
+
+      programs.git = {
+        enable = true;
+        config.safe.directory = [ cfg.systemRepo.path ];
       };
     })
 
