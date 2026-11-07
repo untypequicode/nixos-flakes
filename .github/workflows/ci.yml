@@ -7,8 +7,8 @@ on:
     branches: ["main"]
 
 jobs:
-  build:
-    name: Build Nix Packages
+  check:
+    name: Flake check et build
     runs-on: ubuntu-latest
 
     steps:
@@ -21,17 +21,8 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Build 'hello' package
-        run: nix build .#hello
-
-      - name: Build 'nixos-check-flake-update' package
-        run: nix build .#nixos-check-flake-update
-
-      - name: Build 'nixos-flake-update' package
-        run: nix build .#nixos-flake-update
-
-      - name: Build 'nixos-auto-upgrade' package
-        run: nix build .#nixos-auto-upgrade
-
-      - name: Check flake configuration
+      - name: Check flake (build, tests, clippy, rustfmt)
         run: nix flake check
+
+      - name: Build all tools
+        run: nix build .#default

@@ -1,88 +1,148 @@
-# NixOS Flakes
+# nixos-flakes
 
-Voici une simple collection de scripts et d'utilitaires que j'ai développé afin de simplifier la gestion de mon système NixOS sur Hyprland.
+Recueil d'outils Nix/NixOS écrits en Rust. Le premier outil gère les **flakes de la machine** : il repère tous les dépôts flake, te laisse choisir ceux que tu maintiens, les met à jour, propose les commits git au bon moment et applique la configuration système.
 
-## Paquets disponibles
+| Outil | Binaire | Rôle |
+| --- | --- | --- |
+| CLI | `nixos-flakes` | Vérifier, mettre à jour, appliquer, mise à niveau automatique, sortie Waybar |
+| GUI | `nixos-flakes-gui` | Interface moderne (iced) avec icône de zone de notification optionnelle |
 
-- **`nixos-auto-upgrade`** : Met à jour automatiquement le flake et le système avec gestion des erreurs et restauration en cas d'échec.
-- **`nixos-flake-update`** : Met à jour le flake système (`/etc/nixos`) et applique la configuration via `nixos-rebuild`.
-- **`nixos-check-flake-update`** : Vérifie les mises à jour disponibles pour un flake et retourne un format JSON (idéal pour intégrer dans des barres d'état comme Waybar ou Polybar).
-- **`hello`** : Paquet d'exemple pour tester l'environnement.
+D'autres outils viendront dans `crates/` : tout crate binaire est automatiquement exposé par le flake (voir [Ajouter un outil](#ajouter-un-outil)).
 
-## Utilisation à la volée (sans installation)
+Vocabulaire : [GLOSSARY.md](GLOSSARY.md). Conception : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Vous pouvez exécuter n'importe quel script directement depuis GitHub grâce à la commande `nix run` :
+## Concepts
+
+- **Dépôt détecté** : un dossier avec un `flake.nix` trouvé par le scan. Il n'est **jamais touché** tant que tu ne l'as pas choisi.
+- **Dépôt suivi** : un dépôt que tu as choisi de maintenir.
+- **Dépôt système** : le dépôt suivi qui décrit ta machine (par défaut `/etc/nixos`). Seul lui peut être appliqué au système.
+- **Ignoré** : masqué définitivement de la liste.
+
+La configuration est dans `~/.config/nixos-flakes/config.toml` (racines de scan, profondeur, rôles, tray, fréquence de vérification).
+
+## Essayer sans installer
 
 ```bash
-# Vérifier les mises à jour (pointe vers /etc/nixos par défaut)
-nix run github:untypequicode/nixos-flakes#nixos-check-flake-update
-
-# Vérifier les mises à jour d'un dossier spécifique
-nix run github:untypequicode/nixos-flakes#nixos-check-flake-update -- /chemin/vers/mon/flake
-
-# Mettre à jour le système manuellement
-nix run github:untypequicode/nixos-flakes#nixos-flake-update
-
+nix run github:untypequicode/nixos-flake#nixos-flakes -- list --all
+nix run github:untypequicode/nixos-flake#nixos-flakes-gui
 ```
 
-## Installation permanente via Flakes
+## CLI
 
-Pour avoir ces utilitaires disponibles en permanence sur votre système, vous pouvez les ajouter à votre configuration NixOS.
+```text
+nixos-flakes list [--all] [--check]       dépôts suivis (--all : + détectés)
+nixos-flakes scan                         dépôts détectés sous les racines de scan
+nixos-flakes check [PATH] [--waybar]      mises à jour disponibles (sans rien modifier)
+nixos-flakes update [PATH] [--commit]     nix flake update (+ commit de flake.lock seul)
+nixos-flakes apply [PATH]                 nixos-rebuild switch via pkexec
+nixos-flakes upgrade [PATH] [--notify]    mise à jour + application, retour arrière si échec
+nixos-flakes track|untrack|ignore PATH    gérer les rôles
+nixos-flakes set-system PATH              définir le dépôt système
+```
 
-### 1. Modifier votre `flake.nix`
+`PATH` vaut par défaut le dépôt système. `--config FICHIER` change le fichier de configuration.
 
-Ajoutez le dépôt dans vos `inputs` et passez-le à votre système via `specialArgs` :
+### Waybar
+
+```jsonc
+"custom/flakes": {
+  "exec": "nixos-flakes check --waybar",
+  "return-type": "json",
+  "interval": 3600
+}
+```
+
+Classes CSS : `uptodate`, `outdated` (texte `❆ N`), `error`.
+
+## GUI
+
+- Liste des dépôts groupés Système / Suivis / Détectés / Ignorés avec un badge d'état.
+- Détail : diff par input, boutons Vérifier / Mettre à jour / Appliquer / Suivre / Ignorer.
+- Console de logs en direct.
+- **Flux git** : avant la mise à jour, si le dépôt a des modifications non commitées, proposition de les commiter ; après, proposition de commiter `flake.lock` seul. Jamais de push automatique.
+- Réglages : racines de scan, profondeur, tray, fréquence de vérification.
+- **Tray optionnel** (`nixos-flakes-gui --tray` ou réglage) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter. Nécessite un hôte StatusNotifier (module `tray` de Waybar, par exemple).
+
+L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour des verrous se fait toujours avec tes droits, donc `flake.lock` ne devient jamais propriété de root.
+
+## Installation sur NixOS
+
+`flake.nix` de ta machine :
 
 ```nix
 {
-  description = "Ma configuration NixOS";
-
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-
-    untypequicode-flakes.url = "github:untypequicode/nixos-flakes";
+    nixos-flakes.url = "github:untypequicode/nixos-flake";
+    nixos-flakes.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, untypequicode-flakes, ... }@inputs: {
+  outputs = { nixpkgs, nixos-flakes, ... }: {
     nixosConfigurations.mon-pc = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
-      specialArgs = { inherit inputs; };
-
       modules = [
         ./configuration.nix
+        nixos-flakes.nixosModules.default
       ];
     };
   };
 }
-
 ```
 
-### 2. Activer les modules et installer les paquets dans `configuration.nix`
+`configuration.nix` :
 
 ```nix
-{ pkgs, inputs, ... }:
-
 {
-  imports = [
-    inputs.untypequicode-flakes.nixosModules.auto-upgrade
-  ];
-
-  services.nixos-auto-upgrade-custom = {
-    enable = true;
-    interval = "daily"; # Fréquence : "daily", "weekly", ou une heure précise (ex: "04:00")
+  services.nixos-flakes = {
+    autoUpgrade = {
+      enable = true;
+      interval = "daily";        # ou "weekly", "04:00"…
+      flakePath = "/etc/nixos";
+      user = "moi";              # optionnel : flake.lock reste à ton nom
+    };
+    gui = {
+      enable = true;             # installe la GUI et la CLI
+      tray = true;               # lance la GUI dans la zone de notification à la session
+    };
   };
-
-  environment.systemPackages = with pkgs; [
-    inputs.untypequicode-flakes.packages.${pkgs.system}.nixos-check-flake-update
-    inputs.untypequicode-flakes.packages.${pkgs.system}.nixos-flake-update
-  ];
 }
-
 ```
 
-Une fois ces modifications faites, appliquez-les avec :
+L'ancien nom `services.nixos-auto-upgrade-custom.{enable,interval}` fonctionne encore (avertissement de renommage).
+
+Le timer lance `nixos-flakes upgrade --notify` : mise à jour des verrous, application si quelque chose a changé, et en cas d'échec restauration du `flake.lock` puis retour à la génération précédente. Il ne commite rien : la GUI te proposera de commiter le verrou modifié.
+
+## Développement
 
 ```bash
-sudo nixos-rebuild switch --flake /etc/nixos
-
+nix develop                         # cargo, clippy, rustfmt, libs de la GUI
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p nixos-flakes -- list --all
+cargo run -p nixos-flakes-gui
+nix flake check                     # build + tests + clippy + rustfmt
 ```
+
+Organisation :
+
+```text
+crates/nixos-flakes-core/   logique partagée (config, scan, lock, git, nix, upgrade…)
+crates/nixos-flakes/        CLI
+crates/nixos-flakes-gui/    GUI iced + tray
+modules/nixos-flakes.nix    module NixOS
+nix/                        packaging (auto-découverte des crates)
+```
+
+### Ajouter un outil
+
+```bash
+cargo new crates/mon-outil
+git add crates/mon-outil
+nix build .#mon-outil     # paquet et app générés automatiquement
+```
+
+Réutilise `nixos-flakes-core` si besoin (`nixos-flakes-core = { path = "../nixos-flakes-core" }`). Pour un module NixOS dédié, ajoute `modules/mon-outil.nix`.
+
+## Licence
+
+GPL-3.0-or-later — voir [LICENSE](LICENSE).

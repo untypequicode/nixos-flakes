@@ -1,5 +1,5 @@
 {
-  description = "Utilitaires NixOS de untypequicode";
+  description = "Recueil d'outils Nix/NixOS de untypequicode";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -16,43 +16,63 @@
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
 
       nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
+
+      # { packages, checks, tools, guiLibs } par système
+      buildFor = forAllSystems (system: import ./nix { pkgs = nixpkgsFor.${system}; });
     in
     {
-      packages = forAllSystems (
+      packages = forAllSystems (system: buildFor.${system}.packages);
+
+      apps = forAllSystems (
+        system:
+        builtins.mapAttrs (_: pkg: {
+          type = "app";
+          program = nixpkgs.lib.getExe pkg;
+          meta = pkg.meta or { };
+        }) buildFor.${system}.tools
+      );
+
+      checks = forAllSystems (system: buildFor.${system}.checks);
+
+      formatter = forAllSystems (system: nixpkgsFor.${system}.nixfmt);
+
+      devShells = forAllSystems (
         system:
         let
           pkgs = nixpkgsFor.${system};
+          guiLibs = buildFor.${system}.guiLibs;
         in
         {
-          hello = pkgs.callPackage ./pkgs/hello { };
-          nixos-check-flake-update = pkgs.callPackage ./pkgs/nixos-check-flake-update { };
-          nixos-flake-update = pkgs.callPackage ./pkgs/nixos-flake-update { };
-          nixos-auto-upgrade = pkgs.callPackage ./pkgs/nixos-auto-upgrade { };
-
-          default = self.packages.${system}.hello;
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              rustc
+              clippy
+              rustfmt
+              rust-analyzer
+              pkg-config
+              git
+              nix
+              libnotify
+              nixfmt
+            ];
+            buildInputs = guiLibs;
+            RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiLibs;
+          };
         }
       );
 
-      apps = forAllSystems (system: {
-        nixos-check-flake-update = {
-          type = "app";
-          program = "${self.packages.${system}.nixos-check-flake-update}/bin/nixos-check-flake-update";
-        };
-        nixos-flake-update = {
-          type = "app";
-          program = "${self.packages.${system}.nixos-flake-update}/bin/nixos-flake-update";
-        };
-        nixos-auto-upgrade = {
-          type = "app";
-          program = "${self.packages.${system}.nixos-auto-upgrade}/bin/nixos-auto-upgrade";
-        };
-        hello = {
-          type = "app";
-          program = "${self.packages.${system}.hello}/bin/hello";
-        };
-      });
+      overlays.default =
+        final: _prev:
+        (import ./nix {
+          pkgs = final;
+          root = ./.;
+        }).tools;
 
-      nixosModules.auto-upgrade = import ./modules/auto-upgrade.nix;
-      nixosModules.default = self.nixosModules.auto-upgrade;
+      nixosModules = {
+        nixos-flakes = import ./modules/nixos-flakes.nix self;
+        default = self.nixosModules.nixos-flakes;
+      };
     };
 }
