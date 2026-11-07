@@ -8,6 +8,13 @@
 //! Si `NIXOS_FLAKES_GITHUB_TOKEN_FILE` est défini (option NixOS
 //! `services.nixos-flakes.githubTokenFile`), le jeton est lu depuis ce fichier,
 //! en lecture seule : l'interface ne peut ni l'enregistrer ni l'effacer.
+//!
+//! Ordre de priorité : fichier Nix (`Fichier`) > jeton de l'interface >
+//! fichier système `/etc/nix/access-tokens.conf` (`Systeme`, lecture seule,
+//! chemin surchargeable par `NIXOS_FLAKES_SYSTEM_TOKEN_FILE`). Ce dernier est
+//! souvent en root 600 : `nix` lancé par l'utilisateur ne le lit pas et son
+//! jeton est alors ignoré (limite de 60 requêtes/h) ; `Source::Systeme
+//! { lisible: false }` permet de le signaler.
 
 use crate::error::{Error, Result};
 use std::fs;
@@ -67,9 +74,74 @@ pub enum Source {
     Fichier(PathBuf),
     /// Fichier géré par l'interface (`~/.config/nixos-flakes/github-token`).
     Interface,
+    /// Fichier système `/etc/nix/access-tokens.conf` (lecture seule), utilisé
+    /// quand ni le fichier Nix ni l'interface ne fournissent de jeton.
+    /// `lisible: false` : le fichier existe mais l'utilisateur courant ne peut
+    /// pas le lire (souvent root 600) ; `nix` lancé en utilisateur l'ignore donc
+    /// aussi. Remède : le rendre lisible (`chmod 640`, groupe `users`) ou
+    /// enregistrer un jeton dans l'interface.
+    Systeme { path: PathBuf, lisible: bool },
     /// Aucun jeton.
     Aucun,
 }
+
+/// Variable d'environnement surchargeant le chemin du fichier système (tests).
+pub const ENV_SYSTEM_FILE: &str = "NIXOS_FLAKES_SYSTEM_TOKEN_FILE";
+
+/// Chemin par défaut du fichier de jetons système de Nix.
+pub const DEFAULT_SYSTEM_FILE: &str = "/etc/nix/access-tokens.conf";
+
+/// Chemin du fichier de jetons système.
+pub fn system_path() -> PathBuf {
+    std::env::var_os(ENV_SYSTEM_FILE)
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from(DEFAULT_SYSTEM_FILE), PathBuf::from)
+}
+
+/// État du fichier système : `None` s'il n'existe pas (ou ne contient aucun
+/// jeton GitHub lisible) ; `Some(Systeme { .. })` sinon.
+fn probe_system(path: &Path) -> Option<Source> {
+    match fs::read_to_string(path) {
+        Ok(s) => match parse_system(&s) {
+            Ok(Some(_)) => Some(Source::Systeme {
+                path: path.to_path_buf(),
+                lisible: true,
+            }),
+            _ => None,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(Source::Systeme {
+            path: path.to_path_buf(),
+            lisible: false,
+        }),
+        Err(_) => None,
+    }
+}
+
+/// Jeton du fichier système, s'il est lisible et en contient un.
+fn load_system(path: &Path) -> Option<Token> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| parse_system(&s).ok().flatten())
+}
+
+/// Analyse stricte d'un fichier de configuration Nix : seules les lignes
+/// `access-tokens`/`extra-access-tokens` comptent (pas de jeton brut).
+fn parse_system(raw: &str) -> Result<Option<Token>> {
+    let kept: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            [ACCESS_TOKENS, EXTRA_ACCESS_TOKENS].iter().any(|k| {
+                l.strip_prefix(k)
+                    .is_some_and(|r| r.trim_start().starts_with('='))
+            })
+        })
+        .collect();
+    parse_token(&kept.join("\n"))
+}
+
+const ACCESS_TOKENS: &str = "access-tokens";
+const EXTRA_ACCESS_TOKENS: &str = "extra-access-tokens";
 
 /// Fichier de jeton imposé par l'environnement, s'il est défini et non vide.
 fn env_file() -> Option<PathBuf> {
@@ -80,22 +152,37 @@ fn env_file() -> Option<PathBuf> {
 
 /// Origine du jeton courant.
 pub fn source() -> Source {
-    source_with(env_file(), path().ok().as_deref())
+    source_with(env_file(), path().ok().as_deref(), &system_path())
 }
 
-fn source_with(env: Option<PathBuf>, own: Option<&Path>) -> Source {
+fn source_with(env: Option<PathBuf>, own: Option<&Path>, system: &Path) -> Source {
     match env {
         Some(p) => Source::Fichier(p),
         None if own.is_some_and(Path::is_file) => Source::Interface,
-        None => Source::Aucun,
+        None => probe_system(system).unwrap_or(Source::Aucun),
     }
 }
 
-/// Un jeton est-il disponible ? (fichier Nix présent, ou jeton de l'interface)
+/// Un jeton utilisable est-il disponible ? (fichier Nix présent, jeton de
+/// l'interface, ou fichier système lisible contenant un jeton GitHub)
 pub fn exists() -> bool {
-    match env_file() {
-        Some(p) => p.is_file(),
-        None => path().is_ok_and(|p| p.is_file()),
+    match source() {
+        Source::Fichier(p) => p.is_file(),
+        Source::Interface => true,
+        Source::Systeme { lisible, .. } => lisible,
+        Source::Aucun => false,
+    }
+}
+
+/// Le fichier de jetons système existe-t-il sans être lisible par l'utilisateur
+/// courant (et sans jeton prioritaire) ? Dans ce cas `nix` ignore son jeton.
+pub fn system_unreadable() -> Option<PathBuf> {
+    match source() {
+        Source::Systeme {
+            path,
+            lisible: false,
+        } => Some(path),
+        _ => None,
     }
 }
 
@@ -103,7 +190,10 @@ pub fn exists() -> bool {
 pub fn load() -> Result<Option<Token>> {
     match env_file() {
         Some(p) => load_file(&p),
-        None => load_in(&default_dir()?),
+        None => match load_in(&default_dir()?)? {
+            Some(t) => Ok(Some(t)),
+            None => Ok(load_system(&system_path())),
+        },
     }
 }
 
@@ -139,10 +229,14 @@ fn parse_token(raw: &str) -> Result<Option<Token>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = match line.strip_prefix("access-tokens") {
-            Some(rest) if rest.trim_start().starts_with('=') => rest.trim_start()[1..].trim(),
-            _ => line,
-        };
+        let line = [EXTRA_ACCESS_TOKENS, ACCESS_TOKENS]
+            .iter()
+            .find_map(|k| {
+                line.strip_prefix(k)
+                    .filter(|rest| rest.trim_start().starts_with('='))
+                    .map(|rest| rest.trim_start()[1..].trim())
+            })
+            .unwrap_or(line);
         for entry in line.split_whitespace() {
             match entry.split_once('=') {
                 Some(("github.com", v)) => return validated(v).map(Some),
@@ -311,14 +405,75 @@ mod tests {
     fn source_priority() {
         let d = tempfile::tempdir().unwrap();
         let own = d.path().join("github-token");
-        assert_eq!(source_with(None, Some(&own)), Source::Aucun);
+        let sys = d.path().join("access-tokens.conf");
+        assert_eq!(source_with(None, Some(&own), &sys), Source::Aucun);
+        fs::write(&sys, "extra-access-tokens = github.com=ghp_sys\n").unwrap();
+        assert_eq!(
+            source_with(None, Some(&own), &sys),
+            Source::Systeme {
+                path: sys.clone(),
+                lisible: true
+            }
+        );
         fs::write(&own, "x").unwrap();
-        assert_eq!(source_with(None, Some(&own)), Source::Interface);
+        assert_eq!(source_with(None, Some(&own), &sys), Source::Interface);
         let nix = PathBuf::from("/run/secrets/gh");
         assert_eq!(
-            source_with(Some(nix.clone()), Some(&own)),
+            source_with(Some(nix.clone()), Some(&own), &sys),
             Source::Fichier(nix)
         );
+    }
+
+    #[test]
+    fn parses_extra_access_tokens_and_multiple_hosts() {
+        let ok = |raw: &str| parse_token(raw).unwrap().map(|t| t.expose().to_string());
+        assert_eq!(
+            ok("extra-access-tokens = github.com=ghp_x\n").as_deref(),
+            Some("ghp_x")
+        );
+        assert_eq!(
+            ok("extra-access-tokens=gitlab.com=zz github.com=ghp_y other=1").as_deref(),
+            Some("ghp_y")
+        );
+        assert_eq!(ok("extra-access-tokens = gitlab.com=zz"), None);
+    }
+
+    #[test]
+    fn system_file_is_parsed_strictly() {
+        let ok = |raw: &str| parse_system(raw).unwrap().map(|t| t.expose().to_string());
+        assert_eq!(
+            ok("substituters = https://c\nextra-access-tokens = github.com=ghp_s\n").as_deref(),
+            Some("ghp_s")
+        );
+        // Pas de jeton brut ni de réglage étranger pris pour un jeton.
+        assert_eq!(ok("substituters = https://c\n"), None);
+        assert_eq!(ok("ghp_brut\n"), None);
+    }
+
+    #[test]
+    fn system_file_states() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = d.path().join("access-tokens.conf");
+        assert_eq!(probe_system(&sys), None);
+        assert!(load_system(&sys).is_none());
+        fs::write(&sys, "extra-access-tokens = github.com=ghp_sys\n").unwrap();
+        assert_eq!(load_system(&sys).unwrap().expose(), "ghp_sys");
+        fs::set_permissions(&sys, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&sys).is_ok() {
+            return; // root : les permissions ne s'appliquent pas
+        }
+        assert_eq!(
+            probe_system(&sys),
+            Some(Source::Systeme {
+                path: sys.clone(),
+                lisible: false
+            })
+        );
+        assert!(load_system(&sys).is_none());
+        // Le jeton de l'interface reste prioritaire sur un fichier illisible.
+        let own = d.path().join("github-token");
+        fs::write(&own, "x").unwrap();
+        assert_eq!(source_with(None, Some(&own), &sys), Source::Interface);
     }
 
     #[test]
