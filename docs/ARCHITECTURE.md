@@ -11,7 +11,8 @@ crates/
   nixos-flakes/               bin `nixos-flakes` : CLI (clap)
   nixos-flakes-gui/           bin `nixos-flakes-gui` : GUI iced + tray optionnel
   <futur-outil>/              un crate par nouvel outil
-modules/                      modules NixOS (un fichier par outil)
+pkgs/<outil>/                  outils non-Rust (ex. extension Firefox), packagés à la main via nix/extensions.nix
+modules/                      modules NixOS : un fichier et un nom `nixosModules.<outil>` par outil (pas de module « default »)
 nix/                          packaging (auto-découverte des crates)
 docs/                         documentation
 ```
@@ -129,6 +130,10 @@ Codes de sortie : 0 ok, 1 erreur. `check --waybar` sort toujours 0 avec un JSON.
 
 iced (Wayland/X11). Thème sombre/clair suivant le système, design moderne : barre latérale (Système / Suivis / Détectés / Ignorés) avec badges d'état, panneau de détail (diff par input, boutons Vérifier / Mettre à jour / Appliquer / Suivre / Ignorer), console de logs en direct, dialogue de commit (avant : modifs non commitées ; après : `flake.lock`), page Réglages. Tray optionnel (`ksni`) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter ; fermer la fenêtre réduit dans le tray si activé. Les appels `core` se font dans des threads (`iced::Task::perform` + `std::thread`/canal pour les logs).
 
-## Module NixOS
+## Modules NixOS
+
+Un module NixOS n'est pas un programme : c'est un fichier de configuration réutilisable qui déclare des options (`services.…`) et les traduit en services systemd, paquets installés, etc. Chaque outil a le sien, exposé par le flake sous `nixosModules.<outil>` : `nixos-flakes` (ci-dessous) et `image-downloader-visible` (extension Firefox). Il n'y a pas de module `default`, pour rester explicite. La GUI est un paquet, que le module `nixos-flakes` installe si `gui.enable = true`.
+
+### nixosModules.nixos-flakes
 
 `services.nixos-flakes.autoUpgrade.{enable,interval,flakePath}` (service oneshot + timer, exécute `nixos-flakes upgrade --notify`), `services.nixos-flakes.gui.{enable,tray}` (installe la GUI, autostart tray). Alias `mkRenamedOptionModule` depuis `services.nixos-auto-upgrade-custom`.

@@ -6,7 +6,7 @@
 
 stdenvNoCC.mkDerivation {
   pname = "firefox-image-downloader-visible";
-  version = "1.2";
+  version = (builtins.fromJSON (builtins.readFile ./src/manifest.json)).version;
 
   src = ./src;
 

@@ -2,3 +2,5 @@ result
 target
 .direnv
 digest.txt
+.amo-upload-uuid
+web-ext-artifacts

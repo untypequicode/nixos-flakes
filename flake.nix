@@ -20,28 +20,16 @@
       # { packages, checks, tools, guiLibs } par système
       buildFor = forAllSystems (system: import ./nix { pkgs = nixpkgsFor.${system}; });
 
-      # true si le .xpi signé par Mozilla est commité (voir README.md, section
-      # Extension Firefox/Zen). Sinon le paquet "-signed" n'est pas exposé.
-      hasSignedXpi = builtins.pathExists (
-        ./pkgs/firefox-image-downloader-visible-signed/image-downloader-visible-signed.xpi
+      extensionsFor = forAllSystems (
+        system:
+        import ./nix/extensions.nix {
+          pkgs = nixpkgsFor.${system};
+          root = ./.;
+        }
       );
     in
     {
-      packages = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgsFor.${system};
-        in
-        buildFor.${system}.packages
-        // {
-          firefox-image-downloader-visible = pkgs.callPackage ./pkgs/firefox-image-downloader-visible { };
-        }
-        // nixpkgs.lib.optionalAttrs hasSignedXpi {
-          firefox-image-downloader-visible-signed =
-            pkgs.callPackage ./pkgs/firefox-image-downloader-visible-signed
-              { };
-        }
-      );
+      packages = forAllSystems (system: buildFor.${system}.packages // extensionsFor.${system}.packages);
 
       apps = forAllSystems (
         system:
@@ -52,7 +40,7 @@
         }) buildFor.${system}.tools
       );
 
-      checks = forAllSystems (system: buildFor.${system}.checks);
+      checks = forAllSystems (system: buildFor.${system}.checks // extensionsFor.${system}.checks);
 
       formatter = forAllSystems (system: nixpkgsFor.${system}.nixfmt);
 
@@ -119,7 +107,6 @@
       nixosModules = {
         nixos-flakes = import ./modules/nixos-flakes.nix self;
         image-downloader-visible = import ./modules/browser-extensions.nix self;
-        default = self.nixosModules.nixos-flakes;
       };
     };
 }

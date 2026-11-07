@@ -1,7 +1,7 @@
 self:
 
-# `self` doit être LE self de *ce* flake (nixos-flakes). C'est pourquoi ce
-# fichier est appliqué partiellement dans flake.nix :
+# `self` doit être LE self de *ce* flake (nixos-flakes) : le module est appliqué
+# partiellement dans flake.nix :
 #   nixosModules.image-downloader-visible = import ./modules/browser-extensions.nix self;
 # plutôt que de compter sur specialArgs côté utilisateur.
 {
@@ -15,9 +15,7 @@ let
   cfg = config.programs.image-downloader-visible;
   system = pkgs.stdenv.hostPlatform.system;
 
-  hasSignedXpi = builtins.pathExists (
-    self + "/pkgs/firefox-image-downloader-visible-signed/image-downloader-visible-signed.xpi"
-  );
+  hasSignedXpi = self.packages.${system} ? firefox-image-downloader-visible-signed;
 in
 {
   options.programs.image-downloader-visible = {
@@ -51,10 +49,13 @@ in
       }
     ];
 
-    programs.firefox.policies.ExtensionSettings =
+    # Garde : sans .xpi signé, c'est l'assertion ci-dessus qui s'affiche
+    # (sinon l'évaluation échouerait avant, sur un attribut manquant).
+    programs.firefox.policies.ExtensionSettings = lib.mkIf (!cfg.useSigned || hasSignedXpi) (
       self.lib.mkImageDownloaderExtensionSettings {
         inherit system;
         useSigned = cfg.useSigned;
-      };
+      }
+    );
   };
 }

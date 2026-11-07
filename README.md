@@ -86,7 +86,7 @@ L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour
       system = "x86_64-linux";
       modules = [
         ./configuration.nix
-        nixos-flakes.nixosModules.default
+        nixos-flakes.nixosModules.nixos-flakes
       ];
     };
   };
@@ -149,32 +149,16 @@ Réutilise `nixos-flakes-core` si besoin (`nixos-flakes-core = { path = "../nixo
 
 ## Extension Firefox/Zen : Image Downloader Visible
 
-Le dossier `pkgs/firefox-image-downloader-visible/src` contient le code source
-de l'extension (manifest V3). Elle liste toutes les images et vidéos
-*visibles à l'écran* sur l'onglet actif (y compris les images de fond CSS, le
-contenu de `<canvas>`, le Shadow DOM…) et permet de les prévisualiser, les
-ouvrir, les copier ou les télécharger, individuellement ou en masse.
+Source (manifest V3) dans `pkgs/firefox-image-downloader-visible/src`. Le popup liste les images et vidéos *visibles à l'écran* de l'onglet actif (balises, fonds CSS, `<canvas>`, Shadow DOM) pour les prévisualiser, ouvrir, copier ou télécharger. Le script d'analyse n'est injecté qu'à l'ouverture du popup (`activeTab` + `scripting`), jamais en permanence. Permissions : `activeTab`, `scripting`, `downloads`, `clipboardWrite`.
 
-Contrairement à la version d'origine, elle n'injecte plus de script en
-permanence sur `<all_urls>` : le code d'analyse (`content.js`) n'est exécuté
-qu'à la demande, sur l'onglet actif, quand vous ouvrez le popup
-(`browser.scripting.executeScript` + permission `activeTab`). C'est plus
-respectueux de la vie privée et plus léger.
+**Signature Mozilla.** Firefox release et Zen refusent toute extension non signée, même via les policies (`ExtensionSettings`). Deux modes :
 
-### ⚠️ Signature Mozilla : ce qu'il faut savoir
+| Mode | Paquet | Navigateur |
+|------|--------|------------|
+| Dev / ESR | `firefox-image-downloader-visible` (`.xpi` non signé, construit depuis les sources) | Firefox ESR, Nightly, Developer Edition |
+| Production | `firefox-image-downloader-visible-signed` (`.xpi` signé commité) | Firefox release, Zen |
 
-Firefox et Zen (basés tous les deux sur le canal *release* de Gecko)
-**refusent d'installer en permanence une extension qui n'est pas signée par
-Mozilla**, y compris via les policies entreprise (`ExtensionSettings`). Seuls
-les canaux ESR, Nightly et Developer Edition permettent de désactiver cette
-vérification. Deux chemins sont donc proposés :
-
-#### Option A — Mode dev / ESR (100 % reproductible, aucun secret nécessaire)
-
-Le paquet `firefox-image-downloader-visible` construit un `.xpi` **non
-signé** directement depuis les sources, à chaque build. Utilisable seulement
-avec `pkgs.firefox-esr` (ou Nightly/Developer Edition), en désactivant la
-vérification de signature :
+### Mode dev / ESR
 
 ```nix
 { pkgs, inputs, ... }:
@@ -187,93 +171,68 @@ vérification de signature :
         Value = false;
         Status = "locked";
       };
-    } // {
-      ExtensionSettings =
-        inputs.untypequicode-flakes.lib.mkImageDownloaderExtensionSettings {
-          system = pkgs.system;
-          useSigned = false;
-        };
+      ExtensionSettings = inputs.nixos-flakes.lib.mkImageDownloaderExtensionSettings {
+        system = pkgs.stdenv.hostPlatform.system;
+        useSigned = false;
+      };
     };
   };
 }
 ```
 
-#### Option B — Mode production (Firefox release + Zen)
+### Mode production
 
-1. Créez un compte sur [addons.mozilla.org](https://addons.mozilla.org),
-   récupérez une clé API (JWT issuer/secret) dans vos paramètres développeur.
-2. Depuis `pkgs/firefox-image-downloader-visible/src`, générez le `.xpi`
-   signé (une seule fois, à chaque nouvelle version) :
+1. Récupérez une clé API (JWT issuer/secret) sur [addons.mozilla.org](https://addons.mozilla.org) (paramètres développeur).
+2. À chaque changement de `version` dans `manifest.json`, signez (canal non listé) :
 
    ```bash
-   npx web-ext sign \
-     --channel=unlisted \
-     --api-key=$AMO_JWT_ISSUER \
-     --api-secret=$AMO_JWT_SECRET \
+   nix run nixpkgs#web-ext -- sign --channel=unlisted \
+     --api-key="$AMO_JWT_ISSUER" --api-secret="$AMO_JWT_SECRET" \
      --source-dir=pkgs/firefox-image-downloader-visible/src \
      --artifacts-dir=/tmp/web-ext-artifacts
-   ```
-
-3. Copiez le fichier généré dans le repo et committez-le :
-
-   ```bash
    cp /tmp/web-ext-artifacts/*.xpi \
      pkgs/firefox-image-downloader-visible-signed/image-downloader-visible-signed.xpi
    ```
 
-4. Le paquet `firefox-image-downloader-visible-signed` (et le module
-   `nixosModules.image-downloader-visible`) deviennent automatiquement
-   disponibles — Nix ne fait plus que copier ce `.xpi` déjà signé, sans appel
-   réseau au moment du build.
+3. Committez le `.xpi`. Le paquet `-signed` n'existe que s'il est présent, et `nix flake check` vérifie que sa version correspond aux sources.
 
-**Pour Firefox**, via le module fourni :
+Firefox, via le module :
 
 ```nix
 { inputs, ... }:
 {
-  imports = [ inputs.untypequicode-flakes.nixosModules.image-downloader-visible ];
+  imports = [ inputs.nixos-flakes.nixosModules.image-downloader-visible ];
 
   programs.firefox.enable = true;
   programs.image-downloader-visible.enable = true; # useSigned = true par défaut
 }
 ```
 
-**Pour Zen Browser**, en réutilisant la même fonction partagée via l'override
-`extraPolicies` exposé par `youwen5/zen-browser-flake` :
+Sans `.xpi` signé, `useSigned = true` échoue avec une assertion explicite ; passez `useSigned = false` pour le mode dev/ESR.
+
+Zen Browser (via l'override `extraPolicies` de `youwen5/zen-browser-flake`) :
 
 ```nix
 { inputs, pkgs, ... }:
 {
   environment.systemPackages = [
     (inputs.zen-browser.packages.${pkgs.stdenv.hostPlatform.system}.default.override {
-      extraPolicies = {
-        ExtensionSettings =
-          inputs.untypequicode-flakes.lib.mkImageDownloaderExtensionSettings {
-            system = pkgs.stdenv.hostPlatform.system;
-            useSigned = true;
-          };
+      extraPolicies.ExtensionSettings = inputs.nixos-flakes.lib.mkImageDownloaderExtensionSettings {
+        system = pkgs.stdenv.hostPlatform.system;
+        useSigned = true;
       };
     })
   ];
 }
 ```
 
-### Développement / test rapide sans signer
-
-Pour itérer sur le code sans passer par la signature à chaque fois, chargez
-l'extension temporairement (elle disparaît au redémarrage de Firefox, mais ne
-nécessite ni policy ni signature) :
-
-1. Ouvrez `about:debugging#/runtime/this-firefox`.
-2. Cliquez sur « Charger un module complémentaire temporaire… ».
-3. Sélectionnez `pkgs/firefox-image-downloader-visible/src/manifest.json`.
-
-Ou en une commande, via `web-ext` :
+### Test rapide sans signer
 
 ```bash
-nix run nixpkgs#nodePackages.web-ext -- run \
-  --source-dir=pkgs/firefox-image-downloader-visible/src
+nix run nixpkgs#web-ext -- run --source-dir=pkgs/firefox-image-downloader-visible/src
 ```
+
+Ou `about:debugging#/runtime/this-firefox` → « Charger un module complémentaire temporaire… » → `manifest.json` (disparaît au redémarrage).
 
 ## Licence
 

@@ -11,7 +11,10 @@
 # moment du build.
 stdenvNoCC.mkDerivation {
   pname = "firefox-image-downloader-visible-signed";
-  version = "1.2";
+  # Même version que les sources (le .xpi signé doit être régénéré à chaque bump).
+  version =
+    (builtins.fromJSON (builtins.readFile ../firefox-image-downloader-visible/src/manifest.json))
+    .version;
 
   src = ./image-downloader-visible-signed.xpi;
 
