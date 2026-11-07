@@ -44,6 +44,9 @@ pub enum Command {
         /// Valide flake.lock dans git si des inputs ont changé.
         #[arg(long)]
         commit: bool,
+        /// Ne met à jour que cet input (répétable) ; sans option : tous les inputs.
+        #[arg(long = "input", value_name = "NOM")]
+        inputs: Vec<String>,
     },
     /// Applique la configuration d'un dépôt à la machine (nixos-rebuild switch).
     Apply {
@@ -130,12 +133,34 @@ mod tests {
             parse(&["update"]).unwrap().command,
             Command::Update {
                 path: None,
-                commit: false
+                commit: false,
+                inputs: vec![]
             }
         );
         assert_eq!(
             parse(&["apply"]).unwrap().command,
             Command::Apply { path: None }
+        );
+    }
+
+    #[test]
+    fn update_input_is_repeatable() {
+        let cli = parse(&[
+            "update",
+            "/etc/nixos",
+            "--input",
+            "nixpkgs",
+            "--input",
+            "home",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Update {
+                path: Some(PathBuf::from("/etc/nixos")),
+                commit: false,
+                inputs: vec!["nixpkgs".into(), "home".into()]
+            }
         );
     }
 

@@ -6,7 +6,7 @@ use iced::futures::channel::mpsc;
 use iced::futures::Stream;
 use nixos_flakes_core::config::Role;
 use nixos_flakes_core::git::GitState;
-use nixos_flakes_core::lock::InputChange;
+use nixos_flakes_core::lock::{InputChange, RootInput};
 use nixos_flakes_core::nix::UpdateReport;
 use nixos_flakes_core::status::RepoStatus;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,61 @@ pub fn changes(n: usize, now: i64) -> Vec<InputChange> {
     .into_iter()
     .take(n)
     .collect()
+}
+
+fn root(name: &str, rev: &str, url: &str, age: i64, now: i64) -> RootInput {
+    RootInput {
+        name: name.into(),
+        node: Some(name.into()),
+        rev: Some(rev.into()),
+        short_rev: Some(rev.chars().take(7).collect()),
+        last_modified: Some(now - age),
+        kind: Some("github".into()),
+        owner: None,
+        repo: None,
+        url: Some(url.into()),
+    }
+}
+
+/// Inputs racine fictifs (les quatre premiers ont une mise à jour fictive).
+pub fn inputs(now: i64) -> Vec<RootInput> {
+    vec![
+        root(
+            "nixpkgs",
+            "3f1c9a7d2b4e5c6a",
+            "github:NixOS/nixpkgs/nixos-unstable",
+            18 * DAY,
+            now,
+        ),
+        root(
+            "home-manager",
+            "c41d7e0b9a2f3d68",
+            "github:nix-community/home-manager",
+            40 * DAY,
+            now,
+        ),
+        root(
+            "flake-utils",
+            "b1e32c8d7f904a5e",
+            "github:numtide/flake-utils",
+            200 * DAY,
+            now,
+        ),
+        root(
+            "rust-overlay",
+            "07a4be39c5d1e862",
+            "github:oxalica/rust-overlay",
+            12 * DAY,
+            now,
+        ),
+        root(
+            "nixos-hardware",
+            "88d0a4c1e5f2b739",
+            "github:NixOS/nixos-hardware",
+            6 * DAY,
+            now,
+        ),
+    ]
 }
 
 fn git(branch: &str, dirty: &[&str], lock: bool) -> GitState {
@@ -152,7 +207,7 @@ fn git_after(repo: &Path, job: &Job) -> GitState {
         return GitState::default();
     }
     match job {
-        Job::Update => git("main", &[], true),
+        Job::Update | Job::UpdateInputs(_) => git("main", &[], true),
         _ => git("main", &[], false),
     }
 }
@@ -184,7 +239,24 @@ pub fn run_job(repo: PathBuf, job: Job, now: i64) -> impl Stream<Item = JobEvent
                 pause(700);
                 out("• Updated input 'home-manager'");
                 pause(700);
-                Outcome::Update(Ok(report(2)))
+                Outcome::Update(Vec::new(), Ok(report(2)))
+            }
+            Job::UpdateInputs(names) => {
+                out(&format!("$ nix flake update {}", names.join(" ")));
+                pause(600);
+                let mut changes = changes(4, now);
+                changes.retain(|c| names.contains(&c.name));
+                for c in &changes {
+                    out(&format!("• Updated input '{}'", c.name));
+                    pause(500);
+                }
+                Outcome::Update(
+                    names.clone(),
+                    Ok(UpdateReport {
+                        repo: repo.clone(),
+                        changes,
+                    }),
+                )
             }
             other => {
                 out(&format!("$ {} (simulé)", other.kind().label()));
@@ -223,5 +295,29 @@ mod tests {
             block_on(run_job("/home/demo/x".into(), Job::Check, 1_700_000_000).collect());
         assert!(matches!(evs.last(), Some(JobEvent::Finished(_))));
         assert!(evs.len() >= 2);
+    }
+
+    #[test]
+    fn simulated_partial_update_touches_only_requested_inputs() {
+        let job = Job::UpdateInputs(vec!["home-manager".into(), "nixos-hardware".into()]);
+        let evs: Vec<JobEvent> =
+            block_on(run_job("/home/demo/x".into(), job, 1_700_000_000).collect());
+        let Some(JobEvent::Finished(f)) = evs.last() else {
+            panic!("pas de fin");
+        };
+        let Outcome::Update(names, Ok(report)) = &f.outcome else {
+            panic!("pas une mise à jour");
+        };
+        assert_eq!(names.len(), 2);
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].name, "home-manager");
+    }
+
+    #[test]
+    fn demo_inputs_match_demo_changes() {
+        let ins = inputs(1_700_000_000);
+        for c in changes(4, 1_700_000_000) {
+            assert!(ins.iter().any(|i| i.node.as_deref() == Some(&c.name)));
+        }
     }
 }

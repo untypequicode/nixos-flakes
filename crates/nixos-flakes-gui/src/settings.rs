@@ -33,12 +33,36 @@ pub fn token_status_text(saved: bool) -> &'static str {
 }
 
 /// Libellé d'état selon l'origine du jeton (`saved` : le jeton est lisible).
-pub fn token_source_text(source: &Source, saved: bool) -> &'static str {
+pub fn token_source_text(source: &Source, saved: bool) -> String {
     match source {
-        Source::Fichier(_) if saved => "Jeton configuré par la configuration Nix",
-        Source::Fichier(_) => "Jeton configuré par la configuration Nix (fichier absent ou vide)",
-        _ => token_status_text(saved),
+        Source::Fichier(_) if saved => "Jeton configuré par la configuration Nix".into(),
+        Source::Fichier(_) => {
+            "Jeton configuré par la configuration Nix (fichier absent ou vide)".into()
+        }
+        Source::Systeme {
+            path,
+            lisible: true,
+        } => format!("Jeton lu depuis {}", path.display()),
+        Source::Systeme {
+            path,
+            lisible: false,
+        } => format!("Fichier {} illisible : jeton ignoré", path.display()),
+        Source::Interface | Source::Aucun => token_status_text(saved).into(),
     }
+}
+
+/// Avertissement affiché quand le fichier système existe mais n'est pas lisible.
+pub fn system_unreadable_warning(path: &Path) -> String {
+    format!(
+        "Le fichier {} existe mais votre utilisateur ne peut pas le lire, donc nix l'ignore. \
+         Rendez-le lisible (`install -m 640 -g users`) ou enregistrez un jeton ici.",
+        path.display()
+    )
+}
+
+/// Remarque quand le jeton vient du fichier système lisible.
+pub fn system_priority_note() -> &'static str {
+    "Un jeton enregistré ici est prioritaire sur celui du fichier système."
 }
 
 #[derive(Debug, Clone)]
@@ -264,20 +288,7 @@ pub fn view<'a>(
     }
     let tray_diag = container(tray_diag).padding([0, 16]).width(Fill);
 
-    let token_controls: Element<'a, Message> = if let Source::Fichier(p) = token_source {
-        // Géré par Nix : ni saisie, ni Enregistrer, ni Effacer.
-        column![
-            text(token_source_text(token_source, true))
-                .size(13)
-                .color(tk.text),
-            text(p.display().to_string())
-                .size(12)
-                .font(widgets::MONO)
-                .color(tk.text),
-        ]
-        .spacing(3)
-        .into()
-    } else {
+    let token_form = || -> Element<'a, Message> {
         row![
             text_input("Coller le jeton (jamais affiché)", token_input)
                 .secure(true)
@@ -300,12 +311,46 @@ pub fn view<'a>(
                 "Effacer",
                 Btn::Secondary,
                 None,
-                token_saved.then_some(Message::Settings(Msg::TokenClear))
+                (token_saved && !matches!(token_source, Source::Systeme { .. }))
+                    .then_some(Message::Settings(Msg::TokenClear))
             ),
         ]
         .spacing(8)
         .align_y(iced::Center)
         .into()
+    };
+    let token_controls: Element<'a, Message> = if let Source::Fichier(p) = token_source {
+        // Géré par Nix : ni saisie, ni Enregistrer, ni Effacer.
+        column![
+            text(token_source_text(token_source, true))
+                .size(13)
+                .color(tk.text),
+            text(p.display().to_string())
+                .size(12)
+                .font(widgets::MONO)
+                .color(tk.text),
+        ]
+        .spacing(3)
+        .into()
+    } else if let Source::Systeme { path, lisible } = token_source {
+        let info: Element<'a, Message> = if *lisible {
+            column![
+                text(token_source_text(token_source, true))
+                    .size(13)
+                    .color(tk.text),
+                faint(tk, system_priority_note()),
+            ]
+            .spacing(3)
+            .into()
+        } else {
+            text(system_unreadable_warning(path))
+                .size(12)
+                .color(tk.warning)
+                .into()
+        };
+        column![info, token_form()].spacing(8).into()
+    } else {
+        token_form()
     };
 
     let token_block = container(
@@ -462,6 +507,29 @@ mod tests {
         assert_eq!(token_source_text(&Source::Aucun, false), "Aucun jeton");
         let dbg = format!("{:?}", Msg::TokenInput(Secret("ghp_secret".into())));
         assert!(!dbg.contains("ghp_secret"));
+    }
+
+    #[test]
+    fn system_token_texts() {
+        let path = PathBuf::from("/etc/nix/access-tokens.conf");
+        let ok = Source::Systeme {
+            path: path.clone(),
+            lisible: true,
+        };
+        assert_eq!(
+            token_source_text(&ok, true),
+            "Jeton lu depuis /etc/nix/access-tokens.conf"
+        );
+        let ko = Source::Systeme {
+            path: path.clone(),
+            lisible: false,
+        };
+        assert!(token_source_text(&ko, false).contains("illisible"));
+        let w = system_unreadable_warning(&path);
+        assert!(w.contains("/etc/nix/access-tokens.conf"));
+        assert!(w.contains("ne peut pas le lire"));
+        assert!(w.contains("install -m 640 -g users"));
+        assert!(system_priority_note().contains("prioritaire"));
     }
 
     #[test]

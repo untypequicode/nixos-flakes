@@ -134,3 +134,30 @@ fn waybar_always_prints_json_and_exits_zero() -> TestResult {
     )?;
     Ok(())
 }
+
+#[test]
+fn update_rejects_unknown_input_before_running_nix() -> TestResult {
+    let dir = work_dir("update-input").map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("flake.lock"),
+        r#"{"nodes":{"root":{"inputs":{"nixpkgs":"nixpkgs"}},"nixpkgs":{"locked":{"type":"github","rev":"abc"}}},"root":"root","version":7}"#,
+    )
+    .map_err(|e| e.to_string())?;
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "").map_err(|e| e.to_string())?;
+    let out = run(&[
+        "--config",
+        &config.to_string_lossy(),
+        "update",
+        &dir.to_string_lossy(),
+        "--input",
+        "inconnu",
+    ])
+    .map_err(|e| e.to_string())?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    expect(!out.status.success(), "doit échouer")?;
+    expect(
+        stderr.contains("input inconnu"),
+        format!("stderr : {stderr}"),
+    )
+}

@@ -20,9 +20,10 @@ use iced::widget::text_editor;
 use iced::{window, Subscription, Task, Theme};
 use nixos_flakes_core::config::{Config, Role};
 use nixos_flakes_core::git;
+use nixos_flakes_core::lock::RootInput;
 use nixos_flakes_core::status::RepoStatus;
 use nixos_flakes_core::token::Source as TokenSource;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -70,6 +71,14 @@ pub enum Followup {
     Update,
 }
 
+/// Sélection en bloc des inputs d'un dépôt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSelect {
+    All,
+    NoneSelected,
+    Updatable,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // Données
@@ -80,10 +89,20 @@ pub enum Message {
     Check(PathBuf),
     CheckAll,
     Update(PathBuf),
+    /// Mise à jour limitée à ces inputs racine.
+    UpdateInputs(PathBuf, Vec<String>),
+    /// Mise à jour des inputs cochés.
+    UpdateSelection(PathBuf),
+    ToggleInput(PathBuf, String),
+    SelectInputs(PathBuf, InputSelect),
+    InputsLoaded(PathBuf, Result<Vec<RootInput>, String>),
     Apply(PathBuf),
     Push(PathBuf),
     Role(PathBuf, RoleAction),
-    Job { repo: PathBuf, event: JobEvent },
+    Job {
+        repo: PathBuf,
+        event: JobEvent,
+    },
     // Dialogues git
     EditorAction(text_editor::Action),
     ModalCommit,
@@ -139,6 +158,12 @@ pub struct App {
     pub queue_notify: bool,
     pub queue_new: Vec<(String, usize)>,
     pub followups: HashMap<PathBuf, Followup>,
+    /// Inputs racine du `flake.lock` de chaque dépôt (chargés à la sélection).
+    pub inputs: HashMap<PathBuf, Vec<RootInput>>,
+    /// Inputs cochés par dépôt (vidé après une mise à jour).
+    pub input_sel: HashMap<PathBuf, BTreeSet<String>>,
+    /// Inputs d'une mise à jour en attente du commit des modifications.
+    pub update_request: HashMap<PathBuf, Vec<String>>,
     pub tray: Option<TrayHandle>,
     pub tray_pushed: Option<TrayState>,
     pub tray_status: TrayStatus,
@@ -244,6 +269,15 @@ fn demo_token_source(demo: bool) -> nixos_flakes_core::token::Source {
     }
 }
 
+/// Commande de mise à jour : tout si `inputs` est vide, sinon ces inputs seulement.
+fn update_job(inputs: Vec<String>) -> Job {
+    if inputs.is_empty() {
+        Job::Update
+    } else {
+        Job::UpdateInputs(inputs)
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -293,6 +327,9 @@ impl App {
             queue_notify: false,
             queue_new: Vec::new(),
             followups: HashMap::new(),
+            inputs: HashMap::new(),
+            input_sel: HashMap::new(),
+            update_request: HashMap::new(),
             tray: None,
             tray_pushed: None,
             tray_status: TrayStatus::Disabled,
@@ -519,6 +556,24 @@ impl App {
         })
     }
 
+    /// Charge les inputs racine du `flake.lock` (lecture de fichier, hors du fil de l'interface).
+    fn load_inputs_task(&self, repo: &Path) -> Task<Message> {
+        let p = repo.to_path_buf();
+        if self.cli.demo {
+            return Task::done(Message::InputsLoaded(p, Ok(demo::inputs(unix_now()))));
+        }
+        let r = p.clone();
+        Task::perform(
+            tasks::blocking(move || tasks::load_inputs(&r)),
+            move |res| {
+                Message::InputsLoaded(
+                    p.clone(),
+                    res.unwrap_or_else(|| Err("lecture interrompue".into())),
+                )
+            },
+        )
+    }
+
     fn start_next_in_queue(&mut self) -> Task<Message> {
         match model::pick_next(&mut self.queue, &self.entries) {
             Some(p) => self.start_job(&p, Job::Check),
@@ -552,7 +607,8 @@ impl App {
         self.start_next_in_queue()
     }
 
-    fn begin_update(&mut self, repo: &Path) -> Task<Message> {
+    /// Lance la mise à jour de `inputs` (vide = tous) ; propose d'abord de commiter si l'arbre est sale.
+    fn begin_update(&mut self, repo: &Path, inputs: Vec<String>) -> Task<Message> {
         let Some(entry) = self.entry(repo) else {
             return Task::none();
         };
@@ -560,11 +616,13 @@ impl App {
             return Task::none();
         }
         match model::plan_update(&entry.git) {
-            UpdatePlan::Proceed => self.start_job(repo, Job::Update),
+            UpdatePlan::Proceed => self.start_job(repo, update_job(inputs)),
             UpdatePlan::AskCommit => {
+                let dirty = entry.git.dirty.clone();
+                self.update_request.insert(repo.to_path_buf(), inputs);
                 self.open_modal(Modal::CommitDirty {
                     repo: repo.to_path_buf(),
-                    dirty: entry.git.dirty.clone(),
+                    dirty,
                     message: DIRTY_COMMIT_MESSAGE.to_string(),
                 });
                 Task::none()
@@ -656,12 +714,17 @@ impl App {
                     format!("Scan terminé : {count} dépôt(s) flake."),
                 );
                 self.sync_selection_fades();
+                let load = self
+                    .selected
+                    .clone()
+                    .map_or_else(Task::none, |p| self.load_inputs_task(&p));
                 if self.cli.demo {
-                    return self.apply_demo_views();
+                    return Task::batch([load, self.apply_demo_views()]);
                 }
-                Task::none()
+                load
             }
             Message::Select(p) => {
+                let p_loaded = p.clone();
                 if self.selected.as_ref() != Some(&p) {
                     self.restart_panel();
                 }
@@ -670,11 +733,55 @@ impl App {
                 self.page = Page::Main;
                 self.sync_selection_fades();
                 self.reset_hover();
-                Task::none()
+                self.load_inputs_task(&p_loaded)
             }
             Message::Check(p) => self.start_job(&p, Job::Check),
             Message::CheckAll => self.begin_check_all(false),
-            Message::Update(p) => self.begin_update(&p),
+            Message::Update(p) => self.begin_update(&p, Vec::new()),
+            Message::UpdateInputs(p, names) => self.begin_update(&p, names),
+            Message::UpdateSelection(p) => {
+                let names: Vec<String> = self
+                    .input_sel
+                    .get(&p)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                if names.is_empty() {
+                    return Task::none();
+                }
+                self.begin_update(&p, names)
+            }
+            Message::ToggleInput(p, name) => {
+                model::toggle_selection(self.input_sel.entry(p).or_default(), &name);
+                Task::none()
+            }
+            Message::SelectInputs(p, how) => {
+                let inputs = self.inputs.get(&p).map(Vec::as_slice).unwrap_or_default();
+                let sel = match how {
+                    InputSelect::All => model::select_all(inputs),
+                    InputSelect::NoneSelected => BTreeSet::new(),
+                    InputSelect::Updatable => {
+                        let pending = self.entry(&p).and_then(|e| e.pending.as_deref());
+                        model::updatable_names(inputs, pending.unwrap_or_default())
+                    }
+                };
+                self.input_sel.insert(p, sel);
+                Task::none()
+            }
+            Message::InputsLoaded(p, res) => {
+                match res {
+                    Ok(list) => {
+                        if let Some(sel) = self.input_sel.get_mut(&p) {
+                            model::prune_selection(sel, &list);
+                        }
+                        self.inputs.insert(p, list);
+                    }
+                    Err(e) => {
+                        self.inputs.remove(&p);
+                        self.push_log(LogKind::Error, format!("Inputs illisibles : {e}"));
+                    }
+                }
+                Task::none()
+            }
             Message::Apply(p) => {
                 if self.actions_for(&p).apply {
                     self.start_job(&p, Job::Apply)
@@ -706,11 +813,16 @@ impl App {
             }
             Message::ModalCommit => self.on_modal_commit(),
             Message::ModalContinue => match self.take_modal() {
-                Some(Modal::CommitDirty { repo, .. }) => self.start_job(&repo, Job::Update),
+                Some(Modal::CommitDirty { repo, .. }) => {
+                    let inputs = self.update_request.remove(&repo).unwrap_or_default();
+                    self.start_job(&repo, update_job(inputs))
+                }
                 _ => Task::none(),
             },
             Message::ModalCancel => {
-                self.take_modal();
+                if let Some(Modal::CommitDirty { repo, .. }) = self.take_modal() {
+                    self.update_request.remove(&repo);
+                }
                 Task::none()
             }
             Message::ClearLog => {
@@ -919,7 +1031,10 @@ impl App {
 
     fn clear_token(&mut self) {
         self.token_input.clear();
-        if matches!(self.token_source, TokenSource::Fichier(_)) {
+        if matches!(
+            self.token_source,
+            TokenSource::Fichier(_) | TokenSource::Systeme { .. }
+        ) {
             return;
         }
         if self.cli.demo {
@@ -928,8 +1043,9 @@ impl App {
         }
         match nixos_flakes_core::token::clear() {
             Ok(()) => {
-                self.token_saved = false;
-                self.token_source = TokenSource::Aucun;
+                // Le fichier système peut reprendre le relais une fois le jeton effacé.
+                self.token_saved = nixos_flakes_core::token::exists();
+                self.token_source = nixos_flakes_core::token::source();
                 self.push_log(LogKind::Info, "Jeton GitHub effacé.");
             }
             Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non effacé : {e}")),
@@ -989,6 +1105,7 @@ impl App {
         let mut is_check = false;
         let mut modal = None;
         let mut new_update: Option<(String, usize)> = None;
+        let mut reload_inputs = false;
 
         match outcome {
             Outcome::Check(res) => {
@@ -1019,18 +1136,17 @@ impl App {
                     }
                 }
             }
-            Outcome::Update(res) => match res {
+            Outcome::Update(inputs, res) => match res {
                 Ok(report) => {
                     entry.error = None;
-                    entry.pending = Some(Vec::new());
+                    entry.pending =
+                        model::remaining_pending(entry.pending.take(), &inputs, &report.changes);
                     entry.last_update = Some(report.changes.clone());
                     logs.push((
                         LogKind::Success,
-                        format!(
-                            "✓ {name} : mise à jour terminée ({} input(s) modifié(s))",
-                            report.changes.len()
-                        ),
+                        model::update_done_text(&name, &inputs, report.changes.len()),
                     ));
+                    reload_inputs = true;
                     if model::should_propose_lock_commit(&git) {
                         modal = Some(Modal::CommitLock {
                             repo: repo.clone(),
@@ -1040,9 +1156,14 @@ impl App {
                 }
                 Err(e) => {
                     entry.error = Some(e.clone());
+                    let which = if inputs.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" de {}", model::inputs_text(&inputs))
+                    };
                     logs.push((
                         LogKind::Error,
-                        format!("✕ {name} : mise à jour échouée\n{e}"),
+                        format!("✕ {name} : mise à jour{which} échouée\n{e}"),
                     ));
                 }
             },
@@ -1059,7 +1180,8 @@ impl App {
                         format!("✓ {name} : {} terminé{hint}", kind.label()),
                     ));
                     if kind == JobKind::Commit && followup == Some(Followup::Update) {
-                        next = Task::done(Message::Update(repo.clone()));
+                        let inputs = self.update_request.remove(&repo).unwrap_or_default();
+                        next = Task::done(Message::UpdateInputs(repo.clone(), inputs));
                     }
                 }
                 Err(e) => {
@@ -1088,6 +1210,10 @@ impl App {
             if self.queue_notify {
                 self.queue_new.push(n);
             }
+        }
+        if reload_inputs {
+            self.input_sel.remove(&repo);
+            next = Task::batch([next, self.load_inputs_task(&repo)]);
         }
         if is_check {
             let more = self.start_next_in_queue();
@@ -1557,6 +1683,96 @@ mod tests {
         assert_eq!(a.followups.get(Path::new("/r")), Some(&Followup::Update));
     }
 
+    fn root(name: &str) -> RootInput {
+        RootInput {
+            name: name.into(),
+            node: Some(name.into()),
+            rev: None,
+            short_rev: Some("abc1234".into()),
+            last_modified: None,
+            kind: None,
+            owner: None,
+            repo: None,
+            url: None,
+        }
+    }
+
+    #[test]
+    fn input_selection_messages() {
+        let (mut a, _d) = with_repo(Role::Tracked, GitState::default());
+        let p = PathBuf::from("/r");
+        let _ = a.update(Message::InputsLoaded(
+            p.clone(),
+            Ok(vec![root("nixpkgs"), root("hm")]),
+        ));
+        a.entries[0].pending = Some(vec![change()]);
+        let _ = a.update(Message::SelectInputs(p.clone(), InputSelect::All));
+        assert_eq!(a.input_sel[&p].len(), 2);
+        let _ = a.update(Message::SelectInputs(p.clone(), InputSelect::NoneSelected));
+        assert!(a.input_sel[&p].is_empty());
+        let _ = a.update(Message::SelectInputs(p.clone(), InputSelect::Updatable));
+        assert_eq!(
+            a.input_sel[&p].iter().collect::<Vec<_>>(),
+            vec![&"nixpkgs".to_string()]
+        );
+        let _ = a.update(Message::ToggleInput(p.clone(), "hm".into()));
+        assert_eq!(a.input_sel[&p].len(), 2);
+        // Un rechargement retire les inputs disparus.
+        let _ = a.update(Message::InputsLoaded(p.clone(), Ok(vec![root("hm")])));
+        assert_eq!(a.input_sel[&p].len(), 1);
+    }
+
+    #[test]
+    fn empty_selection_starts_nothing() {
+        let (mut a, _d) = with_repo(Role::Tracked, GitState::default());
+        let _ = a.update(Message::UpdateSelection("/r".into()));
+        assert_eq!(a.entries[0].busy, None);
+    }
+
+    #[test]
+    fn selection_update_starts_job_and_partial_result_keeps_other_pending() {
+        let (mut a, _d) = with_repo(Role::Tracked, GitState::default());
+        let p = PathBuf::from("/r");
+        let other = InputChange {
+            name: "hm".into(),
+            ..change()
+        };
+        a.entries[0].pending = Some(vec![change(), other]);
+        let _ = a.update(Message::ToggleInput(p.clone(), "nixpkgs".into()));
+        let _ = a.update(Message::UpdateSelection(p.clone()));
+        assert_eq!(a.entries[0].busy, Some(JobKind::Update));
+        let report = UpdateReport {
+            repo: p.clone(),
+            changes: vec![change()],
+        };
+        let _ = a.update(finished(
+            Outcome::Update(vec!["nixpkgs".into()], Ok(report)),
+            GitState::default(),
+        ));
+        let left = a.entries[0].pending.as_ref().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "hm");
+        assert!(!a.input_sel.contains_key(&p), "sélection réinitialisée");
+        assert!(a
+            .log
+            .iter()
+            .any(|l| l.text.contains("mise à jour de nixpkgs terminée")));
+    }
+
+    #[test]
+    fn dirty_git_keeps_requested_inputs_through_the_modal() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        let _ = a.update(Message::UpdateInputs("/r".into(), vec!["hm".into()]));
+        assert_eq!(a.update_request[Path::new("/r")], vec!["hm".to_string()]);
+        let _ = a.update(Message::ModalContinue);
+        assert!(a.update_request.is_empty());
+        assert_eq!(a.entries[0].busy, Some(JobKind::Update));
+        let _ = a.update(Message::ModalCancel);
+        let (mut b, _d) = with_repo(Role::Tracked, dirty());
+        let _ = b.update(Message::UpdateInputs("/r".into(), vec!["hm".into()]));
+        let _ = b.update(Message::ModalCancel);
+        assert!(b.update_request.is_empty());
+    }
     #[test]
     fn update_without_git_proceeds_directly() {
         let (mut a, _d) = with_repo(Role::Tracked, GitState::default());
@@ -1604,7 +1820,7 @@ mod tests {
             repo: "/r".into(),
             changes: vec![change()],
         };
-        let _ = a.update(finished(Outcome::Update(Ok(report)), g));
+        let _ = a.update(finished(Outcome::Update(Vec::new(), Ok(report)), g));
         match &a.modal {
             Some(Modal::CommitLock { message, .. }) => {
                 assert!(message.starts_with("flake.lock: update inputs"));
@@ -1625,7 +1841,10 @@ mod tests {
             repo: "/r".into(),
             changes: vec![change()],
         };
-        let _ = a.update(finished(Outcome::Update(Ok(report)), GitState::default()));
+        let _ = a.update(finished(
+            Outcome::Update(Vec::new(), Ok(report)),
+            GitState::default(),
+        ));
         assert!(a.modal.is_none());
     }
 

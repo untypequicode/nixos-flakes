@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 pub enum Job {
     Check,
     Update,
+    /// Mise à jour limitée à ces inputs racine (jamais vide : sinon `Update`).
+    UpdateInputs(Vec<String>),
     Apply,
     Commit(String),
     CommitLock(String),
@@ -29,7 +31,7 @@ impl Job {
     pub fn kind(&self) -> JobKind {
         match self {
             Job::Check => JobKind::Check,
-            Job::Update => JobKind::Update,
+            Job::Update | Job::UpdateInputs(_) => JobKind::Update,
             Job::Apply => JobKind::Apply,
             Job::Commit(_) => JobKind::Commit,
             Job::CommitLock(_) => JobKind::CommitLock,
@@ -42,7 +44,8 @@ impl Job {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Check(Result<UpdateReport, String>),
-    Update(Result<UpdateReport, String>),
+    /// Inputs demandés (vide = tous) et résultat.
+    Update(Vec<String>, Result<UpdateReport, String>),
     Done(JobKind, Result<(), String>),
 }
 
@@ -65,7 +68,11 @@ pub fn execute(repo: &Path, job: &Job, out: &mut dyn FnMut(&str)) -> Outcome {
     let s = |e: nixos_flakes_core::Error| e.to_string();
     match job {
         Job::Check => Outcome::Check(nix::check(repo).map_err(s)),
-        Job::Update => Outcome::Update(nix::update(repo, out).map_err(s)),
+        Job::Update => Outcome::Update(Vec::new(), nix::update(repo, out).map_err(s)),
+        Job::UpdateInputs(names) => Outcome::Update(
+            names.clone(),
+            nix::update_inputs(repo, names, out).map_err(s),
+        ),
         Job::Apply => Outcome::Done(
             JobKind::Apply,
             nix::apply(repo, Privilege::Pkexec, out).map_err(s),
@@ -123,6 +130,11 @@ pub fn scan_all(cfg: &Config) -> Vec<RepoStatus> {
         .collect()
 }
 
+/// Inputs racine du `flake.lock` (lecture de fichier, erreur déjà en texte).
+pub fn load_inputs(repo: &Path) -> Result<Vec<nixos_flakes_core::lock::RootInput>, String> {
+    nix::list_inputs(repo).map_err(|e| e.to_string())
+}
+
 /// Notification de bureau sans bloquer.
 pub fn notify(title: String, body: String) {
     std::thread::spawn(move || nixos_flakes_core::notify::desktop(&title, &body, false));
@@ -144,6 +156,7 @@ mod tests {
         assert_eq!(Job::Commit("m".into()).kind(), JobKind::Commit);
         assert_eq!(Job::CommitLock("m".into()).kind(), JobKind::CommitLock);
         assert_eq!(Job::Push.kind(), JobKind::Push);
+        assert_eq!(Job::UpdateInputs(vec!["a".into()]).kind(), JobKind::Update);
     }
 
     #[test]

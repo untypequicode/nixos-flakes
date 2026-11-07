@@ -106,6 +106,12 @@ in
         Le fichier doit être lisible par chaque utilisateur concerné ; pour le service
         de mise à niveau (root), root doit pouvoir le lire.
         `null` : jeton géré depuis l'interface (`~/.config/nixos-flakes/github-token`).
+        Remarque : `/etc/nix/access-tokens.conf` (ligne `extra-access-tokens = github.com=JETON`),
+        souvent en root 600, n'est pas lisible par `nix` lancé en utilisateur : son jeton est alors
+        ignoré (limite de 60 requêtes/h). nixos-flakes le détecte et l'utilise s'il est lisible ;
+        pour le rendre lisible, par exemple
+        `install -m 640 -g users /chemin/source /etc/nix/access-tokens.conf`, ou enregistrez
+        un jeton dans l'interface, ou pointez cette option vers un fichier lisible.
       '';
     };
 
