@@ -65,9 +65,14 @@ let
             "System"
             "Settings"
           ];
+          icon = "nixos-flakes-gui";
           startupWMClass = "nixos-flakes-gui";
         })
       ];
+      postInstall = ''
+        install -Dm644 crates/nixos-flakes-gui/assets/icons/nixos-flakes-gui.svg \
+          $out/share/icons/hicolor/scalable/apps/nixos-flakes-gui.svg
+      '';
       postFixup = ''
         for bin in $out/bin/*; do
           patchelf --add-rpath ${lib.makeLibraryPath guiLibs} "$bin"
@@ -102,6 +107,7 @@ let
           git config --global user.name test
           git config --global init.defaultBranch main
         '';
+        postInstall = extra.postInstall or "";
         postFixup = (extra.postFixup or "") + ''
           for bin in $out/bin/*; do
             wrapProgram "$bin" \
