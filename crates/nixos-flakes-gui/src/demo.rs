@@ -4,6 +4,7 @@
 use crate::tasks::{Finished, Job, JobEvent, Outcome};
 use iced::futures::channel::mpsc;
 use iced::futures::Stream;
+use nixos_flakes_config::PackageHit;
 use nixos_flakes_core::config::Role;
 use nixos_flakes_core::git::GitState;
 use nixos_flakes_core::lock::{InputChange, RootInput};
@@ -269,6 +270,107 @@ pub fn run_job(repo: PathBuf, job: Job, now: i64) -> impl Stream<Item = JobEvent
     });
     rx
 }
+// -- Paquets -----------------------------------------------------------------------
+
+/// Fausse config du Dépôt système : (chemin relatif, source Nix). Rien n'est lu ni écrit.
+pub fn config_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "modules/common/packages.nix",
+            "{ pkgs, ... }:\n{\n  environment.systemPackages = with pkgs; [\n    git\n    vim\n    htop\n    # firefox\n  ];\n}\n",
+        ),
+        (
+            "modules/desktop.nix",
+            "{ pkgs, ... }:\n{\n  environment.systemPackages = with pkgs; [\n    alacritty\n    wl-clipboard\n  ];\n\n  fonts.packages = with pkgs; [\n    inter\n  ];\n}\n",
+        ),
+        (
+            "home/demo.nix",
+            "{ pkgs, lib, ... }:\n{\n  home.packages = with pkgs; [\n    fd\n    bat\n  ];\n\n  environment.systemPackages = map (n: pkgs.${n}) [ \"nano\" ];\n}\n",
+        ),
+    ]
+}
+
+/// Fichiers de config fictifs, prêts à être affichés.
+pub fn config_files() -> Vec<crate::packages::ConfigFile> {
+    config_sources()
+        .into_iter()
+        .map(|(rel, src)| {
+            crate::packages::ConfigFile::new(
+                rel,
+                PathBuf::from("/demo/nixos-config").join(rel),
+                src.to_string(),
+            )
+        })
+        .filter(|f| !f.locations.is_empty())
+        .collect()
+}
+
+fn hit(attr: &str, version: &str, description: &str, license: &str, cache: bool) -> PackageHit {
+    PackageHit {
+        attr: attr.into(),
+        name: attr.into(),
+        version: version.into(),
+        description: description.into(),
+        license: Some(license.into()),
+        from_cache: cache,
+    }
+}
+
+/// Faux résultats de recherche (filtrés sur la saisie, sans réseau).
+pub fn package_hits(query: &str) -> Vec<PackageHit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        hit(
+            "git",
+            "2.47.1",
+            "Distributed version control system",
+            "GPL-2.0-only",
+            false,
+        ),
+        hit(
+            "gitui",
+            "0.26.3",
+            "Blazing fast terminal UI for git",
+            "MIT",
+            false,
+        ),
+        hit(
+            "lazygit",
+            "0.44.1",
+            "Simple terminal UI for git commands",
+            "MIT",
+            false,
+        ),
+        hit(
+            "ripgrep",
+            "14.1.1",
+            "Utility that combines the usability of The Silver Searcher with the speed of grep",
+            "Unlicense",
+            true,
+        ),
+        hit(
+            "firefox",
+            "133.0",
+            "Web browser from Mozilla",
+            "MPL-2.0",
+            false,
+        ),
+        hit(
+            "vim",
+            "9.1.0",
+            "The most popular clone of the VI editor",
+            "Vim",
+            false,
+        ),
+    ]
+    .into_iter()
+    .filter(|h| h.attr.contains(&q) || h.description.to_lowercase().contains(&q))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

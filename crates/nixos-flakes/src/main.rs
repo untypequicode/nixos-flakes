@@ -2,6 +2,7 @@
 
 mod cli;
 mod commands;
+mod pkg;
 
 use clap::Parser;
 use std::process::ExitCode;

@@ -15,3 +15,5 @@ path = "src/main.rs"
 [dependencies]
 nixos-flakes-core = { path = "../nixos-flakes-core" }
 clap = { version = "4", features = ["derive"] }
+nixos-flakes-config = { path = "../nixos-flakes-config" }
+tempfile = "3"

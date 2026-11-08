@@ -28,7 +28,7 @@ Options :
       --demo              Mode démonstration : faux dépôts et commandes simulées, rien n'est modifié
       --demo-view <VUES>  Avec --demo, ouvre au démarrage des vues (séparées par des virgules) :
                           palette, recherche, modal, reglages, verif, git, erreur, site,
-                          replie, toasts, clair
+                          replie, toasts, clair, paquets, paquets-ajout
   -h, --help              Affiche cette aide
   -V, --version           Affiche la version";
 

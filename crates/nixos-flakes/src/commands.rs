@@ -39,6 +39,7 @@ pub fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Upgrade { path, notify, sudo } => {
             upgrade_cmd(&config, path.as_deref(), notify, sudo)
         }
+        Command::Pkg { command } => crate::pkg::run(command, &config),
         Command::Track { path } => set_role(&mut config, &config_path, &path, Role::Tracked),
         Command::Untrack { path } => set_role(&mut config, &config_path, &path, Role::Detected),
         Command::Ignore { path } => set_role(&mut config, &config_path, &path, Role::Ignored),
@@ -47,7 +48,7 @@ pub fn run(cli: Cli) -> Result<ExitCode, String> {
 }
 
 /// Dépôt demandé, sinon dépôt système, sinon `/etc/nixos`.
-fn resolve_repo(config: &Config, path: Option<&Path>) -> PathBuf {
+pub(crate) fn resolve_repo(config: &Config, path: Option<&Path>) -> PathBuf {
     path.map(Path::to_path_buf)
         .or_else(|| config.system_repo.clone())
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SYSTEM_REPO))

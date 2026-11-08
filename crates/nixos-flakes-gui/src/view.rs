@@ -6,6 +6,7 @@ use crate::model::{
     self, badge, format_opt_date, format_relative, group_entries, role_singular, role_title,
     short_rev, Badge, Modal, RepoEntry, RoleAction, Tone,
 };
+use crate::packages;
 use crate::palette::Item;
 use crate::settings;
 use crate::theme::{self, with_alpha, Btn};
@@ -173,6 +174,17 @@ impl App {
             nav_item(ui, "nav:rescan", "Rescanner", None, Message::Rescan),
             nav_item(
                 ui,
+                "nav:packages",
+                "Paquets",
+                None,
+                if self.page == Page::Packages {
+                    Message::Noop
+                } else {
+                    Message::Packages(packages::Msg::Open)
+                },
+            ),
+            nav_item(
+                ui,
                 "nav:settings",
                 "Réglages",
                 None,
@@ -301,6 +313,16 @@ impl App {
                 &self.token_input,
                 self.token_saved,
                 &self.token_source,
+            ),
+            Page::Packages => packages::view(
+                ui,
+                &self.packages,
+                self.cfg.system_repo.as_deref(),
+                self.cfg
+                    .system_repo
+                    .as_ref()
+                    .filter(|p| self.actions_for(p).apply)
+                    .map(|p| Message::Apply(p.clone())),
             ),
             Page::Main => match self.selected_entry() {
                 Some(e) => self.repo_detail(ui, e, narrow, width),

@@ -251,6 +251,30 @@ fn run_privileged(privilege: Privilege, args: &[&str], out: &mut dyn FnMut(&str)
     proc::run(&cmd[0], &rest, None, out)
 }
 
+/// Copie `src` sur `dest` avec élévation de privilèges (`cp` : propriétaire et droits
+/// d'un `dest` existant conservés). Sert à écrire sous un dossier appartenant à root.
+pub fn install_file(
+    src: &Path,
+    dest: &Path,
+    privilege: Privilege,
+    out: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let (s, d) = (src.to_string_lossy(), dest.to_string_lossy());
+    let tmp = format!("{d}.nixos-flakes-tmp");
+    // Atomique : copie sous un nom temporaire du même dossier (droits et propriétaire
+    // de `dest` reportés s'il existe), puis `mv` par-dessus `dest`.
+    let script = r#"set -e
+trap 'rm -f -- "$3"' EXIT
+cp -- "$1" "$3"
+if [ -e "$2" ]; then
+  chown --reference="$2" -- "$3"
+  chmod --reference="$2" -- "$3"
+fi
+mv -f -- "$3" "$2"
+trap - EXIT"#;
+    run_privileged(privilege, &["sh", "-c", script, "sh", &s, &d, &tmp], out)
+}
+
 /// `nixos-rebuild switch --flake <repo>` avec élévation de privilèges.
 pub fn apply(repo: &Path, privilege: Privilege, out: &mut dyn FnMut(&str)) -> Result<()> {
     let repo_s = repo.to_string_lossy().into_owned();

@@ -128,7 +128,7 @@ Codes de sortie : 0 ok, 1 erreur. `check --waybar` sort toujours 0 avec un JSON.
 
 ## GUI `nixos-flakes-gui`
 
-iced (Wayland/X11). Thème sombre/clair suivant le système, design moderne : barre latérale (Système / Suivis / Détectés / Ignorés) avec badges d'état, panneau de détail (diff par input, boutons Vérifier / Mettre à jour / Appliquer / Suivre / Ignorer), console de logs en direct, dialogue de commit (avant : modifs non commitées ; après : `flake.lock`), page Réglages. Tray optionnel (`ksni`) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter ; fermer la fenêtre réduit dans le tray si activé. Les appels `core` se font dans des threads (`iced::Task::perform` + `std::thread`/canal pour les logs).
+iced (Wayland/X11). Thème sombre/clair suivant le système, design moderne : barre latérale (Système / Suivis / Détectés / Ignorés) avec badges d'état, panneau de détail (diff par input, boutons Vérifier / Mettre à jour / Appliquer / Suivre / Ignorer), console de logs en direct, dialogue de commit (avant : modifs non commitées ; après : `flake.lock`), page Réglages, page Paquets (module `packages.rs` : état et plans de modification purs et testés, E/S bloquantes dans `iced::Task`, appels à `nixos-flakes-config` ; en `--demo`, données de `demo.rs` et écriture en mémoire seulement). Tray optionnel (`ksni`) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter ; fermer la fenêtre réduit dans le tray si activé. Les appels `core` se font dans des threads (`iced::Task::perform` + `std::thread`/canal pour les logs).
 
 ## Modules NixOS
 
