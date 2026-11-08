@@ -7,6 +7,7 @@ use crate::keys::{self, KeyContext, Shortcut};
 use crate::model::{
     self, Actions, JobKind, Modal, RepoEntry, RoleAction, UpdatePlan, DIRTY_COMMIT_MESSAGE,
 };
+use crate::packages::{self, PackagesState};
 use crate::palette::{self, Command, PaletteState};
 use crate::settings;
 use crate::tasks::{self, Finished, Job, JobEvent, Outcome};
@@ -40,6 +41,7 @@ pub const PALETTE_ROWS: usize = 9;
 pub enum Page {
     Main,
     Settings,
+    Packages,
 }
 
 /// Onglet du panneau de détail.
@@ -115,6 +117,7 @@ pub enum Message {
     ToggleSidebar,
     OpenSettings,
     Settings(settings::Msg),
+    Packages(packages::Msg),
     SystemTheme(iced::theme::Mode),
     SetTab(Tab),
     ToggleGroup(Role),
@@ -193,6 +196,8 @@ pub struct App {
     pub toasts: Toasts,
     /// Vues de démonstration à ouvrir après le premier scan.
     pub demo_views: Vec<String>,
+    /// État de la page Paquets.
+    pub packages: PackagesState,
 }
 
 /// Paramètres de la fenêtre principale.
@@ -352,6 +357,7 @@ impl App {
             mode_from: Mode::Dark,
             toasts: Toasts::default(),
             demo_views,
+            packages: PackagesState::default(),
         }
     }
 
@@ -847,6 +853,7 @@ impl App {
                 Task::none()
             }
             Message::Settings(msg) => self.on_settings(msg),
+            Message::Packages(msg) => self.on_packages(msg),
             Message::SystemTheme(m) => {
                 if let Some(m) = theme::from_iced(m) {
                     self.set_theme_mode(m);
@@ -946,6 +953,153 @@ impl App {
                 }
             }
             Message::Key(key, mods, captured) => self.on_key(&key, mods, captured),
+        }
+    }
+
+    /// Lecture asynchrone des Fichiers de config du Dépôt système (fausse config en démo).
+    fn packages_load_task(&mut self) -> Task<Message> {
+        if self.cli.demo {
+            self.packages.set_files(demo::config_files());
+            return Task::none();
+        }
+        let Some(repo) = self.cfg.system_repo.clone() else {
+            return Task::none();
+        };
+        self.packages.loading = true;
+        Task::perform(tasks::blocking(move || packages::load_repo(&repo)), |r| {
+            Message::Packages(packages::Msg::Loaded(
+                r.unwrap_or_else(|| Err("lecture interrompue".to_string())),
+            ))
+        })
+    }
+
+    fn packages_search_task(&self, seq: u64, query: String) -> Task<Message> {
+        let demo = self.cli.demo;
+        Task::perform(
+            tasks::blocking(move || {
+                if demo {
+                    std::thread::sleep(Duration::from_millis(250));
+                    Ok(demo::package_hits(&query))
+                } else {
+                    nixos_flakes_config::search(&query, packages::SEARCH_LIMIT)
+                        .map_err(|e| e.to_string())
+                }
+            }),
+            move |r| {
+                Message::Packages(packages::Msg::SearchDone(
+                    seq,
+                    r.unwrap_or_else(|| Err("recherche interrompue".to_string())),
+                ))
+            },
+        )
+    }
+
+    fn on_packages(&mut self, msg: packages::Msg) -> Task<Message> {
+        use packages::{Msg, Op};
+        match msg {
+            Msg::Open => {
+                self.page = Page::Packages;
+                self.sidebar_open = false;
+                self.restart_panel();
+                self.reset_hover();
+                if self.packages.loaded || self.packages.loading {
+                    Task::none()
+                } else {
+                    self.packages_load_task()
+                }
+            }
+            Msg::Back => {
+                self.page = Page::Main;
+                self.restart_panel();
+                self.reset_hover();
+                Task::none()
+            }
+            Msg::Query(q) => {
+                self.packages.query = q;
+                Task::none()
+            }
+            Msg::Search => match self.packages.begin_search() {
+                Some((seq, q)) => self.packages_search_task(seq, q),
+                None => Task::none(),
+            },
+            Msg::SearchDone(seq, res) => {
+                self.packages.finish_search(seq, res);
+                Task::none()
+            }
+            Msg::Reload => self.packages_load_task(),
+            Msg::Loaded(res) => {
+                match res {
+                    Ok(files) => self.packages.set_files(files),
+                    Err(e) => {
+                        self.push_log(LogKind::Error, format!("Paquets : {e}"));
+                        self.packages.set_load_error(e);
+                    }
+                }
+                Task::none()
+            }
+            Msg::Add(i) => {
+                if let Some(h) = self.packages.results.get(i) {
+                    let name = h.attr.clone();
+                    self.packages.begin_op(Op::Add { name });
+                }
+                Task::none()
+            }
+            Msg::Remove(file, loc, name) => {
+                self.packages.begin_op(Op::Remove { file, loc, name });
+                Task::none()
+            }
+            Msg::Move(file, loc, name) => {
+                self.packages.begin_op(Op::Move { file, loc, name });
+                Task::none()
+            }
+            Msg::PickFile(i) => {
+                self.packages.pick_file(i);
+                Task::none()
+            }
+            Msg::PickLoc(j) => {
+                self.packages.pick_loc(j);
+                Task::none()
+            }
+            Msg::Cancel => {
+                self.packages.cancel();
+                Task::none()
+            }
+            Msg::Confirm => {
+                let Some(changes) = self.packages.begin_write() else {
+                    return Task::none();
+                };
+                if self.cli.demo {
+                    // Démo : la fausse config est modifiée en mémoire, rien n'est écrit.
+                    let r = self.packages.apply_in_memory(&changes);
+                    return self.update_inner(Message::Packages(Msg::Written(r)));
+                }
+                Task::perform(
+                    tasks::blocking(move || packages::write_changes(&changes)),
+                    |r| {
+                        Message::Packages(Msg::Written(
+                            r.unwrap_or_else(|| Err("écriture interrompue".to_string())),
+                        ))
+                    },
+                )
+            }
+            Msg::Written(res) => {
+                let ok = res.is_ok();
+                match &res {
+                    Ok(()) => {
+                        self.push_log(LogKind::Success, "Paquets : configuration modifiée.");
+                        self.toast(
+                            ToastKind::Success,
+                            "Configuration modifiée. Rien n'est appliqué.",
+                        );
+                    }
+                    Err(e) => self.push_log(LogKind::Error, format!("Paquets : {e}")),
+                }
+                self.packages.finish_write(res);
+                if ok && !self.cli.demo {
+                    return self.packages_load_task();
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1354,7 +1508,7 @@ impl App {
         let ctx = KeyContext {
             modal: self.modal.is_some(),
             palette: self.palette_open,
-            settings: self.page == Page::Settings,
+            settings: self.page != Page::Main,
         };
         let Some(shortcut) = keys::resolve(key, mods, captured, ctx) else {
             return Task::none();
@@ -1374,7 +1528,7 @@ impl App {
                     Task::none()
                 } else if self.modal.is_some() {
                     self.update_inner(Message::ModalCancel)
-                } else if self.page == Page::Settings {
+                } else if self.page != Page::Main {
                     self.page = Page::Main;
                     self.restart_panel();
                     self.reset_hover();
@@ -1446,6 +1600,19 @@ impl App {
                 "replie" => tasks.push(self.update_inner(Message::ToggleGroup(Role::Tracked))),
                 "reglages" | "settings" => tasks.push(self.update_inner(Message::OpenSettings)),
                 "verif" => tasks.push(self.update_inner(Message::CheckAll)),
+                "paquets" | "paquets-ajout" => {
+                    use packages::{Msg, Op};
+                    tasks.push(self.update_inner(Message::Packages(Msg::Open)));
+                    self.packages.query = "git".into();
+                    tasks.push(self.update_inner(Message::Packages(Msg::Search)));
+                    if v == "paquets-ajout" {
+                        self.packages.begin_op(Op::Add {
+                            name: "ripgrep".into(),
+                        });
+                        self.packages.pick_file(0);
+                        self.packages.pick_loc(0);
+                    }
+                }
                 "git" => {
                     if let Some(p) = by_name(self, "website") {
                         tasks.push(self.update_inner(Message::Select(p)));

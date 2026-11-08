@@ -43,6 +43,18 @@ nixos-flakes set-system PATH              définir le dépôt système
 
 `PATH` vaut par défaut le dépôt système. `--config FICHIER` change le fichier de configuration.
 
+### Paquets déclarés (`pkg`)
+
+```text
+nixos-flakes pkg search REQUÊTE [--limit N]      cherche dans nixpkgs (search.nixos.org, puis nix search, puis cache hors ligne)
+nixos-flakes pkg list [--repo CHEMIN]            Fichiers de config, Emplacements (lecture seule signalés) et paquets déclarés
+nixos-flakes pkg add NOM --file F --location ID  déclare un paquet
+nixos-flakes pkg remove NOM --file F --location ID
+nixos-flakes pkg move NOM --from F:ID --to F:ID
+```
+
+Les commandes qui modifient affichent le diff, valident le Nix puis demandent confirmation (`--yes` pour passer, `--dry-run` pour ne rien écrire). `--repo` remplace le dépôt système. Si le dossier n'est pas modifiable, l'écriture passe par `pkexec` (ou `sudo` avec `--sudo`). Rien n'est appliqué : lance ensuite `nixos-flakes apply`. Les résultats de recherche sont gardés dans `~/.cache/nixos-flakes/search/`.
+
 ### Mise à jour sélective
 
 Un dépôt flake peut déclarer plusieurs inputs ; tu peux n'en mettre à jour qu'une partie.
@@ -70,6 +82,7 @@ Classes CSS : `uptodate`, `outdated` (texte `❆ N`), `error`.
 - Console de logs en direct.
 - **Flux git** : avant la mise à jour, si le dépôt a des modifications non commitées, proposition de les commiter ; après, proposition de commiter `flake.lock` seul. Jamais de push automatique.
 - Réglages : racines de scan, profondeur, tray, fréquence de vérification.
+- **Page Paquets** (barre latérale) : recherche nixpkgs (async, badge « cache » hors ligne), puis choix du Fichier de config et de l'Emplacement avec aperçu du diff et confirmation avant écriture ; liste des Paquets déclarés du Dépôt système avec Supprimer / Déplacer (Emplacements générés : « modifiable en code seulement »). Rien n'est appliqué tant que tu n'as pas lancé l'Application. Écriture avec élévation (pkexec) si le dépôt appartient à root. Vue de démo : `--demo --demo-view paquets` (ou `paquets-ajout`) ; la fausse config reste en mémoire.
 - Design inspiré de Linear : thème sombre/clair selon le système, police Inter, transitions fluides (rien ne tourne au repos).
 - **Clavier** : `Ctrl+K` palette de commandes, `j`/`k` ou flèches pour naviguer, `r` vérifier, `u` mettre à jour, `Échap` fermer.
 - `--demo` : lance l'interface avec de fausses données (rien n'est lu ni écrit), pratique pour essayer.

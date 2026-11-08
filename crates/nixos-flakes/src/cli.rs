@@ -1,6 +1,6 @@
 //! Définition des arguments de la ligne de commande (clap).
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Gestion des flakes Nix de la machine.
@@ -79,10 +79,86 @@ pub enum Command {
         /// Dossier du dépôt flake.
         path: PathBuf,
     },
+    /// Recherche et édition des paquets déclarés dans les Fichiers de config.
+    Pkg {
+        #[command(subcommand)]
+        command: PkgCommand,
+    },
     /// Désigne le dépôt système (l'ancien devient suivi).
     SetSystem {
         /// Dossier du dépôt flake.
         path: PathBuf,
+    },
+}
+
+/// Options communes aux commandes qui modifient un Fichier de config.
+#[derive(Debug, Args, PartialEq, Eq, Default)]
+pub struct WriteOpts {
+    /// Dépôt à modifier (défaut : dépôt système).
+    #[arg(long, value_name = "CHEMIN")]
+    pub repo: Option<PathBuf>,
+    /// Écrit sans demander confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Affiche le diff sans rien écrire.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Élève les privilèges avec sudo au lieu de pkexec si le dossier n'est pas modifiable.
+    #[arg(long)]
+    pub sudo: bool,
+}
+
+/// Sous-commandes de `pkg`.
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PkgCommand {
+    /// Cherche un paquet nixpkgs (search.nixos.org, puis nix search, puis cache).
+    Search {
+        /// Mot recherché.
+        query: String,
+        /// Nombre maximal de résultats.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Liste les Fichiers de config, leurs Emplacements et les paquets déclarés.
+    List {
+        /// Dépôt à lire (défaut : dépôt système).
+        #[arg(long, value_name = "CHEMIN")]
+        repo: Option<PathBuf>,
+    },
+    /// Déclare un paquet dans un Emplacement.
+    Add {
+        /// Nom du paquet (attribut nixpkgs).
+        name: String,
+        /// Fichier de config (relatif au dépôt).
+        #[arg(long, value_name = "FICHIER")]
+        file: PathBuf,
+        /// Identifiant de l'Emplacement (voir `pkg list`).
+        #[arg(long, value_name = "ID")]
+        location: String,
+        #[command(flatten)]
+        opts: WriteOpts,
+    },
+    /// Retire un paquet déclaré d'un Emplacement.
+    Remove {
+        name: String,
+        #[arg(long, value_name = "FICHIER")]
+        file: PathBuf,
+        #[arg(long, value_name = "ID")]
+        location: String,
+        #[command(flatten)]
+        opts: WriteOpts,
+    },
+    /// Déplace un paquet déclaré d'un Emplacement vers un autre.
+    Move {
+        name: String,
+        /// Origine, au format FICHIER:ID.
+        #[arg(long, value_name = "FICHIER:ID")]
+        from: String,
+        /// Destination, au format FICHIER:ID.
+        #[arg(long, value_name = "FICHIER:ID")]
+        to: String,
+        #[command(flatten)]
+        opts: WriteOpts,
     },
 }
 

@@ -48,6 +48,22 @@ _Avoid_: Auto-upgrade
 Secret personnel saisi dans l'interface qui authentifie les accès à GitHub pour relever la limite de requêtes ; il ne figure jamais dans la configuration Nix.
 _Avoid_: Token, clé API
 
+**Fichier de config**:
+Fichier Nix du dépôt système (ou d'un dépôt suivi) que l'on peut ouvrir, soit en code, soit en vue graphique.
+_Avoid_: Module (seul), fichier de conf
+
+**Vue graphique**:
+Présentation d'un fichier de config sous forme de réglages éditables ; les parties trop complexes y sont signalées comme modifiables en code seulement.
+_Avoid_: GUI (seul), mode visuel
+
+**Paquet déclaré**:
+Logiciel nommé dans une liste de paquets d'un fichier de config, donc installé par cette configuration.
+_Avoid_: Paquet installé, application
+
+**Emplacement**:
+Liste de paquets précise d'un fichier de config où un paquet déclaré se trouve ou peut être ajouté.
+_Avoid_: Destination, cible
+
 **Zone de notification**:
 Zone de la barre où l'outil affiche son icône d'état.
 _Avoid_: Tray, systray

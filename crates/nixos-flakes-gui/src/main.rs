@@ -6,6 +6,7 @@ mod cli;
 mod demo;
 mod keys;
 mod model;
+mod packages;
 mod palette;
 mod settings;
 mod tasks;
