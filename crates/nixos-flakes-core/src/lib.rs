@@ -5,8 +5,10 @@
 //! fusionnés). Voir `docs/ARCHITECTURE.md` et `GLOSSARY.md`.
 
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod git;
+pub mod icon;
 pub mod lock;
 pub mod nix;
 pub mod notify;

@@ -10,25 +10,81 @@ let
   cfg = config.services.nixos-flakes;
   system = pkgs.stdenv.hostPlatform.system;
   inherit (lib) mkOption mkEnableOption types;
+
+  guiExe = lib.getExe' cfg.guiPackage "nixos-flakes-gui";
+
+  # Anciens `enable` (booléens) : la mise à niveau automatique s'active désormais
+  # en donnant une valeur à `services.nixos-flakes.interval`.
+  legacyEnablePaths = [
+    [
+      "services"
+      "nixos-auto-upgrade-custom"
+      "enable"
+    ]
+    [
+      "services"
+      "nixos-flakes"
+      "autoUpgrade"
+      "enable"
+    ]
+  ];
+  legacyEnableSet = lib.filter (p: lib.getAttrFromPath p config != null) legacyEnablePaths;
+  legacyEnabled = lib.any (p: lib.getAttrFromPath p config == true) legacyEnablePaths;
+
+  renamed =
+    from: to:
+    lib.mkRenamedOptionModule from [
+      "services"
+      "nixos-flakes"
+      to
+    ];
 in
 {
   imports = [
-    (lib.mkRenamedOptionModule
-      [ "services" "nixos-auto-upgrade-custom" "enable" ]
-      [ "services" "nixos-flakes" "autoUpgrade" "enable" ]
-    )
-    (lib.mkRenamedOptionModule
-      [ "services" "nixos-auto-upgrade-custom" "interval" ]
-      [ "services" "nixos-flakes" "autoUpgrade" "interval" ]
-    )
+    (renamed [ "services" "nixos-auto-upgrade-custom" "interval" ] "interval")
+    (renamed [ "services" "nixos-flakes" "autoUpgrade" "interval" ] "interval")
+    (renamed [ "services" "nixos-flakes" "autoUpgrade" "flakePath" ] "flakePath")
+    (renamed [ "services" "nixos-flakes" "autoUpgrade" "user" ] "user")
+
+    # Anciens `enable` : acceptés avec un avertissement. `true` sans `interval` garde l'ancien
+    # comportement (mise à niveau quotidienne).
+    {
+      options = lib.foldl' lib.recursiveUpdate { } (
+        map (
+          p:
+          lib.setAttrByPath p (mkOption {
+            type = types.nullOr types.bool;
+            default = null;
+            visible = false;
+            description = "Obsolète : voir `services.nixos-flakes.interval`.";
+          })
+        ) legacyEnablePaths
+      );
+      config = {
+        warnings = map (
+          p:
+          "L'option `${lib.showOption p}` est obsolète : la mise à niveau automatique s'active en "
+          + "définissant `services.nixos-flakes.interval` (par exemple \"daily\"). Par compatibilité, "
+          + "`true` sans `interval` équivaut à `interval = \"daily\"`."
+        ) legacyEnableSet;
+        services.nixos-flakes.interval = lib.mkIf legacyEnabled (lib.mkDefault "daily");
+      };
+    }
   ];
 
   options.services.nixos-flakes = {
+    enable = mkEnableOption ''
+      le démon nixos-flakes : processus de fond de la session qui héberge l'icône d'état dans la
+      zone de notification et surveille les mises à jour. Le service utilisateur est lié à
+      `graphical-session.target` : celui-ci n'est atteint que si la session le démarre
+      (`niri-session`, ou tout lanceur de session qui active `graphical-session.target` et importe
+      `WAYLAND_DISPLAY` dans l'environnement systemd utilisateur)'';
+
     package = mkOption {
       type = types.package;
       default = self.packages.${system}.nixos-flakes;
       defaultText = lib.literalExpression "nixos-flakes.packages.\${system}.nixos-flakes";
-      description = "Paquet de la CLI `nixos-flakes`.";
+      description = "Paquet de la CLI `nixos-flakes` (qui contient le démon).";
     };
 
     guiPackage = mkOption {
@@ -38,34 +94,33 @@ in
       description = "Paquet de l'interface graphique `nixos-flakes-gui`.";
     };
 
-    autoUpgrade = {
-      enable = mkEnableOption "la mise à niveau automatique du dépôt système";
+    interval = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "04:00";
+      description = ''
+        Fréquence (format `systemd.time`) de la mise à niveau automatique du dépôt système
+        (service root + minuteur). `null` : pas de mise à niveau automatique.
+      '';
+    };
 
-      interval = mkOption {
-        type = types.str;
-        default = "daily";
-        example = "04:00";
-        description = "Fréquence (format `systemd.time`) de la mise à niveau automatique.";
-      };
+    flakePath = mkOption {
+      type = types.str;
+      default = "/etc/nixos";
+      description = "Chemin du dépôt système (dépôt flake de la configuration NixOS).";
+    };
 
-      flakePath = mkOption {
-        type = types.str;
-        default = "/etc/nixos";
-        description = "Chemin du dépôt système (dépôt flake de la configuration NixOS).";
-      };
-
-      user = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "alice";
-        description = ''
-          Propriétaire du dépôt système. Si défini, le service reste lancé en root
-          (nécessaire à l'application), mais `flake.lock` est rendu à cet utilisateur
-          après chaque exécution et git accepte le dépôt malgré son propriétaire différent,
-          pour que `flake.lock` ne reste pas la propriété de root.
-          `null` : tout reste à root.
-        '';
-      };
+    user = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "alice";
+      description = ''
+        Utilisateur de la machine. Le démon (service utilisateur) n'est lancé que pour lui.
+        La mise à niveau automatique reste lancée en root (nécessaire à l'application), mais
+        `flake.lock` est rendu à cet utilisateur après chaque exécution et git accepte le dépôt
+        malgré son propriétaire différent, pour que `flake.lock` ne reste pas la propriété de root.
+        `null` : le démon peut être lancé pour tout utilisateur, et tout reste à root.
+      '';
     };
 
     systemRepo = {
@@ -86,7 +141,8 @@ in
 
       path = mkOption {
         type = types.str;
-        default = "/etc/nixos";
+        default = cfg.flakePath;
+        defaultText = lib.literalExpression "config.services.nixos-flakes.flakePath";
         description = "Chemin du dépôt système concerné par `systemRepo.owner`.";
       };
     };
@@ -98,9 +154,9 @@ in
       description = ''
         Chemin d'un fichier contenant le jeton GitHub (jeton brut, `github.com=JETON` ou
         `access-tokens = github.com=JETON`), par exemple géré par sops-nix ou agenix.
-        Exporté dans `NIXOS_FLAKES_GITHUB_TOKEN_FILE` (session, service de la zone de
-        notification et mise à niveau automatique) : l'interface, la CLI, la zone de
-        notification et la mise à niveau l'utilisent en lecture seule.
+        Exporté dans `NIXOS_FLAKES_GITHUB_TOKEN_FILE` (session, démon de session
+        et mise à niveau automatique) : l'interface, la CLI, le démon
+        et la mise à niveau l'utilisent en lecture seule.
         Le type est `str` et non `path` pour qu'un chemin d'exécution ne soit pas copié dans
         le store : le contenu du fichier n'est jamais écrit dans la configuration Nix.
         Le fichier doit être lisible par chaque utilisateur concerné ; pour le service
@@ -116,21 +172,60 @@ in
     };
 
     gui = {
-      enable = mkEnableOption "l'interface graphique nixos-flakes-gui";
-
-      tray = mkEnableOption ''
-        le lancement automatique de l'interface dans la zone de notification (`nixos-flakes-gui --tray`).
-        Le service est lié à `graphical-session.target` : celui-ci n'est atteint que si la session
-        le démarre (`niri-session`, ou tout lanceur de session qui active `graphical-session.target`
-        et importe `WAYLAND_DISPLAY` dans l'environnement systemd utilisateur). Avec un simple
-        `niri` lancé depuis un TTY ou un gestionnaire de connexion, le service ne démarre pas :
-        lancez plutôt `nixos-flakes-gui --tray` via `spawn-at-startup` dans la configuration de niri
-        '';
+      enable = mkEnableOption ''
+        l'interface graphique nixos-flakes-gui (nécessite `services.nixos-flakes.enable` : elle
+        se connecte au démon). L'entrée « Ouvrir l'interface » de l'icône d'état la lance'';
     };
   };
 
   config = lib.mkMerge [
-    (lib.mkIf cfg.autoUpgrade.enable {
+    (lib.mkIf cfg.enable {
+      environment.systemPackages = [ cfg.package ];
+
+      systemd.user.services.nixos-flakes-daemon = {
+        description = "Démon nixos-flakes (icône d'état et vérification des mises à jour)";
+        wantedBy = [ "graphical-session.target" ];
+        partOf = [ "graphical-session.target" ];
+        after = [ "graphical-session.target" ];
+        unitConfig = lib.optionalAttrs (cfg.user != null) {
+          # Réservé à l'utilisateur configuré ; les autres sessions ne le lancent pas.
+          ConditionUser = cfg.user;
+        };
+        # Binaires externes (git, nix, notify-send) résolus via PATH.
+        path = [
+          pkgs.git
+          pkgs.nix
+          pkgs.libnotify
+        ];
+        environment = lib.optionalAttrs (cfg.githubTokenFile != null) {
+          NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
+        };
+        serviceConfig = {
+          ExecStart = lib.concatStringsSep " " (
+            [
+              (lib.getExe cfg.package)
+              "daemon"
+            ]
+            ++ lib.optionals cfg.gui.enable [
+              "--gui-command"
+              (lib.escapeShellArg guiExe)
+            ]
+          );
+          Restart = "on-failure";
+          # Si WAYLAND_DISPLAY ou le bus ne sont pas encore prêts, on retente un peu plus tard.
+          RestartSec = 2;
+        };
+      };
+    })
+
+    (lib.mkIf cfg.gui.enable {
+      environment.systemPackages = [
+        cfg.package
+        cfg.guiPackage
+      ];
+    })
+
+    (lib.mkIf (cfg.interval != null) {
       environment.systemPackages = [ cfg.package ];
 
       systemd.services.nixos-flakes-upgrade = {
@@ -145,21 +240,25 @@ in
           pkgs.libnotify
         ];
         environment =
-          lib.optionalAttrs (cfg.autoUpgrade.user != null) {
+          lib.optionalAttrs (cfg.user != null) {
             GIT_CONFIG_COUNT = "1";
             GIT_CONFIG_KEY_0 = "safe.directory";
-            GIT_CONFIG_VALUE_0 = "*";
+            GIT_CONFIG_VALUE_0 = cfg.flakePath;
           }
           // lib.optionalAttrs (cfg.githubTokenFile != null) {
             NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
           };
         serviceConfig = {
           Type = "oneshot";
-          ExecStart = "${lib.getExe cfg.package} upgrade --notify ${lib.escapeShellArg cfg.autoUpgrade.flakePath}";
+          ExecStart = "${lib.getExe cfg.package} upgrade --notify ${lib.escapeShellArg cfg.flakePath}";
+          # /var/lib/nixos-flakes/status.json : état de la dernière exécution, lu par le démon
+          # de session (d'où le dossier lisible par tous).
+          StateDirectory = "nixos-flakes";
+          StateDirectoryMode = "0755";
         }
-        // lib.optionalAttrs (cfg.autoUpgrade.user != null) {
+        // lib.optionalAttrs (cfg.user != null) {
           # `+` : exécuté avec tous les privilèges, même après un échec de l'upgrade.
-          ExecStopPost = "+${pkgs.coreutils}/bin/chown ${lib.escapeShellArg cfg.autoUpgrade.user} ${lib.escapeShellArg "${cfg.autoUpgrade.flakePath}/flake.lock"}";
+          ExecStopPost = "-+${pkgs.coreutils}/bin/chown ${lib.escapeShellArg cfg.user} ${lib.escapeShellArg "${cfg.flakePath}/flake.lock"}";
         };
       };
 
@@ -167,31 +266,8 @@ in
         description = "Minuteur de la mise à niveau automatique NixOS";
         wantedBy = [ "timers.target" ];
         timerConfig = {
-          OnCalendar = cfg.autoUpgrade.interval;
+          OnCalendar = cfg.interval;
           Persistent = true;
-        };
-      };
-    })
-
-    (lib.mkIf cfg.gui.enable {
-      environment.systemPackages = [
-        cfg.package
-        cfg.guiPackage
-      ];
-
-      systemd.user.services.nixos-flakes-gui-tray = lib.mkIf cfg.gui.tray {
-        description = "nixos-flakes dans la zone de notification";
-        wantedBy = [ "graphical-session.target" ];
-        partOf = [ "graphical-session.target" ];
-        after = [ "graphical-session.target" ];
-        environment = lib.optionalAttrs (cfg.githubTokenFile != null) {
-          NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
-        };
-        serviceConfig = {
-          ExecStart = "${lib.getExe' cfg.guiPackage "nixos-flakes-gui"} --tray";
-          Restart = "on-failure";
-          # Si WAYLAND_DISPLAY n'est pas encore importé, on retente un peu plus tard.
-          RestartSec = 2;
         };
       };
     })
@@ -216,8 +292,8 @@ in
     {
       assertions = [
         {
-          assertion = !cfg.gui.tray || cfg.gui.enable;
-          message = "services.nixos-flakes.gui.tray nécessite services.nixos-flakes.gui.enable.";
+          assertion = !cfg.gui.enable || cfg.enable;
+          message = "services.nixos-flakes.gui.enable nécessite services.nixos-flakes.enable (l'interface se connecte au démon).";
         }
       ];
     }

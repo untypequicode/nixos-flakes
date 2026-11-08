@@ -2,6 +2,7 @@
 
 use crate::anim;
 use crate::app::{App, InputSelect, LogKind, Message, Page, Tab, CONSOLE_HEIGHT};
+use crate::daemon_link;
 use crate::model::{
     self, badge, format_opt_date, format_relative, group_entries, role_singular, role_title,
     short_rev, Badge, Modal, RepoEntry, RoleAction, Tone,
@@ -9,6 +10,7 @@ use crate::model::{
 use crate::packages;
 use crate::palette::Item;
 use crate::settings;
+use crate::sync::SyncState;
 use crate::theme::{self, with_alpha, Btn};
 use crate::toast::{ToastKind, Toasts};
 use crate::widgets::{
@@ -22,6 +24,7 @@ use iced::widget::{
 };
 use iced::{Element, Fill, Length, Padding, Size};
 use nixos_flakes_core::config::Role;
+use nixos_flakes_core::daemon::StateKind;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Largeur à partir de laquelle la barre latérale reste visible.
@@ -169,6 +172,8 @@ impl App {
             list = list.push(self.group_view(ui, role, &idx));
         }
 
+        let status_block = self.status_block(ui);
+
         let footer = column![
             nav_item(ui, "nav:all", "Tout vérifier", None, Message::CheckAll),
             nav_item(ui, "nav:rescan", "Rescanner", None, Message::Rescan),
@@ -181,6 +186,17 @@ impl App {
                     Message::Noop
                 } else {
                     Message::Packages(packages::Msg::Open)
+                },
+            ),
+            nav_item(
+                ui,
+                "nav:terminal",
+                "Terminal",
+                None,
+                if self.page == Page::Terminal {
+                    Message::Noop
+                } else {
+                    Message::OpenTerminal
                 },
             ),
             nav_item(
@@ -208,6 +224,8 @@ impl App {
                 scrollable(container(list).padding([2, 8]))
                     .height(Fill)
                     .style(theme::scroll_style(tk)),
+                hairline(ui),
+                status_block,
                 hairline(ui),
                 container(footer).padding(8),
             ]
@@ -309,7 +327,6 @@ impl App {
                 ui,
                 &self.cfg,
                 &self.new_root,
-                &self.tray_status,
                 &self.token_input,
                 self.token_saved,
                 &self.token_source,
@@ -324,6 +341,7 @@ impl App {
                     .filter(|p| self.actions_for(p).apply)
                     .map(|p| Message::Apply(p.clone())),
             ),
+            Page::Terminal => self.terminal_page(ui),
             Page::Main => match self.selected_entry() {
                 Some(e) => self.repo_detail(ui, e, narrow, width),
                 None => self.no_selection(ui, narrow),
@@ -340,6 +358,91 @@ impl App {
         .height(Fill)
         .style(theme::panel(tk))
         .into()
+    }
+
+    /// Démon et synchronisation du dépôt système, au-dessus des liens de navigation.
+    fn status_block(&self, ui: &Ui<'_>) -> Element<'_, Message> {
+        let tk = ui.tk;
+        let daemon_tone = match &self.daemon {
+            None => tk.text3,
+            Some(s) => match s.state {
+                StateKind::Error => tk.danger,
+                StateKind::Updates => tk.warning,
+                _ if s.checking => tk.text2,
+                _ => tk.success,
+            },
+        };
+        let daemon_row = row![
+            dot(daemon_tone, 7.0),
+            text(daemon_link::label(self.daemon.as_ref()))
+                .size(12)
+                .color(tk.text2)
+                .width(Fill),
+            action(
+                ui,
+                "daemon:check",
+                "Vérifier maintenant",
+                Btn::Ghost,
+                None,
+                (self.daemon.as_ref().is_some_and(|s| !s.checking))
+                    .then_some(Message::DaemonCheckNow),
+            ),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+
+        let mut col = column![section_label(tk, "Démon"), daemon_row,].spacing(6);
+        if self.cfg.system_repo.is_some() {
+            let can_pull = matches!(&self.sync, SyncState::Ready(s) if s.behind > 0)
+                || matches!(&self.sync, SyncState::Failed(_));
+            let sync_row = row![
+                text(self.sync.label())
+                    .size(12)
+                    .color(if matches!(self.sync, SyncState::Failed(_)) {
+                        tk.danger
+                    } else {
+                        tk.text2
+                    })
+                    .width(Fill),
+                action(
+                    ui,
+                    "sync:fetch",
+                    "Actualiser",
+                    Btn::Ghost,
+                    None,
+                    (!self.sync.busy()).then_some(Message::SyncFetch),
+                ),
+                action(
+                    ui,
+                    "sync:pull",
+                    "Synchroniser",
+                    Btn::Secondary,
+                    None,
+                    (can_pull && !self.sync.busy()).then_some(Message::SyncPull),
+                ),
+            ]
+            .spacing(6)
+            .align_y(iced::Center);
+            col = col.push(section_label(tk, "Config système")).push(sync_row);
+        }
+        container(col).padding([10, 14]).into()
+    }
+
+    /// Terminal intégré (shell de l'utilisateur dans le dépôt de config).
+    fn terminal_page(&self, ui: &Ui<'_>) -> Element<'_, Message> {
+        if let Some(term) = &self.terminal {
+            return container(iced_term::TerminalView::show(term).map(Message::Terminal))
+                .width(Fill)
+                .height(Fill)
+                .into();
+        }
+        let (head, detail) = match &self.terminal_error {
+            Some(e) => ("Terminal indisponible", e.as_str()),
+            None => ("Le shell s'est terminé", "Relancez-le pour continuer."),
+        };
+        let retry =
+            (!self.cli.demo).then(|| ("cta:terminal", "Relancer", Message::RestartTerminal));
+        empty_state(ui, head, detail, retry)
     }
 
     fn nav_toggle(&self, ui: &Ui<'_>) -> Element<'_, Message> {

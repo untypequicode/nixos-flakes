@@ -3,6 +3,7 @@
 mod anim;
 mod app;
 mod cli;
+mod daemon_link;
 mod demo;
 mod icon;
 mod keys;
@@ -10,10 +11,11 @@ mod model;
 mod packages;
 mod palette;
 mod settings;
+mod sync;
 mod tasks;
+mod terminal;
 mod theme;
 mod toast;
-mod tray;
 mod view;
 mod widgets;
 

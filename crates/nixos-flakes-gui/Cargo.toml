@@ -16,6 +16,8 @@ path = "src/main.rs"
 nixos-flakes-core = { path = "../nixos-flakes-core" }
 nixos-flakes-config = { path = "../nixos-flakes-config" }
 tempfile = "3"
-iced = { version = "0.14", default-features = true }
-ksni = { version = "0.3", features = ["blocking"] }
+iced = { version = "0.14", default-features = true, features = ["tokio"] }
+iced_term = "0.8"
+tokio = { version = "1", features = ["time", "macros"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
