@@ -89,6 +89,23 @@ pub fn label(status: Option<&DaemonStatus>) -> String {
     }
 }
 
+/// Version courte de [`label`] pour une rangée étroite (le texte complet va en infobulle).
+pub fn short_label(status: Option<&DaemonStatus>) -> String {
+    match status {
+        Some(s) if !s.checking && s.state == StateKind::Updates => {
+            if s.updates == 1 {
+                "1 mise à jour".to_string()
+            } else {
+                format!("{} mises à jour", s.updates)
+            }
+        }
+        Some(s) if !s.checking && s.state == StateKind::Unknown => "Pas vérifié".to_string(),
+        Some(s) if !s.checking && s.state == StateKind::Error => "Erreur".to_string(),
+        Some(s) if s.checking => "Vérification…".to_string(),
+        _ => label(status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,8 +15,8 @@ use crate::theme::{self, with_alpha, Btn};
 use crate::toast::{ToastKind, Toasts};
 use crate::widgets::{
     self, action, body, chevron, dim, dot, empty_state, fade_in, faint, hoverable, kbd, medium,
-    mono, nav_item, pill, progress_bar, rev_chip, section_label, semibold, skeleton, spinner,
-    status_dot, tip, title, Ui,
+    mini_button, mono, nav_item, pill, progress_bar, rev_chip, section_label, section_label_pad,
+    semibold, skeleton, spinner, status_dot, status_row, tip, title, Ui,
 };
 use iced::widget::{
     button, column, container, mouse_area, opaque, responsive, row, scrollable, space, stack, text,
@@ -174,41 +174,37 @@ impl App {
 
         let status_block = self.status_block(ui);
 
-        let footer = column![
-            nav_item(ui, "nav:all", "Tout vérifier", None, Message::CheckAll),
-            nav_item(ui, "nav:rescan", "Rescanner", None, Message::Rescan),
+        let page_item = |key: &str, label: &str, page: Page, open: Message| {
+            let active = self.page == page;
             nav_item(
                 ui,
+                key,
+                label,
+                active,
+                if active { Message::Noop } else { open },
+            )
+        };
+        let footer = column![
+            nav_item(ui, "nav:all", "Tout vérifier", false, Message::CheckAll),
+            nav_item(ui, "nav:rescan", "Rescanner", false, Message::Rescan),
+            container(hairline(ui)).padding([4, 6]),
+            page_item(
                 "nav:packages",
                 "Paquets",
-                None,
-                if self.page == Page::Packages {
-                    Message::Noop
-                } else {
-                    Message::Packages(packages::Msg::Open)
-                },
+                Page::Packages,
+                Message::Packages(packages::Msg::Open)
             ),
-            nav_item(
-                ui,
+            page_item(
                 "nav:terminal",
                 "Terminal",
-                None,
-                if self.page == Page::Terminal {
-                    Message::Noop
-                } else {
-                    Message::OpenTerminal
-                },
+                Page::Terminal,
+                Message::OpenTerminal
             ),
-            nav_item(
-                ui,
+            page_item(
                 "nav:settings",
                 "Réglages",
-                None,
-                if self.page == Page::Settings {
-                    Message::Noop
-                } else {
-                    Message::OpenSettings
-                }
+                Page::Settings,
+                Message::OpenSettings
             ),
         ]
         .spacing(1);
@@ -360,7 +356,8 @@ impl App {
         .into()
     }
 
-    /// Démon et synchronisation du dépôt système, au-dessus des liens de navigation.
+    /// Démon et synchronisation du dépôt système, au-dessus des liens de navigation :
+    /// une rangée de 28 px par état (pastille + texte court), actions à droite.
     fn status_block(&self, ui: &Ui<'_>) -> Element<'_, Message> {
         let tk = ui.tk;
         let daemon_tone = match &self.daemon {
@@ -372,60 +369,63 @@ impl App {
                 _ => tk.success,
             },
         };
-        let daemon_row = row![
-            dot(daemon_tone, 7.0),
-            text(daemon_link::label(self.daemon.as_ref()))
-                .size(12)
-                .color(tk.text2)
-                .width(Fill),
-            action(
+        let detail = daemon_link::label(self.daemon.as_ref());
+        let daemon_row = status_row(
+            ui,
+            daemon_tone,
+            &daemon_link::short_label(self.daemon.as_ref()),
+            &detail,
+            24,
+            vec![mini_button(
                 ui,
                 "daemon:check",
-                "Vérifier maintenant",
-                Btn::Ghost,
-                None,
+                "Vérifier",
+                false,
                 (self.daemon.as_ref().is_some_and(|s| !s.checking))
                     .then_some(Message::DaemonCheckNow),
-            ),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
+            )],
+        );
 
-        let mut col = column![section_label(tk, "Démon"), daemon_row,].spacing(6);
+        let mut col = column![section_label_pad(tk, "Démon"), daemon_row].spacing(2);
         if self.cfg.system_repo.is_some() {
-            let can_pull = matches!(&self.sync, SyncState::Ready(s) if s.behind > 0)
-                || matches!(&self.sync, SyncState::Failed(_));
-            let sync_row = row![
-                text(self.sync.label())
-                    .size(12)
-                    .color(if matches!(self.sync, SyncState::Failed(_)) {
-                        tk.danger
-                    } else {
-                        tk.text2
-                    })
-                    .width(Fill),
-                action(
-                    ui,
-                    "sync:fetch",
-                    "Actualiser",
-                    Btn::Ghost,
-                    None,
-                    (!self.sync.busy()).then_some(Message::SyncFetch),
-                ),
-                action(
+            let failed = matches!(self.sync, SyncState::Failed(_));
+            let can_pull = matches!(&self.sync, SyncState::Ready(s) if s.behind > 0) || failed;
+            let tone = match &self.sync {
+                SyncState::Failed(_) => tk.danger,
+                SyncState::Ready(s) if s.behind > 0 => tk.warning,
+                SyncState::Ready(_) => tk.success,
+                _ => tk.text3,
+            };
+            let full = self.sync.label();
+            let refresh = mini_button(
+                ui,
+                "sync:fetch",
+                "Actualiser",
+                false,
+                (!self.sync.busy()).then_some(Message::SyncFetch),
+            );
+            let sync_row = status_row(ui, tone, &full, &full, 22, vec![refresh]);
+            col = col
+                .push(space::vertical().height(6))
+                .push(section_label_pad(tk, "Config système"))
+                .push(sync_row);
+            if can_pull {
+                // Seule action primaire du bloc, sur sa propre rangée alignée à droite.
+                let pull = mini_button(
                     ui,
                     "sync:pull",
                     "Synchroniser",
-                    Btn::Secondary,
-                    None,
-                    (can_pull && !self.sync.busy()).then_some(Message::SyncPull),
-                ),
-            ]
-            .spacing(6)
-            .align_y(iced::Center);
-            col = col.push(section_label(tk, "Config système")).push(sync_row);
+                    true,
+                    (!self.sync.busy()).then_some(Message::SyncPull),
+                );
+                col = col.push(
+                    container(row![space::horizontal(), pull])
+                        .padding([0, 6])
+                        .width(Fill),
+                );
+            }
         }
-        container(col).padding([10, 14]).into()
+        container(col).padding([8, 8]).into()
     }
 
     /// Terminal intégré (shell de l'utilisateur dans le dépôt de config).

@@ -495,6 +495,11 @@ impl App {
         if m != self.mode {
             self.mode_from = self.mode;
             self.mode = m;
+            if let Some(t) = self.terminal.as_mut() {
+                t.handle(iced_term::Command::ChangeTheme(Box::new(
+                    terminal::palette(m),
+                )));
+            }
             self.theme_t = Tween::new(0.0, self.now);
             self.theme_t.retarget(1.0, self.now, anim::SLOW);
         }
@@ -1668,7 +1673,11 @@ impl App {
             self.terminal_error = Some("Terminal indisponible en mode démo.".to_string());
             return;
         }
-        match terminal::spawn(self.cfg.system_repo.as_deref(), self.home.as_deref()) {
+        match terminal::spawn(
+            self.cfg.system_repo.as_deref(),
+            self.home.as_deref(),
+            self.mode,
+        ) {
             Ok(t) => {
                 self.terminal = Some(t);
                 self.terminal_error = None;
