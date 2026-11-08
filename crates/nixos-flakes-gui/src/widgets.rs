@@ -96,6 +96,11 @@ pub fn section_label<'a>(tk: Tokens, s: &str) -> Text<'a> {
         .color(tk.text3)
 }
 
+/// Étiquette de section alignée sur le texte des rangées (6 px de retrait).
+pub fn section_label_pad<'a>(tk: Tokens, s: &str) -> Container<'a, Message> {
+    container(section_label(tk, s)).padding([4, 6])
+}
+
 // -- survol ----------------------------------------------------------------------
 
 /// Enveloppe `content` pour suivre le survol de la clé `key`.
@@ -172,29 +177,130 @@ pub fn action<'a>(
     }
 }
 
-/// Ligne de navigation pleine largeur (pied de la barre latérale).
+/// Ligne de navigation pleine largeur de 28 px (pied de la barre latérale) ;
+/// `active` : page courante, surlignée.
 pub fn nav_item<'a>(
     ui: &Ui<'_>,
     key: &str,
     label: &str,
-    shortcut: Option<&str>,
+    active: bool,
     msg: Message,
 ) -> Element<'a, Message> {
     let tk = ui.tk;
-    let mut content = row![
-        text(label.to_string()).size(13).font(regular()),
-        space::horizontal()
+    let content = row![
+        text(label.to_string())
+            .size(13)
+            .font(if active { medium() } else { regular() })
+            .wrapping(text::Wrapping::None),
+        space::horizontal(),
     ]
+    .height(Fill)
     .align_y(iced::Center);
-    if let Some(s) = shortcut {
-        content = content.push(kbd(ui, s, false));
-    }
     let b = button(content)
         .width(Fill)
-        .padding([6, 10])
-        .style(theme::row_style(tk, ui.hover(key), 0.0))
+        .height(28)
+        .padding([0, 10])
+        .style(theme::row_style(
+            tk,
+            ui.hover(key),
+            if active { 1.0 } else { 0.0 },
+        ))
         .on_press(msg);
     hoverable(key.to_string(), b)
+}
+
+/// Raccourcit `s` à `max` caractères avec une ellipse (le texte complet va en infobulle).
+pub fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", head.trim_end())
+}
+
+/// Petit bouton fantôme de 24 px, aligné à droite d'une rangée d'état ;
+/// `primary` : variante discrète à fond teinté (une seule par bloc).
+pub fn mini_button<'a>(
+    ui: &Ui<'_>,
+    key: &str,
+    label: &str,
+    primary: bool,
+    msg: Option<Message>,
+) -> Element<'a, Message> {
+    let tk = ui.tk;
+    let enabled = msg.is_some();
+    let hover = ui.hover(key);
+    let b = button(
+        text(label.to_string())
+            .size(12)
+            .font(medium())
+            .wrapping(text::Wrapping::None),
+    )
+    .height(24)
+    .padding([0, 8])
+    .style(move |_: &iced::Theme, status| {
+        let disabled = matches!(status, button::Status::Disabled);
+        let (rest, over, fg) = if primary {
+            (
+                with_alpha(tk.accent, 0.14),
+                with_alpha(tk.accent, 0.26),
+                tk.tone_text(Tone::Info),
+            )
+        } else {
+            (iced::Color::TRANSPARENT, tk.hover, tk.text2)
+        };
+        let bg = crate::anim::lerp_color(rest, over, hover.min(1.0));
+        button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color: if disabled {
+                tk.text3
+            } else if primary {
+                fg
+            } else {
+                crate::anim::lerp_color(fg, tk.text, hover.min(1.0))
+            },
+            border: iced::border::rounded(5),
+            ..button::Style::default()
+        }
+    })
+    .on_press_maybe(msg);
+    if enabled {
+        hoverable(key.to_string(), b)
+    } else {
+        b.into()
+    }
+}
+
+/// Rangée d'état de 28 px : pastille, texte court sur une ligne (infobulle `detail`),
+/// puis actions alignées à droite.
+pub fn status_row<'a>(
+    ui: &Ui<'_>,
+    color: iced::Color,
+    label: &str,
+    detail: &str,
+    max_chars: usize,
+    actions: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let tk = ui.tk;
+    let line = row![
+        container(dot(color, 7.0)).center_x(12),
+        text(ellipsize(label, max_chars))
+            .size(12)
+            .color(tk.text2)
+            .wrapping(text::Wrapping::None),
+    ]
+    .spacing(6)
+    .align_y(iced::Center);
+    let mut r = row![
+        tip(ui, line, detail, tooltip::Position::Top),
+        space::horizontal()
+    ]
+    .spacing(6)
+    .align_y(iced::Center);
+    for a in actions {
+        r = r.push(a);
+    }
+    container(r).height(28).padding([0, 6]).center_y(28).into()
 }
 
 /// Info-bulle sous l'élément.
