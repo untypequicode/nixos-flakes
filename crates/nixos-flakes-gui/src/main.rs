@@ -4,6 +4,7 @@ mod anim;
 mod app;
 mod cli;
 mod demo;
+mod icon;
 mod keys;
 mod model;
 mod packages;

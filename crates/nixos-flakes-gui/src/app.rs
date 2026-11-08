@@ -206,6 +206,7 @@ pub fn window_settings() -> window::Settings {
         size: iced::Size::new(1180.0, 760.0),
         min_size: Some(iced::Size::new(420.0, 400.0)),
         exit_on_close_request: false,
+        icon: window::icon::from_rgba(crate::icon::app_rgba(256), 256, 256).ok(),
         platform_specific: window::settings::PlatformSpecific {
             application_id: "nixos-flakes-gui".to_string(),
             ..Default::default()

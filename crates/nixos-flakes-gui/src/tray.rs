@@ -35,17 +35,8 @@ impl From<Overall> for TrayState {
 }
 
 impl TrayState {
-    /// Nom d'icône du thème freedesktop.
-    pub fn icon_name(self) -> &'static str {
-        match self {
-            TrayState::UpToDate => "emblem-ok-symbolic",
-            TrayState::Updates(_) => "software-update-available-symbolic",
-            TrayState::Error => "dialog-error-symbolic",
-        }
-    }
-
-    /// Couleur (RGB) de la pastille de repli.
-    fn color(self) -> [u8; 3] {
+    /// Couleur (RGB) du flocon.
+    pub(crate) fn color(self) -> [u8; 3] {
         match self {
             TrayState::UpToDate => [0x2e, 0xa0, 0x43],
             TrayState::Updates(_) => [0xe0, 0x8a, 0x1e],
@@ -53,9 +44,12 @@ impl TrayState {
         }
     }
 
-    /// Pastilles ARGB32 de repli, pour les thèmes sans icônes `-symbolic`.
+    /// Pixmaps ARGB32 (flocon coloré selon l'état).
     pub fn pixmaps(self) -> Vec<ksni::Icon> {
-        [22, 32].into_iter().map(|n| pixmap(self, n)).collect()
+        [16, 22, 24, 32, 48, 64]
+            .into_iter()
+            .map(|n| pixmap(self, n))
+            .collect()
     }
 
     pub fn tooltip(self) -> String {
@@ -68,26 +62,13 @@ impl TrayState {
     }
 }
 
-/// Disque plein de `size` pixels, bord lissé, au format ARGB32 (ordre réseau).
+/// Pixmap ARGB32 de `size` pixels : flocon coloré selon l'état.
 pub fn pixmap(state: TrayState, size: i32) -> ksni::Icon {
-    let [r, g, b] = state.color();
-    let n = usize::try_from(size.max(1)).unwrap_or(1);
-    let c = n as f32 / 2.0;
-    let radius = c - 1.0;
-    let mut data = Vec::with_capacity(n * n * 4);
-    for y in 0..n {
-        for x in 0..n {
-            let dx = x as f32 + 0.5 - c;
-            let dy = y as f32 + 0.5 - c;
-            let d = (dx * dx + dy * dy).sqrt();
-            let a = (radius + 0.5 - d).clamp(0.0, 1.0);
-            data.extend_from_slice(&[(a * 255.0).round() as u8, r, g, b]);
-        }
-    }
+    let size = size.max(1);
     ksni::Icon {
         width: size,
         height: size,
-        data,
+        data: crate::icon::tray_argb(state, usize::try_from(size).unwrap_or(1)),
     }
 }
 
@@ -150,7 +131,7 @@ impl ksni::Tray for FlakeTray {
     }
 
     fn icon_name(&self) -> String {
-        self.state.icon_name().into()
+        String::new()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -159,7 +140,7 @@ impl ksni::Tray for FlakeTray {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            icon_name: self.state.icon_name().into(),
+            icon_name: String::new(),
             icon_pixmap: self.state.pixmaps(),
             title: "Gestion des flakes".into(),
             description: self.state.tooltip(),
@@ -240,16 +221,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icons_per_state() {
-        assert_eq!(TrayState::UpToDate.icon_name(), "emblem-ok-symbolic");
-        assert_eq!(
-            TrayState::Updates(2).icon_name(),
-            "software-update-available-symbolic"
-        );
-        assert_eq!(TrayState::Error.icon_name(), "dialog-error-symbolic");
-    }
-
-    #[test]
     fn overall_mapping() {
         assert_eq!(TrayState::from(Overall::Unknown), TrayState::UpToDate);
         assert_eq!(TrayState::from(Overall::Updates(3)), TrayState::Updates(3));
@@ -271,15 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn pixmap_is_argb_disc() {
+    fn pixmap_is_argb() {
         let p = pixmap(TrayState::Error, 22);
         assert_eq!((p.width, p.height), (22, 22));
         assert_eq!(p.data.len(), 22 * 22 * 4);
-        // Coin transparent, centre opaque et de la couleur d'erreur.
         assert_eq!(p.data[0], 0);
-        let mid = (11 * 22 + 11) * 4;
-        assert_eq!(&p.data[mid..mid + 4], &[255, 0xd1, 0x34, 0x38]);
-        assert_eq!(TrayState::UpToDate.pixmaps().len(), 2);
+        assert_eq!(TrayState::UpToDate.pixmaps().len(), 6);
     }
 
     #[test]
