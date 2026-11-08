@@ -5,8 +5,6 @@ use std::path::PathBuf;
 /// Options de la ligne de commande.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cli {
-    /// `--tray` : active la zone de notification et démarre fenêtre masquée.
-    pub tray: bool,
     /// `--config <fichier>` : fichier de configuration alternatif.
     pub config: Option<PathBuf>,
     /// `--help` / `-h`.
@@ -23,7 +21,6 @@ pub const USAGE: &str = "\
 Usage : nixos-flakes-gui [OPTIONS]
 
 Options :
-      --tray              Active l'icône de notification (démarre masqué si elle est disponible)
       --config <FICHIER>  Utilise ce fichier de configuration
       --demo              Mode démonstration : faux dépôts et commandes simulées, rien n'est modifié
       --demo-view <VUES>  Avec --demo, ouvre au démarrage des vues (séparées par des virgules) :
@@ -42,7 +39,6 @@ where
     let mut it = args.into_iter().map(Into::into);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--tray" => cli.tray = true,
             "--demo" => cli.demo = true,
             "--demo-view" => {
                 let v = it
@@ -81,12 +77,6 @@ mod tests {
     }
 
     #[test]
-    fn tray_flag() {
-        assert!(parse(["--tray"]).unwrap().tray);
-        assert!(!parse(["--help"]).unwrap().tray);
-    }
-
-    #[test]
     fn help_and_version() {
         assert!(parse(["-h"]).unwrap().help);
         assert!(parse(["--version"]).unwrap().version);
@@ -116,7 +106,7 @@ mod tests {
 
     #[test]
     fn unknown_option_is_error() {
-        let e = parse(["--tray", "--bof"]).unwrap_err();
+        let e = parse(["--bof"]).unwrap_err();
         assert!(e.contains("--bof"));
     }
 }

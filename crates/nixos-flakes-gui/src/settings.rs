@@ -2,9 +2,8 @@
 
 use crate::app::Message;
 use crate::theme::{self, Btn};
-use crate::tray::TrayStatus;
 use crate::widgets::{self, action, dim, faint, title, Ui};
-use iced::widget::{column, container, row, scrollable, space, text, text_input, toggler};
+use iced::widget::{column, container, row, scrollable, space, text, text_input};
 use iced::{Element, Fill, Length};
 use nixos_flakes_core::config::Config;
 use nixos_flakes_core::token::Source;
@@ -72,7 +71,6 @@ pub enum Msg {
     RemoveRoot(usize),
     Depth(bool),
     Interval(bool),
-    ToggleTray(bool),
     TokenInput(Secret),
     TokenSave,
     TokenClear,
@@ -228,7 +226,6 @@ pub fn view<'a>(
     ui: &Ui<'_>,
     cfg: &'a Config,
     input: &'a str,
-    tray: &'a TrayStatus,
     token_input: &'a str,
     token_saved: bool,
     token_source: &'a Source,
@@ -276,17 +273,6 @@ pub fn view<'a>(
     ]
     .spacing(8)
     .align_y(iced::Center);
-
-    let tray_hint = if cfg.tray_enabled && matches!(tray, TrayStatus::Failed(_)) {
-        "Zone de notification demandée mais indisponible sur cette session."
-    } else {
-        "Affiche une icône ; fermer la fenêtre la réduit dans la zone de notification."
-    };
-    let mut tray_diag = column![faint(tk, format!("État : {}", tray.text()))].spacing(3);
-    if let Some(h) = tray.hint() {
-        tray_diag = tray_diag.push(faint(tk, h));
-    }
-    let tray_diag = container(tray_diag).padding([0, 16]).width(Fill);
 
     let token_form = || -> Element<'a, Message> {
         row![
@@ -419,22 +405,12 @@ pub fn view<'a>(
             stepper(ui, "depth", cfg.scan_depth.to_string(), Msg::Depth),
         ),
         rule(ui),
-        setting(
-            ui,
-            "Zone de notification",
-            tray_hint,
-            toggler(cfg.tray_enabled)
-                .on_toggle(|on| Message::Settings(Msg::ToggleTray(on)))
-                .style(theme::toggler_style(tk)),
-        ),
-        tray_diag,
-        rule(ui),
         token_block,
         rule(ui),
         setting(
             ui,
             "Intervalle de vérification",
-            "Fréquence de la vérification automatique (zone de notification active).",
+            "Fréquence de la vérification automatique, effectuée par le démon.",
             stepper(
                 ui,
                 "interval",

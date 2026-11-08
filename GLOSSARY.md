@@ -71,3 +71,19 @@ _Avoid_: Tray, systray
 **Droits système**:
 Élévation de privilèges demandée uniquement pour l'application du système et le retour arrière.
 _Avoid_: Sudo, root
+
+**Démon**:
+Unique processus de fond de la session ; il héberge l'icône d'état et sert d'interlocuteur à l'interface graphique.
+_Avoid_: Service (seul), tray (seul), agent
+
+**autoUpgrade**:
+Travail périodique exécuté en root qui effectue la mise à niveau automatique du dépôt système.
+_Avoid_: Cron, tâche planifiée
+
+**Synchroniser**:
+Mettre le dépôt système à niveau avec son amont : `git fetch`, puis avance rapide seulement (`pull --ff-only`), refusée si l'arbre est sale ou les historiques divergés.
+_Avoid_: Sync (seul), pull (seul)
+
+**Icône d'état**:
+Icône de la zone de notification dont la couleur reflète l'état des mises à jour.
+_Avoid_: Tray, indicateur

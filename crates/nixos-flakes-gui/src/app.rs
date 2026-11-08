@@ -2,6 +2,7 @@
 
 use crate::anim::{self, Fades, Tween};
 use crate::cli::Cli;
+use crate::daemon_link;
 use crate::demo;
 use crate::keys::{self, KeyContext, Shortcut};
 use crate::model::{
@@ -10,16 +11,18 @@ use crate::model::{
 use crate::packages::{self, PackagesState};
 use crate::palette::{self, Command, PaletteState};
 use crate::settings;
+use crate::sync::{self, SyncState};
 use crate::tasks::{self, Finished, Job, JobEvent, Outcome};
+use crate::terminal;
 use crate::theme::{self, Mode, Tokens};
 use crate::toast::{ToastKind, Toasts};
-use crate::tray::{self, TrayEvent, TrayHandle, TrayState, TrayStatus};
 use crate::widgets::{self, Ui};
 use iced::futures::{stream, Stream, StreamExt};
 use iced::keyboard::{Key, Modifiers};
 use iced::widget::text_editor;
 use iced::{window, Subscription, Task, Theme};
 use nixos_flakes_core::config::{Config, Role};
+use nixos_flakes_core::daemon::DaemonStatus;
 use nixos_flakes_core::git;
 use nixos_flakes_core::lock::RootInput;
 use nixos_flakes_core::status::RepoStatus;
@@ -42,6 +45,7 @@ pub enum Page {
     Main,
     Settings,
     Packages,
+    Terminal,
 }
 
 /// Onglet du panneau de détail.
@@ -132,12 +136,21 @@ pub enum Message {
     FocusPalette,
     PaletteRun(usize),
     Key(Key, Modifiers, bool),
-    // Fenêtre et tray
-    CloseRequested(window::Id),
+    // Fenêtre
+    CloseRequested,
     WindowClosed(window::Id),
-    Tray(TrayEvent),
-    TrayStarted(Option<Result<TrayHandle, String>>),
-    Tick,
+    // Démon (absent = `None`)
+    Daemon(Option<DaemonStatus>),
+    DaemonCheckNow,
+    DaemonCheckSent(Result<(), String>),
+    // Synchronisation du dépôt système
+    SyncFetch,
+    SyncPull,
+    SyncDone(Result<git::SyncStatus, String>),
+    // Terminal intégré
+    OpenTerminal,
+    RestartTerminal,
+    Terminal(iced_term::Event),
 }
 
 pub struct App {
@@ -158,8 +171,6 @@ pub struct App {
     pub window: Option<window::Id>,
     pub sidebar_open: bool,
     pub queue: VecDeque<PathBuf>,
-    pub queue_notify: bool,
-    pub queue_new: Vec<(String, usize)>,
     pub followups: HashMap<PathBuf, Followup>,
     /// Inputs racine du `flake.lock` de chaque dépôt (chargés à la sélection).
     pub inputs: HashMap<PathBuf, Vec<RootInput>>,
@@ -167,9 +178,12 @@ pub struct App {
     pub input_sel: HashMap<PathBuf, BTreeSet<String>>,
     /// Inputs d'une mise à jour en attente du commit des modifications.
     pub update_request: HashMap<PathBuf, Vec<String>>,
-    pub tray: Option<TrayHandle>,
-    pub tray_pushed: Option<TrayState>,
-    pub tray_status: TrayStatus,
+    /// État du démon : `None` = absent (le GUI fonctionne seul).
+    pub daemon: Option<DaemonStatus>,
+    pub sync: SyncState,
+    /// Terminal intégré, créé à la première ouverture de l'onglet.
+    pub terminal: Option<iced_term::Terminal>,
+    pub terminal_error: Option<String>,
     /// Saisie du jeton GitHub : vidée dès l'enregistrement, jamais journalisée ni écrite en config.
     pub token_input: String,
     pub token_saved: bool,
@@ -232,32 +246,14 @@ pub fn boot(cli: Cli) -> (App, Task<Message>) {
     let mut app = App::new(cli, cfg, cfg_path);
     app.log.extend(early_log);
 
-    let want_tray = app.cli.tray || app.cfg.tray_enabled;
-    if want_tray && !app.cli.demo {
-        match tray::spawn(TrayState::UpToDate) {
-            Ok(h) => {
-                app.tray = Some(h);
-                app.tray_status = TrayStatus::Registered;
-            }
-            Err(e) => {
-                app.push_log(
-                    LogKind::Error,
-                    format!("Zone de notification indisponible : {e}. L'application continue sans icône."),
-                );
-                app.tray_status = TrayStatus::Failed(e);
-            }
-        }
-    }
-    let start_hidden = app.cli.tray && app.tray.is_some();
-
     let mut tasks = vec![app.scan_task()];
     // En démo, le thème reste celui demandé (vue « clair ») au lieu de suivre le système.
     if !app.cli.demo {
         tasks.push(iced::system::theme().map(Message::SystemTheme));
     }
-    if !start_hidden {
-        tasks.push(app.open_window());
-    }
+    tasks.push(app.open_window());
+    // Un seul fetch à l'ouverture ; ensuite uniquement sur demande.
+    tasks.push(app.sync_task(false));
     (app, Task::batch(tasks))
 }
 
@@ -330,15 +326,14 @@ impl App {
             window: None,
             sidebar_open: false,
             queue: VecDeque::new(),
-            queue_notify: false,
-            queue_new: Vec::new(),
             followups: HashMap::new(),
             inputs: HashMap::new(),
             input_sel: HashMap::new(),
             update_request: HashMap::new(),
-            tray: None,
-            tray_pushed: None,
-            tray_status: TrayStatus::Disabled,
+            daemon: None,
+            sync: SyncState::Idle,
+            terminal: None,
+            terminal_error: None,
             token_input: String::new(),
             token_saved: demo_token_saved(demo),
             token_source: demo_token_source(demo),
@@ -584,29 +579,15 @@ impl App {
     fn start_next_in_queue(&mut self) -> Task<Message> {
         match model::pick_next(&mut self.queue, &self.entries) {
             Some(p) => self.start_job(&p, Job::Check),
-            None => {
-                self.finish_queue();
-                Task::none()
-            }
+            None => Task::none(),
         }
     }
 
-    fn finish_queue(&mut self) {
-        if self.queue_notify && !self.queue_new.is_empty() {
-            let (title, body) = model::notification_text(&self.queue_new);
-            tasks::notify(title, body);
-        }
-        self.queue_notify = false;
-        self.queue_new.clear();
-    }
-
-    fn begin_check_all(&mut self, notify: bool) -> Task<Message> {
+    fn begin_check_all(&mut self) -> Task<Message> {
         if !self.queue.is_empty() {
             return Task::none();
         }
         self.queue = model::check_all_targets(&self.entries).into();
-        self.queue_notify = notify;
-        self.queue_new.clear();
         if self.queue.is_empty() {
             self.push_log(LogKind::Info, "Aucun dépôt suivi à vérifier.");
             return Task::none();
@@ -686,9 +667,7 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // Horloge monotone (les tests peuvent l'avancer à la main).
         self.now = self.now.max(Instant::now());
-        let task = self.update_inner(message);
-        self.sync_tray();
-        task
+        self.update_inner(message)
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
@@ -743,7 +722,7 @@ impl App {
                 self.load_inputs_task(&p_loaded)
             }
             Message::Check(p) => self.start_job(&p, Job::Check),
-            Message::CheckAll => self.begin_check_all(false),
+            Message::CheckAll => self.begin_check_all(),
             Message::Update(p) => self.begin_update(&p, Vec::new()),
             Message::UpdateInputs(p, names) => self.begin_update(&p, names),
             Message::UpdateSelection(p) => {
@@ -861,40 +840,61 @@ impl App {
                 }
                 Task::none()
             }
-            Message::CloseRequested(id) => {
-                if self.tray.is_some() {
-                    window::close(id)
-                } else {
-                    iced::exit()
-                }
-            }
+            Message::CloseRequested => iced::exit(),
             Message::WindowClosed(id) => {
                 if self.window == Some(id) {
                     self.window = None;
                 }
                 Task::none()
             }
-            Message::Tray(ev) => self.on_tray_event(ev),
-            Message::TrayStarted(res) => {
+            Message::Daemon(status) => {
+                self.daemon = status;
+                Task::none()
+            }
+            Message::DaemonCheckNow => {
+                if self.cli.demo || self.daemon.is_none() {
+                    return Task::none();
+                }
+                Task::perform(daemon_link::check_now(), Message::DaemonCheckSent)
+            }
+            Message::DaemonCheckSent(res) => {
                 match res {
-                    Some(Ok(h)) => {
-                        self.tray_pushed = None;
-                        self.tray = Some(h);
-                        self.tray_status = TrayStatus::Registered;
-                        self.push_log(LogKind::Info, "Icône de notification activée.");
+                    Ok(()) => self.toast(ToastKind::Info, "Vérification demandée au démon"),
+                    Err(e) => {
+                        self.toast(ToastKind::Error, "Démon injoignable");
+                        self.push_log(LogKind::Error, format!("Démon injoignable : {e}"));
                     }
-                    Some(Err(e)) => {
-                        self.push_log(
-                            LogKind::Error,
-                            format!("Zone de notification indisponible : {e}"),
-                        );
-                        self.tray_status = TrayStatus::Failed(e);
-                    }
-                    None => {}
                 }
                 Task::none()
             }
-            Message::Tick => self.begin_check_all(true),
+            Message::SyncFetch => self.sync_task(false),
+            Message::SyncPull => self.sync_task(true),
+            Message::SyncDone(res) => self.on_sync_done(res),
+            Message::OpenTerminal => {
+                self.page = Page::Terminal;
+                self.restart_panel();
+                self.reset_hover();
+                if self.terminal.is_none() && self.terminal_error.is_none() {
+                    self.start_terminal();
+                }
+                Task::none()
+            }
+            Message::RestartTerminal => {
+                self.start_terminal();
+                Task::none()
+            }
+            Message::Terminal(iced_term::Event::BackendCall(_, cmd)) => {
+                let Some(term) = self.terminal.as_mut() else {
+                    return Task::none();
+                };
+                if term.handle(iced_term::Command::ProxyToBackend(cmd))
+                    == iced_term::actions::Action::Shutdown
+                {
+                    // Le shell s'est terminé : on libère le terminal, l'onglet propose de le relancer.
+                    self.terminal = None;
+                }
+                Task::none()
+            }
             Message::SetTab(t) => {
                 if self.tab != t {
                     self.tab = t;
@@ -1136,22 +1136,6 @@ impl App {
                     settings::step_interval(self.cfg.check_interval_minutes, up);
                 self.save_config();
             }
-            Msg::ToggleTray(on) => {
-                self.cfg.tray_enabled = on;
-                self.save_config();
-                if on && self.tray.is_none() {
-                    return Task::perform(
-                        tasks::blocking(|| tray::spawn(TrayState::UpToDate)),
-                        Message::TrayStarted,
-                    );
-                }
-                if !on && !self.cli.tray {
-                    if let Some(h) = self.tray.take() {
-                        h.shutdown();
-                    }
-                    self.tray_status = TrayStatus::Disabled;
-                }
-            }
             Msg::TokenInput(s) => self.token_input = s.0,
             Msg::TokenSave => return self.save_token(),
             Msg::TokenClear => self.clear_token(),
@@ -1177,7 +1161,7 @@ impl App {
                 self.token_saved = true;
                 self.token_source = TokenSource::Interface;
                 self.push_log(LogKind::Success, "Jeton GitHub enregistré.");
-                return self.begin_check_all(true);
+                return self.begin_check_all();
             }
             Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non enregistré : {e}")),
         }
@@ -1220,22 +1204,6 @@ impl App {
         }
     }
 
-    fn on_tray_event(&mut self, ev: TrayEvent) -> Task<Message> {
-        match ev {
-            TrayEvent::Open => match self.window {
-                Some(id) => Task::batch([window::minimize(id, false), window::gain_focus(id)]),
-                None => self.open_window(),
-            },
-            TrayEvent::CheckNow => self.begin_check_all(true),
-            TrayEvent::Quit => {
-                if let Some(h) = self.tray.take() {
-                    h.shutdown();
-                }
-                iced::exit()
-            }
-        }
-    }
-
     fn on_job_event(&mut self, repo: PathBuf, event: JobEvent) -> Task<Message> {
         let name = self.repo_name(&repo);
         match event {
@@ -1259,7 +1227,6 @@ impl App {
         let mut logs: Vec<(LogKind, String)> = Vec::new();
         let mut is_check = false;
         let mut modal = None;
-        let mut new_update: Option<(String, usize)> = None;
         let mut reload_inputs = false;
 
         match outcome {
@@ -1268,9 +1235,6 @@ impl App {
                 match res {
                     Ok(report) => {
                         let n = report.changes.len();
-                        if model::has_new_updates(entry.pending.as_deref(), &report.changes) {
-                            new_update = Some((name.clone(), n));
-                        }
                         entry.pending = Some(report.changes);
                         entry.error = None;
                         logs.push((
@@ -1360,11 +1324,6 @@ impl App {
         }
         if let Some(m) = modal {
             self.open_modal(m);
-        }
-        if let Some(n) = new_update {
-            if self.queue_notify {
-                self.queue_new.push(n);
-            }
         }
         if reload_inputs {
             self.input_sel.remove(&repo);
@@ -1506,6 +1465,10 @@ impl App {
     }
 
     fn on_key(&mut self, key: &Key, mods: Modifiers, captured: bool) -> Task<Message> {
+        // Dans le terminal, toutes les touches vont au shell (Échap, Ctrl K… inclus).
+        if self.page == Page::Terminal && !self.palette_open && self.modal.is_none() {
+            return Task::none();
+        }
         let ctx = KeyContext {
             modal: self.modal.is_some(),
             palette: self.palette_open,
@@ -1644,14 +1607,76 @@ impl App {
         Task::batch(tasks)
     }
 
-    // -- tray ---------------------------------------------------------------
+    // -- synchronisation git du dépôt système ----------------------------------
 
-    fn sync_tray(&mut self) {
-        let Some(h) = &self.tray else { return };
-        let state = TrayState::from(model::overall(&self.entries));
-        if self.tray_pushed != Some(state) {
-            h.set_state(state);
-            self.tray_pushed = Some(state);
+    /// Lance `git fetch` (puis, si `pull`, `git pull --ff-only`) sur le dépôt système.
+    fn sync_task(&mut self, pull: bool) -> Task<Message> {
+        if self.cli.demo || self.sync.busy() {
+            return Task::none();
+        }
+        let Some(repo) = self.cfg.system_repo.clone() else {
+            return Task::none();
+        };
+        self.sync = if pull {
+            SyncState::Pulling
+        } else {
+            SyncState::Fetching
+        };
+        Task::perform(
+            tasks::blocking(move || {
+                if pull {
+                    sync::pull_and_status(&repo)
+                } else {
+                    sync::fetch_and_status(&repo)
+                }
+            }),
+            |r| Message::SyncDone(r.unwrap_or_else(|| Err("synchronisation interrompue".into()))),
+        )
+    }
+
+    fn on_sync_done(&mut self, res: Result<git::SyncStatus, String>) -> Task<Message> {
+        let pulled = self.sync == SyncState::Pulling;
+        match res {
+            Ok(status) => {
+                if pulled {
+                    let msg = "Dépôt système synchronisé.";
+                    self.push_log(LogKind::Success, msg);
+                    self.toast(ToastKind::Success, msg);
+                }
+                self.sync = SyncState::Ready(status);
+                // Un pull peut changer les fichiers, le flake.lock, l'état git : on relit tout.
+                if pulled {
+                    return self.scan_task();
+                }
+            }
+            Err(e) => {
+                self.push_log(LogKind::Error, format!("Synchronisation impossible : {e}"));
+                // Un fetch raté à l'ouverture (hors ligne…) ne mérite pas de toast.
+                if pulled {
+                    self.toast(ToastKind::Error, &format!("Synchronisation refusée\n{e}"));
+                }
+                self.sync = SyncState::Failed(e);
+            }
+        }
+        Task::none()
+    }
+
+    // -- terminal -------------------------------------------------------------
+
+    fn start_terminal(&mut self) {
+        if self.cli.demo {
+            self.terminal_error = Some("Terminal indisponible en mode démo.".to_string());
+            return;
+        }
+        match terminal::spawn(self.cfg.system_repo.as_deref(), self.home.as_deref()) {
+            Ok(t) => {
+                self.terminal = Some(t);
+                self.terminal_error = None;
+            }
+            Err(e) => {
+                self.push_log(LogKind::Error, format!("Terminal impossible : {e}"));
+                self.terminal_error = Some(e);
+            }
         }
     }
 
@@ -1659,12 +1684,14 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
-            window::close_requests().map(Message::CloseRequested),
+            window::close_requests().map(|_| Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
             iced::system::theme_changes().map(Message::SystemTheme),
-            Subscription::run(tray_events),
         ];
         subs.push(iced::event::listen_with(key_events));
+        if !self.cli.demo {
+            subs.push(Subscription::run(daemon_link::events).map(Message::Daemon));
+        }
         // Images à ~60 Hz uniquement pendant une animation ; sinon un pouls lent
         // pour l'expiration des toasts, et rien du tout au repos.
         if self.is_animating() {
@@ -1672,11 +1699,8 @@ impl App {
         } else if !self.toasts.is_empty() {
             subs.push(Subscription::run_with(250_u64, slow_ticker).map(|()| Message::Frame));
         }
-        if self.tray.is_some() && self.cfg.check_interval_minutes > 0 {
-            subs.push(
-                Subscription::run_with(self.cfg.check_interval_minutes, ticker)
-                    .map(|_| Message::Tick),
-            );
+        if let Some(t) = &self.terminal {
+            subs.push(t.subscription().map(Message::Terminal));
         }
         Subscription::batch(subs)
     }
@@ -1699,25 +1723,6 @@ fn key_events(
 /// Un tick toutes les `ms` millisecondes (pouls lent des toasts).
 fn slow_ticker(ms: &u64) -> impl Stream<Item = ()> {
     let period = Duration::from_millis(*ms);
-    let (tx, rx) = iced::futures::channel::mpsc::unbounded();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(period);
-        if tx.unbounded_send(()).is_err() {
-            break;
-        }
-    });
-    rx
-}
-
-fn tray_events() -> impl Stream<Item = Message> {
-    stream::iter(tray::take_receiver())
-        .flatten()
-        .map(Message::Tray)
-}
-
-/// Un tick toutes les `minutes` minutes (thread dédié, sans exécuteur particulier).
-fn ticker(minutes: &u32) -> impl Stream<Item = ()> {
-    let period = Duration::from_secs(u64::from(*minutes) * 60);
     let (tx, rx) = iced::futures::channel::mpsc::unbounded();
     std::thread::spawn(move || loop {
         std::thread::sleep(period);
@@ -2093,12 +2098,12 @@ mod tests {
     }
 
     #[test]
-    fn close_request_without_tray_exits_and_with_tray_keeps_running() {
-        // Sans tray : une tâche de sortie est produite ; avec tray : on ferme seulement la fenêtre.
+    fn close_request_exits_the_gui() {
+        // Fermer la fenêtre quitte le GUI (le démon, lui, continue).
         let (mut a, _d) = app();
         let id = window::Id::unique();
         a.window = Some(id);
-        let _ = a.update(Message::CloseRequested(id));
+        let _ = a.update(Message::CloseRequested);
         let _ = a.update(Message::WindowClosed(id));
         assert_eq!(a.window, None);
     }

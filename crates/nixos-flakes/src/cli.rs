@@ -64,6 +64,20 @@ pub enum Command {
         #[arg(long)]
         sudo: bool,
     },
+    /// Synchronise un dépôt avec son amont : fetch, avance/retard, puis pull en avance rapide.
+    Sync {
+        /// Dépôt à synchroniser (défaut : dépôt système).
+        path: Option<PathBuf>,
+        /// Se contente du fetch et de l'affichage, sans récupérer les commits.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Démon de session : icône d'état, vérifications et interface D-Bus (instance unique).
+    Daemon {
+        /// Commande qui ouvre l'interface graphique (absente : pas d'entrée « Ouvrir l'interface »).
+        #[arg(long, env = "NIXOS_FLAKES_GUI_COMMAND", value_name = "COMMANDE")]
+        gui_command: Option<String>,
+    },
     /// Marque un dépôt comme suivi.
     Track {
         /// Dossier du dépôt flake.
@@ -249,6 +263,18 @@ mod tests {
                 path: None,
                 notify: true,
                 sudo: true
+            }
+        );
+    }
+
+    #[test]
+    fn sync_flags() {
+        let cli = parse(&["sync", "--check", "/x"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Sync {
+                path: Some(PathBuf::from("/x")),
+                check: true
             }
         );
     }

@@ -26,6 +26,9 @@ pub enum Error {
         status: String,
         tail: String,
     },
+    /// Opération git refusée ou impossible (message destiné à l'utilisateur).
+    #[error("git : {0}")]
+    Git(String),
     /// `flake.lock` illisible.
     #[error("flake.lock invalide : {0}")]
     Lock(String),

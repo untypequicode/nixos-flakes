@@ -19,8 +19,6 @@ pub struct Config {
     pub tracked: BTreeSet<PathBuf>,
     /// Dépôts ignorés définitivement.
     pub ignored: BTreeSet<PathBuf>,
-    /// Icône de zone de notification activée (défaut : non).
-    pub tray_enabled: bool,
     /// Intervalle de vérification, en minutes (défaut : 60).
     pub check_interval_minutes: u32,
 }
@@ -48,7 +46,6 @@ impl Default for Config {
             system_repo: etc.is_dir().then(|| etc.to_path_buf()),
             tracked: BTreeSet::new(),
             ignored: BTreeSet::new(),
-            tray_enabled: false,
             check_interval_minutes: 60,
         }
     }
@@ -161,7 +158,6 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.scan_depth, 4);
         assert_eq!(c.check_interval_minutes, 60);
-        assert!(!c.tray_enabled);
         assert!(c.scan_roots.contains(&PathBuf::from("/etc/nixos")));
     }
 
@@ -177,7 +173,6 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("a/b/config.toml");
         let mut c = empty();
-        c.tray_enabled = true;
         c.tracked.insert(PathBuf::from("/x/y"));
         c.system_repo = Some(PathBuf::from("/s"));
         c.save(&p).unwrap();

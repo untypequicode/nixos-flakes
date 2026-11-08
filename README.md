@@ -5,7 +5,7 @@ Recueil d'outils Nix/NixOS écrits en Rust. Le premier outil gère les **flakes 
 | Outil | Binaire | Rôle |
 | --- | --- | --- |
 | CLI | `nixos-flakes` | Vérifier, mettre à jour, appliquer, mise à niveau automatique, sortie Waybar |
-| GUI | `nixos-flakes-gui` | Interface moderne (iced) avec icône de zone de notification optionnelle |
+| GUI | `nixos-flakes-gui` | Interface moderne (iced), reliée au démon s'il tourne |
 | Extension Firefox/Zen | `firefox-image-downloader-visible` | Liste et télécharge les images/vidéos visibles à l'écran (voir [la section dédiée](#extension-firefoxzen--image-downloader-visible)) |
 
 D'autres outils viendront dans `crates/` : tout crate binaire est automatiquement exposé par le flake (voir [Ajouter un outil](#ajouter-un-outil)).
@@ -19,7 +19,7 @@ Vocabulaire : [GLOSSARY.md](GLOSSARY.md). Conception : [docs/ARCHITECTURE.md](do
 - **Dépôt système** : le dépôt suivi qui décrit ta machine (par défaut `/etc/nixos`). Seul lui peut être appliqué au système.
 - **Ignoré** : masqué définitivement de la liste.
 
-La configuration est dans `~/.config/nixos-flakes/config.toml` (racines de scan, profondeur, rôles, tray, fréquence de vérification).
+La configuration est dans `~/.config/nixos-flakes/config.toml` (racines de scan, profondeur, rôles, fréquence de vérification).
 
 ## Essayer sans installer
 
@@ -37,6 +37,7 @@ nixos-flakes check [PATH] [--waybar]      mises à jour disponibles (sans rien m
 nixos-flakes update [PATH] [--commit] [--input NOM]   nix flake update (+ commit de flake.lock seul)
 nixos-flakes apply [PATH]                 nixos-rebuild switch via pkexec
 nixos-flakes upgrade [PATH] [--notify]    mise à jour + application, retour arrière si échec
+nixos-flakes sync [PATH] [--check]        git fetch, avance/retard, puis pull --ff-only (--check : sans pull)
 nixos-flakes track|untrack|ignore PATH    gérer les rôles
 nixos-flakes set-system PATH              définir le dépôt système
 ```
@@ -81,12 +82,14 @@ Classes CSS : `uptodate`, `outdated` (texte `❆ N`), `error`.
 - Mise à jour d'un sous-ensemble d'inputs : voir [Mise à jour sélective](#mise-à-jour-sélective).
 - Console de logs en direct.
 - **Flux git** : avant la mise à jour, si le dépôt a des modifications non commitées, proposition de les commiter ; après, proposition de commiter `flake.lock` seul. Jamais de push automatique.
-- Réglages : racines de scan, profondeur, tray, fréquence de vérification.
+- Réglages : racines de scan, profondeur, fréquence de vérification.
 - **Page Paquets** (barre latérale) : recherche nixpkgs (async, badge « cache » hors ligne), puis choix du Fichier de config et de l'Emplacement avec aperçu du diff et confirmation avant écriture ; liste des Paquets déclarés du Dépôt système avec Supprimer / Déplacer (Emplacements générés : « modifiable en code seulement »). Rien n'est appliqué tant que tu n'as pas lancé l'Application. Écriture avec élévation (pkexec) si le dépôt appartient à root. Vue de démo : `--demo --demo-view paquets` (ou `paquets-ajout`) ; la fausse config reste en mémoire.
 - Design inspiré de Linear : thème sombre/clair selon le système, police Inter, transitions fluides (rien ne tourne au repos).
 - **Clavier** : `Ctrl+K` palette de commandes, `j`/`k` ou flèches pour naviguer, `r` vérifier, `u` mettre à jour, `Échap` fermer.
 - `--demo` : lance l'interface avec de fausses données (rien n'est lu ni écrit), pratique pour essayer.
-- **Tray optionnel** (`nixos-flakes-gui --tray` ou réglage) : états à jour / mises à jour / erreur, menu Ouvrir / Vérifier / Quitter. Nécessite un hôte StatusNotifier, voir [Zone de notification sous niri](#zone-de-notification-sous-niri).
+- **Démon** : si `nixos-flakes daemon` tourne, la barre latérale affiche son état (mis à jour en direct) et le bouton **Vérifier maintenant** lui demande une vérification. Sans démon, la GUI fonctionne seule ; le démon n'a pas besoin d'elle. La GUI ne crée jamais d'icône et fermer sa fenêtre la quitte (le démon continue). Les notifications de bureau « mises à jour disponibles » sont envoyées par le démon.
+- **Synchroniser** (config système) : `git fetch` à l'ouverture de la GUI et sur **Actualiser** seulement ; la barre latérale indique l'avance/retard, et **Synchroniser** lance `git pull --ff-only`. Refusé avec un message clair si l'arbre est sale ou si les historiques ont divergé. Équivalent CLI : `nixos-flakes sync [CHEMIN] [--check]`.
+- **Terminal** (barre latérale) : terminal intégré (`iced_term`) qui lance `$SHELL` dans le dépôt de config système. Toutes les touches vont au shell tant que l'onglet est affiché.
 
 L'application du système passe par `pkexec` (fenêtre polkit) ; la mise à jour des verrous se fait toujours avec tes droits, donc `flake.lock` ne devient jamais propriété de root.
 
@@ -110,7 +113,7 @@ Un script NixOS peut aussi écrire le jeton dans `/etc/nix/access-tokens.conf`, 
 
 Ordre de priorité : `githubTokenFile` (configuration Nix) > jeton saisi dans l'interface > `/etc/nix/access-tokens.conf`.
 
-### Zone de notification : prérequis par bureau
+### Zone de notification : prérequis par bureau (icône du démon)
 
 L'icône utilise le standard StatusNotifierItem, sans code propre à un bureau. Il faut un hôte qui l'affiche :
 
@@ -120,15 +123,15 @@ L'icône utilise le standard StatusNotifierItem, sans code propre à un bureau. 
 
 ### Zone de notification sous niri
 
-Le tray a besoin d'un **hôte StatusNotifier** pour afficher son icône. Avec niri, il faut donc :
+L'icône du démon a besoin d'un **hôte StatusNotifier** pour afficher son icône. Avec niri, il faut donc :
 
 1. une barre qui fournit cet hôte, par exemple le module `tray` de Waybar ;
 2. lancer l'interface dans la session :
-   - avec `niri-session` (qui atteint `graphical-session.target`) et `services.nixos-flakes.gui.tray = true`, le service utilisateur `nixos-flakes-gui-tray` démarre seul ;
+   - avec `niri-session` (qui atteint `graphical-session.target`) et `services.nixos-flakes.enable = true`, le service utilisateur `nixos-flakes-daemon` démarre seul ;
    - avec un simple `niri` lancé depuis un TTY ou un gestionnaire de connexion, le service ne démarre pas : ajoute plutôt dans la configuration de niri (`~/.config/niri/config.kdl`) :
 
      ```kdl
-     spawn-at-startup "nixos-flakes-gui" "--tray"
+     spawn-at-startup "nixos-flakes" "daemon"
      ```
 
 Si l'icône n'apparaît pas au démarrage, vérifie que la barre tourne déjà et que son module `tray` est activé.
@@ -162,16 +165,11 @@ Si l'icône n'apparaît pas au démarrage, vérifie que la barre tourne déjà e
 ```nix
 {
   services.nixos-flakes = {
-    autoUpgrade = {
-      enable = true;
-      interval = "daily";        # ou "weekly", "04:00"…
-      flakePath = "/etc/nixos";
-      user = "moi";              # optionnel : flake.lock reste à ton nom
-    };
-    gui = {
-      enable = true;             # installe la GUI et la CLI
-      tray = true;               # lance la GUI dans la zone de notification à la session
-    };
+    enable = true;               # démon de session : icône d'état dans la zone de notification
+    user = "moi";                # utilisateur du démon ; flake.lock reste à ton nom après une mise à niveau
+    interval = "daily";          # optionnel : mise à niveau automatique ("weekly", "04:00"…) ; null = aucune
+    flakePath = "/etc/nixos";
+    gui.enable = true;           # installe la GUI, ouvrable depuis l'icône
   };
 }
 ```
@@ -188,7 +186,7 @@ Cela accorde à `moi` la lecture et l'écriture sur `/etc/nixos` via une ACL (h�
 
 Sans cette option, la vérification d'un `/etc/nixos` appartenant à root fonctionne quand même, sans reconstruction : seuls `flake.nix` et `flake.lock` sont copiés pour être évalués. Écrire le `flake.lock` (mise à jour) exige en revanche `services.nixos-flakes.systemRepo.owner`.
 
-L'ancien nom `services.nixos-auto-upgrade-custom.{enable,interval}` fonctionne encore (avertissement de renommage).
+L'ancien nom `services.nixos-auto-upgrade-custom.{enable,interval}` et les anciennes options `services.nixos-flakes.autoUpgrade.*` fonctionnent encore (avertissement de renommage ; `enable = true` sans `interval` vaut `interval = "daily"`). `gui.tray` n'existe plus : l'icône est portée par le démon (`enable`).
 
 Le timer lance `nixos-flakes upgrade --notify` : mise à jour des verrous, application si quelque chose a changé, et en cas d'échec restauration du `flake.lock` puis retour à la génération précédente. Il ne commite rien : la GUI te proposera de commiter le verrou modifié.
 
@@ -208,7 +206,7 @@ Organisation :
 ```text
 crates/nixos-flakes-core/   logique partagée (config, scan, lock, git, nix, upgrade…)
 crates/nixos-flakes/        CLI
-crates/nixos-flakes-gui/    GUI iced + tray
+crates/nixos-flakes-gui/    GUI iced (liée au démon)
 modules/nixos-flakes.nix    module NixOS
 nix/                        packaging (auto-découverte des crates)
 ```

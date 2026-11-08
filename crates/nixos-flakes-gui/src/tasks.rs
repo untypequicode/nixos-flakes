@@ -135,11 +135,6 @@ pub fn load_inputs(repo: &Path) -> Result<Vec<nixos_flakes_core::lock::RootInput
     nix::list_inputs(repo).map_err(|e| e.to_string())
 }
 
-/// Notification de bureau sans bloquer.
-pub fn notify(title: String, body: String) {
-    std::thread::spawn(move || nixos_flakes_core::notify::desktop(&title, &body, false));
-}
-
 /// Sauvegarde la config (retourne un message d'erreur éventuel).
 pub fn save_config(cfg: &Config, path: &Path) -> Result<(), String> {
     cfg.save(path).map_err(|e| e.to_string())

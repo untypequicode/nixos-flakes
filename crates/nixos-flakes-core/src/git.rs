@@ -1,6 +1,6 @@
 //! Opérations git (via le binaire `git`).
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::lock::InputChange;
 use crate::proc;
 use std::path::Path;
@@ -112,6 +112,144 @@ pub fn commit_lock(repo: &Path, message: &str, out: &mut dyn FnMut(&str)) -> Res
 /// `git push`.
 pub fn push(repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
     run_git(repo, &["push"], out)
+}
+
+/// Retard/avance d'un dépôt par rapport à sa branche amont.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub branch: Option<String>,
+    /// Branche amont suivie (ex. `origin/main`), si elle existe.
+    pub upstream: Option<String>,
+    /// Commits locaux absents de l'amont.
+    pub ahead: u32,
+    /// Commits de l'amont absents en local.
+    pub behind: u32,
+    /// Modifications de fichiers suivis (y compris `flake.lock`) : bloquent une avance rapide.
+    pub dirty: Vec<String>,
+}
+
+impl SyncStatus {
+    /// Les historiques ont divergé (commits de chaque côté).
+    pub fn diverged(&self) -> bool {
+        self.ahead > 0 && self.behind > 0
+    }
+
+    /// Vérifie qu'une avance rapide est possible ; sinon, message clair.
+    pub fn check_pullable(&self) -> Result<()> {
+        if self.upstream.is_none() {
+            return Err(Error::Git(
+                "aucune branche amont n'est configurée pour la branche courante".into(),
+            ));
+        }
+        if !self.dirty.is_empty() {
+            return Err(Error::Git(format!(
+                "l'arbre de travail est sale ({} fichier(s) modifié(s)) : commitez ou annulez vos modifications avant de synchroniser",
+                self.dirty.len()
+            )));
+        }
+        if self.diverged() {
+            return Err(Error::Git(format!(
+                "les historiques ont divergé ({} commit(s) local(aux), {} distant(s)) : fusionnez ou rebasez à la main",
+                self.ahead, self.behind
+            )));
+        }
+        Ok(())
+    }
+
+    /// Résumé lisible : « à jour », « 2 en retard »…
+    pub fn summary(&self) -> String {
+        match (self.ahead, self.behind) {
+            (0, 0) => "à jour".to_string(),
+            (a, 0) => format!("{a} en avance (à pousser)"),
+            (0, b) => format!("{b} en retard (à récupérer)"),
+            (a, b) => format!("divergé : {a} en avance, {b} en retard"),
+        }
+    }
+}
+
+/// Variables d'environnement qui empêchent git d'attendre une saisie.
+fn non_interactive() -> Vec<(String, String)> {
+    vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]
+}
+
+/// `git fetch` (met à jour les références distantes, ne touche pas à l'arbre de travail).
+pub fn fetch(repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
+    let r = repo_str(repo);
+    proc::run_env("git", &base(&r, &["fetch"]), None, &non_interactive(), out)
+}
+
+/// Avance/retard de `repo` par rapport à son amont (sans accès réseau : voir [`fetch`]).
+pub fn sync_status(repo: &Path) -> Result<SyncStatus> {
+    let r = repo_str(repo);
+    let git = |rest: &[&str]| -> Option<String> {
+        let o = proc::output("git", &base(&r, rest), None).ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    if git(&["rev-parse", "--is-inside-work-tree"])
+        .as_deref()
+        .map(str::trim)
+        != Some("true")
+    {
+        return Err(Error::Git(format!(
+            "{} n'est pas un dépôt git",
+            repo.display()
+        )));
+    }
+    let branch = git(&["symbolic-ref", "--short", "-q", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let upstream = git(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ])
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    let (ahead, behind) = if upstream.is_some() {
+        git(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+            .and_then(|s| {
+                let mut it = s.split_whitespace().map(|n| n.parse::<u32>().ok());
+                Some((it.next()??, it.next()??))
+            })
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    let porcelain = git(&["status", "--porcelain=v1", "--untracked-files=no"]).unwrap_or_default();
+    let dirty = porcelain
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| l[3..].to_string())
+        .collect();
+    Ok(SyncStatus {
+        branch,
+        upstream,
+        ahead,
+        behind,
+        dirty,
+    })
+}
+
+/// `git pull --ff-only`, refusé (sans rien modifier) si l'arbre est sale, si les
+/// historiques ont divergé ou s'il n'y a pas d'amont. Ne fait rien s'il n'y a rien à récupérer.
+pub fn pull_ff(repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
+    let status = sync_status(repo)?;
+    status.check_pullable()?;
+    if status.behind == 0 {
+        out("Déjà à jour, rien à récupérer.");
+        return Ok(());
+    }
+    let r = repo_str(repo);
+    proc::run_env(
+        "git",
+        &base(&r, &["pull", "--ff-only"]),
+        None,
+        &non_interactive(),
+        out,
+    )
 }
 
 fn short(rev: &Option<String>) -> String {
@@ -290,6 +428,109 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         init_repo(d.path());
         assert!(push(d.path(), &mut |_| {}).is_err());
+    }
+
+    /// Dépôt distant nu + deux clones `a` (qui pousse) et `b` (qui synchronise).
+    fn sync_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let remote = d.path().join("remote.git");
+        let (a, b) = (d.path().join("a"), d.path().join("b"));
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        fs::create_dir_all(&a).unwrap();
+        init_repo(&a);
+        git(&a, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        fs::write(a.join("f"), "1").unwrap();
+        commit_all(&a, "c1", &mut |_| {}).unwrap();
+        git(&a, &["push", "-q", "-u", "origin", "main"]);
+        git(
+            d.path(),
+            &["clone", "-q", remote.to_str().unwrap(), b.to_str().unwrap()],
+        );
+        git(&b, &["config", "user.name", "Test"]);
+        git(&b, &["config", "user.email", "test@example.org"]);
+        git(&b, &["config", "commit.gpgsign", "false"]);
+        (d, a, b)
+    }
+
+    fn push_new_commit(a: &Path, name: &str) {
+        fs::write(a.join(name), name).unwrap();
+        commit_all(a, name, &mut |_| {}).unwrap();
+        git(a, &["push", "-q"]);
+    }
+
+    #[test]
+    fn sync_up_to_date() {
+        let (_d, _a, b) = sync_fixture();
+        fetch(&b, &mut |_| {}).unwrap();
+        let s = sync_status(&b).unwrap();
+        assert_eq!(s.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((s.ahead, s.behind), (0, 0));
+        assert_eq!(s.summary(), "à jour");
+        pull_ff(&b, &mut |_| {}).unwrap();
+    }
+
+    #[test]
+    fn sync_behind_fetch_then_pull() {
+        let (_d, a, b) = sync_fixture();
+        push_new_commit(&a, "c2");
+        // Sans fetch, le retard est inconnu.
+        assert_eq!(sync_status(&b).unwrap().behind, 0);
+        fetch(&b, &mut |_| {}).unwrap();
+        let s = sync_status(&b).unwrap();
+        assert_eq!((s.ahead, s.behind), (0, 1));
+        assert!(s.summary().contains("1 en retard"));
+        pull_ff(&b, &mut |_| {}).unwrap();
+        assert!(b.join("c2").exists());
+        assert_eq!(sync_status(&b).unwrap().behind, 0);
+    }
+
+    #[test]
+    fn sync_ahead_only_is_not_an_error() {
+        let (_d, _a, b) = sync_fixture();
+        fs::write(b.join("local"), "x").unwrap();
+        commit_all(&b, "local", &mut |_| {}).unwrap();
+        fetch(&b, &mut |_| {}).unwrap();
+        let s = sync_status(&b).unwrap();
+        assert_eq!((s.ahead, s.behind), (1, 0));
+        pull_ff(&b, &mut |_| {}).unwrap();
+    }
+
+    #[test]
+    fn pull_refuses_dirty_tree() {
+        let (_d, a, b) = sync_fixture();
+        push_new_commit(&a, "c2");
+        fetch(&b, &mut |_| {}).unwrap();
+        fs::write(b.join("f"), "modifié").unwrap();
+        let e = pull_ff(&b, &mut |_| {}).unwrap_err().to_string();
+        assert!(e.contains("sale"), "{e}");
+        assert!(!b.join("c2").exists());
+        assert_eq!(fs::read_to_string(b.join("f")).unwrap(), "modifié");
+    }
+
+    #[test]
+    fn pull_refuses_diverged_history() {
+        let (_d, a, b) = sync_fixture();
+        push_new_commit(&a, "c2");
+        fs::write(b.join("local"), "x").unwrap();
+        commit_all(&b, "local", &mut |_| {}).unwrap();
+        fetch(&b, &mut |_| {}).unwrap();
+        let s = sync_status(&b).unwrap();
+        assert!(s.diverged());
+        let e = pull_ff(&b, &mut |_| {}).unwrap_err().to_string();
+        assert!(e.contains("divergé"), "{e}");
+        assert!(!b.join("c2").exists());
+    }
+
+    #[test]
+    fn sync_without_upstream_or_repo() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(sync_status(d.path()).is_err());
+        init_repo(d.path());
+        let s = sync_status(d.path()).unwrap();
+        assert_eq!(s.upstream, None);
+        let e = pull_ff(d.path(), &mut |_| {}).unwrap_err().to_string();
+        assert!(e.contains("amont"), "{e}");
     }
 
     #[test]

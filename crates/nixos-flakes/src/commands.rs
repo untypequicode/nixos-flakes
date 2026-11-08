@@ -2,6 +2,7 @@
 
 use crate::cli::{Cli, Command};
 use nixos_flakes_core::config::{Config, Role};
+use nixos_flakes_core::daemon::{self as daemon_api, UpgradeOutcomeKind, UpgradeRecord};
 use nixos_flakes_core::error::Error as CoreError;
 use nixos_flakes_core::git::{self, GitState};
 use nixos_flakes_core::lock::InputChange;
@@ -25,6 +26,11 @@ pub fn run(cli: Cli) -> Result<ExitCode, String> {
         return Ok(check_waybar(&config_path, path.as_deref()));
     }
 
+    // Démon : relit lui-même la configuration à chaque vérification.
+    if let Command::Daemon { gui_command } = &cli.command {
+        return crate::daemon::run(gui_command.clone());
+    }
+
     let mut config = Config::load(&config_path).map_err(|e| e.to_string())?;
     match cli.command {
         Command::List { all, check } => list(&config, all, check),
@@ -39,6 +45,8 @@ pub fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Upgrade { path, notify, sudo } => {
             upgrade_cmd(&config, path.as_deref(), notify, sudo)
         }
+        Command::Sync { path, check } => sync_cmd(&config, path.as_deref(), check),
+        Command::Daemon { .. } => unreachable!("traité plus haut"),
         Command::Pkg { command } => crate::pkg::run(command, &config),
         Command::Track { path } => set_role(&mut config, &config_path, &path, Role::Tracked),
         Command::Untrack { path } => set_role(&mut config, &config_path, &path, Role::Detected),
@@ -52,6 +60,31 @@ pub(crate) fn resolve_repo(config: &Config, path: Option<&Path>) -> PathBuf {
     path.map(Path::to_path_buf)
         .or_else(|| config.system_repo.clone())
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SYSTEM_REPO))
+}
+
+/// `sync` : fetch, avance/retard, puis `pull --ff-only` (refusé si arbre sale ou historiques divergés).
+fn sync_cmd(config: &Config, path: Option<&Path>, check_only: bool) -> Result<ExitCode, String> {
+    let repo = resolve_repo(config, path);
+    let err = |e: CoreError| e.to_string();
+    git::fetch(&repo, &mut stream_to_stderr).map_err(err)?;
+    let status = git::sync_status(&repo).map_err(err)?;
+    println!(
+        "{} : {}{}",
+        repo.display(),
+        status.summary(),
+        status
+            .upstream
+            .as_deref()
+            .map_or_else(String::new, |u| format!(" (amont : {u})"))
+    );
+    if check_only {
+        return Ok(ExitCode::SUCCESS);
+    }
+    git::pull_ff(&repo, &mut stream_to_stderr).map_err(err)?;
+    if status.behind > 0 {
+        println!("Synchronisé : {} commit(s) récupéré(s).", status.behind);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn stream_to_stderr(line: &str) {
@@ -193,14 +226,26 @@ fn upgrade_cmd(
         }
     };
 
+    // Mémorise l'issue pour le démon de session ; sans droit d'écriture, on l'ignore.
+    let record = |outcome, message: String| {
+        let record = UpgradeRecord {
+            outcome,
+            finished_at: daemon_api::now_unix(),
+            message,
+        };
+        let _ = daemon_api::write_upgrade_record(&daemon_api::status_file_path(), &record);
+    };
+
     match upgrade::upgrade(&repo, privilege, &mut stream_to_stderr) {
         Ok(UpgradeOutcome::AlreadyUpToDate) => {
+            record(UpgradeOutcomeKind::UpToDate, "tout est à jour".into());
             println!("Tout est à jour.");
             Ok(ExitCode::SUCCESS)
         }
         Ok(UpgradeOutcome::Applied(report)) => {
             let body = upgrade_body(&report.changes);
             println!("Mise à niveau appliquée : {body}.");
+            record(UpgradeOutcomeKind::Applied, body.clone());
             if notify_desktop {
                 notify::desktop("Mise à niveau automatique réussie", &body, false);
             }
@@ -212,10 +257,12 @@ fn upgrade_cmd(
                 upgrade_body(&report.changes)
             );
             eprintln!("{message}");
+            record(UpgradeOutcomeKind::RolledBack, message.clone());
             notify_failure("Retour à la génération précédente effectué.");
             Ok(ExitCode::FAILURE)
         }
         Err(e) => {
+            record(UpgradeOutcomeKind::Failed, e.to_string());
             notify_failure(&e.to_string());
             Err(e.to_string())
         }

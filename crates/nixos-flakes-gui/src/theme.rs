@@ -6,7 +6,7 @@
 
 use crate::anim::{lerp, lerp_color};
 use crate::model::Tone;
-use iced::widget::{button, container, scrollable, text_editor, text_input, toggler};
+use iced::widget::{button, container, scrollable, text_editor, text_input};
 use iced::{border, Background, Border, Color, Shadow, Theme, Vector};
 use std::process::Command;
 
@@ -567,31 +567,6 @@ pub fn scroll_style(tk: Tokens) -> impl Fn(&Theme, scrollable::Status) -> scroll
         s.horizontal_rail = rail;
         s.gap = None;
         s
-    }
-}
-
-pub fn toggler_style(tk: Tokens) -> impl Fn(&Theme, toggler::Status) -> toggler::Style {
-    move |_, status| {
-        let on = match status {
-            toggler::Status::Active { is_toggled }
-            | toggler::Status::Hovered { is_toggled }
-            | toggler::Status::Disabled { is_toggled } => is_toggled,
-        };
-        toggler::Style {
-            background: Background::Color(if on { tk.accent } else { tk.selected }),
-            background_border_width: 1.0,
-            background_border_color: if on {
-                Color::TRANSPARENT
-            } else {
-                tk.border_strong
-            },
-            foreground: Background::Color(if on { tk.on_accent } else { tk.text2 }),
-            foreground_border_width: 0.0,
-            foreground_border_color: Color::TRANSPARENT,
-            text_color: Some(tk.text),
-            border_radius: None,
-            padding_ratio: 0.2,
-        }
     }
 }
 

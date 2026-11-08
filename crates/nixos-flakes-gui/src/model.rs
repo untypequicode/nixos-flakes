@@ -270,31 +270,6 @@ pub fn overall(entries: &[RepoEntry]) -> Overall {
     }
 }
 
-/// Vrai si `new` contient des mises à jour qu'on ne connaissait pas dans `old`.
-pub fn has_new_updates(old: Option<&[InputChange]>, new: &[InputChange]) -> bool {
-    new.iter().any(|n| {
-        !old.unwrap_or(&[])
-            .iter()
-            .any(|o| o.name == n.name && o.new_rev == n.new_rev)
-    })
-}
-
-/// Titre et corps de la notification de bureau.
-pub fn notification_text(repos: &[(String, usize)]) -> (String, String) {
-    let total: usize = repos.iter().map(|(_, n)| n).sum();
-    let title = if total == 1 {
-        "1 mise à jour disponible".to_string()
-    } else {
-        format!("{total} mises à jour disponibles")
-    };
-    let body = repos
-        .iter()
-        .map(|(name, n)| format!("{name} : {n}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (title, body)
-}
-
 /// Actions possibles sur un dépôt (désactive tout si une commande tourne).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Actions {
@@ -759,24 +734,6 @@ mod tests {
         assert_eq!(overall(&[a.clone(), b.clone()]), Overall::Updates(2));
         a.error = Some("e".into());
         assert_eq!(overall(&[a, b]), Overall::Error);
-    }
-
-    #[test]
-    fn new_updates_detection() {
-        let old = vec![change("n", "1")];
-        assert!(!has_new_updates(Some(&old), &[change("n", "1")]));
-        assert!(has_new_updates(Some(&old), &[change("n", "2")]));
-        assert!(has_new_updates(None, &[change("n", "1")]));
-        assert!(!has_new_updates(None, &[]));
-    }
-
-    #[test]
-    fn notification_wording() {
-        let (t, b) = notification_text(&[("nixos".into(), 1)]);
-        assert_eq!(t, "1 mise à jour disponible");
-        assert_eq!(b, "nixos : 1");
-        let (t, _) = notification_text(&[("a".into(), 2), ("b".into(), 1)]);
-        assert_eq!(t, "3 mises à jour disponibles");
     }
 
     #[test]
