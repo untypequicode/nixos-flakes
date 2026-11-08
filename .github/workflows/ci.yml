@@ -3,26 +3,86 @@ name: "Nix CI"
 on:
   push:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+# Un nouveau push annule le run précédent de la même branche ou PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SYSTEM: x86_64-linux
 
 jobs:
-  check:
-    name: Flake check et build
+  # Liste les checks du flake : la matrice suit toujours le dépôt, sans nom
+  # à maintenir ici quand un check est ajouté ou retiré.
+  plan:
+    name: Liste des checks
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
+    outputs:
+      checks: ${{ steps.list.outputs.checks }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - id: list
+        run: |
+          checks=$(nix eval --json ".#checks.${SYSTEM}" --apply builtins.attrNames)
+          echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+          echo "Checks : ${checks}"
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@v27
+  # Évaluation seule (rapide) de toutes les sorties, aarch64-linux comprise.
+  eval:
+    name: Évaluation de toutes les plateformes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check --all-systems --no-build
+
+  # Un job par check (build, tests, clippy, rustfmt, extensions…) : ils
+  # tournent en parallèle sur des runners distincts.
+  check:
+    name: ${{ matrix.check }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.plan.outputs.checks) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: Cache du store Nix
+        uses: nix-community/cache-nix-action@v7
         with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          primary-key: nix-${{ runner.os }}-${{ matrix.check }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/*.nix', 'crates/**') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ matrix.check }}-
+          gc-max-store-size-linux: 3G
+      - name: Construction du check
+        run: nix build --print-build-logs --no-link ".#checks.${SYSTEM}.${{ matrix.check }}"
 
-      - name: Check flake (build, tests, clippy, rustfmt)
-        run: nix flake check
-
-      - name: Build all tools
-        run: nix build .#default
+  # Point d'entrée unique pour la protection de branche.
+  ci:
+    name: CI
+    if: always()
+    needs: [eval, check]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          [ "${{ needs.eval.result }}" = success ] && [ "${{ needs.check.result }}" = success ]
