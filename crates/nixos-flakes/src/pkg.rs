@@ -1,7 +1,9 @@
 //! Sous-commandes `pkg` : recherche de paquets et édition des Paquets déclarés.
 
 use crate::cli::{PkgCommand, WriteOpts};
-use crate::commands::{format_table, resolve_repo};
+use crate::commands::{resolve_repo, CmdResult};
+use crate::failure::{Failure, EXIT_CANCELLED};
+use crate::ui::{format_table, info};
 use nixos_flakes_config as cfg;
 use nixos_flakes_core::config::Config;
 use nixos_flakes_core::nix::{self, Privilege};
@@ -11,17 +13,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Exécute une sous-commande `pkg`.
-pub fn run(command: PkgCommand, config: &Config) -> Result<ExitCode, String> {
+pub fn run(command: PkgCommand, config: &Config) -> CmdResult {
     match command {
         PkgCommand::Search { query, limit } => search(&query, limit),
-        PkgCommand::List { repo } => list(&resolve_repo(config, repo.as_deref())),
+        PkgCommand::List { repo } => list(&resolve_repo(config, repo.as_deref())?),
         PkgCommand::Add {
             name,
             file,
             location,
             opts,
         } => {
-            let repo = resolve_repo(config, opts.repo.as_deref());
+            let repo = resolve_repo(config, opts.repo.as_deref())?;
             let changes = plan_add(&repo, &file, &location, &name)?;
             commit(changes, &opts)
         }
@@ -31,7 +33,7 @@ pub fn run(command: PkgCommand, config: &Config) -> Result<ExitCode, String> {
             location,
             opts,
         } => {
-            let repo = resolve_repo(config, opts.repo.as_deref());
+            let repo = resolve_repo(config, opts.repo.as_deref())?;
             let changes = plan_remove(&repo, &file, &location, &name)?;
             commit(changes, &opts)
         }
@@ -41,15 +43,15 @@ pub fn run(command: PkgCommand, config: &Config) -> Result<ExitCode, String> {
             to,
             opts,
         } => {
-            let repo = resolve_repo(config, opts.repo.as_deref());
+            let repo = resolve_repo(config, opts.repo.as_deref())?;
             let changes = plan_move(&repo, &from, &to, &name)?;
             commit(changes, &opts)
         }
     }
 }
 
-fn search(query: &str, limit: usize) -> Result<ExitCode, String> {
-    let hits = cfg::search(query, limit).map_err(|e| e.to_string())?;
+pub(crate) fn search(query: &str, limit: usize) -> CmdResult {
+    let hits = cfg::search(query, limit).map_err(Failure::from)?;
     if hits.is_empty() {
         println!("Aucun paquet trouvé pour « {query} ».");
         return Ok(ExitCode::SUCCESS);
@@ -123,9 +125,12 @@ fn render_list(repo: &Path) -> String {
     out
 }
 
-fn list(repo: &Path) -> Result<ExitCode, String> {
+fn list(repo: &Path) -> CmdResult {
     if !repo.is_dir() {
-        return Err(format!("{} n'est pas un dossier", repo.display()));
+        return Err(Failure::new(format!(
+            "{} n'est pas un dossier",
+            repo.display()
+        )));
     }
     let text = render_list(repo);
     if text.is_empty() {
@@ -228,7 +233,7 @@ fn plan_move(repo: &Path, from: &str, to: &str, name: &str) -> Result<Vec<Change
 }
 
 /// Vrai si la réponse est affirmative (o, oui, y, yes).
-fn is_yes(answer: &str) -> bool {
+pub(crate) fn is_yes(answer: &str) -> bool {
     matches!(
         answer.trim().to_lowercase().as_str(),
         "o" | "oui" | "y" | "yes"
@@ -281,59 +286,81 @@ fn write_all_with(
             }
             return Err(format!("{} : {e}", c.rel));
         }
-        println!("{} écrit.", c.rel);
+        info(&format!("{} écrit.", c.rel));
         done.push(c);
     }
     Ok(())
 }
 
 /// Affiche les diffs, valide, confirme puis écrit.
-fn commit(changes: Vec<Change>, opts: &WriteOpts) -> Result<ExitCode, String> {
+fn commit(changes: Vec<Change>, opts: &WriteOpts) -> CmdResult {
     commit_with(changes, opts, &mut std::io::stdin().lock())
 }
 
-fn commit_with(
-    changes: Vec<Change>,
-    opts: &WriteOpts,
-    input: &mut dyn BufRead,
-) -> Result<ExitCode, String> {
+/// Écriture d'un changement : relit le fichier juste avant d'écrire et refuse s'il a été
+/// modifié depuis l'aperçu (réduit la fenêtre de course). Les restaurations (`content ==
+/// c.old`) ne sont pas contrôlées.
+fn guarded_write(c: &Change, content: &str, privilege: Privilege) -> Result<(), String> {
+    if content != c.old {
+        let now = fs::read_to_string(&c.path).map_err(|e| e.to_string())?;
+        if now != c.old {
+            return Err(
+                "a changé depuis l'aperçu : rien n'a été écrit pour ce fichier, recommencez."
+                    .to_string(),
+            );
+        }
+    }
+    write_change(&c.path, content, privilege)
+}
+
+fn commit_with(changes: Vec<Change>, opts: &WriteOpts, input: &mut dyn BufRead) -> CmdResult {
     let changes: Vec<Change> = changes.into_iter().filter(|c| c.old != c.new).collect();
     if changes.is_empty() {
-        println!("Aucun changement.");
+        info("Aucun changement.");
         return Ok(ExitCode::SUCCESS);
     }
+    let mut nix_checked = true;
     for c in &changes {
         cfg::validate(&c.new).map_err(|e| format!("{} : {e}", c.rel))?;
-        cfg::validate_with_nix(&c.new).map_err(|e| format!("{} : {e}", c.rel))?;
+        nix_checked &= cfg::validate_with_nix(&c.new).map_err(|e| {
+            let rel = &c.rel;
+            Failure::from(e).prefixed(rel)
+        })?;
         println!("=== {} ===", c.rel);
         print!("{}", cfg::diff(&c.old, &c.new));
     }
+    if !nix_checked {
+        eprintln!(
+            "attention : « nix-instantiate » est introuvable ; seule la syntaxe a été vérifiée (analyseur interne), pas par Nix."
+        );
+    }
     if opts.dry_run {
-        println!("Simulation (--dry-run) : rien n'a été écrit.");
+        info("Simulation (--dry-run) : rien n'a été écrit.");
         return Ok(ExitCode::SUCCESS);
     }
     if !opts.yes && !confirm(input) {
         println!("Annulé : rien n'a été écrit.");
-        return Ok(ExitCode::FAILURE);
+        return Ok(ExitCode::from(EXIT_CANCELLED));
     }
     let privilege = if opts.sudo {
         Privilege::Sudo
     } else {
         Privilege::Pkexec
     };
+    // Premier contrôle avant toute écriture ; `guarded_write` le répète fichier par fichier.
     for c in &changes {
         let now = fs::read_to_string(&c.path).map_err(|e| format!("{} : {e}", c.rel))?;
         if now != c.old {
-            return Err(format!(
+            return Err(Failure::new(format!(
                 "{} a changé depuis l'aperçu : rien n'a été écrit, recommencez.",
                 c.rel
-            ));
+            )));
         }
     }
     write_all_with(&changes, &mut |c, content| {
-        write_change(&c.path, content, privilege)
+        guarded_write(c, content, privilege)
     })?;
-    println!("Rien n'est appliqué : lancez « nixos-flakes apply » pour activer.");
+    info("Rien n'est appliqué : lancez « nixos-flakes apply » pour activer.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -402,7 +429,7 @@ mod tests {
         };
         commit_with(mk(), &dry, &mut "".as_bytes()).unwrap();
         let code = commit_with(mk(), &WriteOpts::default(), &mut "n\n".as_bytes()).unwrap();
-        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(code, ExitCode::from(EXIT_CANCELLED));
         assert_eq!(fs::read_to_string(d.path().join("a.nix")).unwrap(), A);
         commit_with(mk(), &WriteOpts::default(), &mut "oui\n".as_bytes()).unwrap();
         assert!(fs::read_to_string(d.path().join("a.nix"))

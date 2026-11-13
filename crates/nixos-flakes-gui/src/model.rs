@@ -28,7 +28,7 @@ impl JobKind {
             JobKind::Apply => "Application",
             JobKind::Commit => "Commit",
             JobKind::CommitLock => "Commit de flake.lock",
-            JobKind::Push => "Push",
+            JobKind::Push => "Envoi (push)",
         }
     }
 }
@@ -185,8 +185,9 @@ pub fn collect_paths(
     for p in scanned {
         seen.insert(norm(&p), ());
     }
-    let known = cfg
-        .system_repo
+    // Le dépôt système résolu est toujours affiché, même hors des racines de scan.
+    let system = cfg.system_repo_resolved().map(|r| r.path);
+    let known = system
         .iter()
         .chain(cfg.tracked.iter())
         .chain(cfg.ignored.iter());
@@ -292,11 +293,12 @@ pub fn actions(e: &RepoEntry) -> Actions {
         update: free && tracked_like,
         apply: free && e.role == Role::System,
         push: free && e.git.is_repo,
-        track: e.role == Role::Detected || e.role == Role::Ignored,
-        untrack: tracked_like,
-        set_system: matches!(e.role, Role::Tracked | Role::Detected),
-        ignore: e.role != Role::Ignored && e.role != Role::System,
-        unignore: e.role == Role::Ignored,
+        // Un changement de rôle pendant une commande la ferait travailler sur un état périmé.
+        track: free && (e.role == Role::Detected || e.role == Role::Ignored),
+        untrack: free && tracked_like,
+        set_system: free && matches!(e.role, Role::Tracked | Role::Detected),
+        ignore: free && e.role != Role::Ignored && e.role != Role::System,
+        unignore: free && e.role == Role::Ignored,
     }
 }
 
@@ -325,6 +327,108 @@ impl RoleAction {
 // Flux git (Q6)
 // ---------------------------------------------------------------------------
 
+/// Action lourde ou destructive soumise à confirmation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfirmAction {
+    Apply(PathBuf),
+    Push(PathBuf),
+    Role(PathBuf, RoleAction),
+    /// Racine de scan à retirer (par chemin : l'indice peut changer entre-temps).
+    RemoveRoot(PathBuf),
+}
+
+impl RoleAction {
+    /// Ce changement de rôle demande-t-il une confirmation ? (Suivre / ne plus ignorer : non.)
+    pub fn needs_confirm(self) -> bool {
+        matches!(
+            self,
+            RoleAction::Untrack | RoleAction::SetSystem | RoleAction::Ignore
+        )
+    }
+}
+
+impl ConfirmAction {
+    /// Dépôt visé (aucun pour une racine de scan).
+    pub fn repo(&self) -> Option<&Path> {
+        match self {
+            ConfirmAction::Apply(p) | ConfirmAction::Push(p) | ConfirmAction::Role(p, _) => Some(p),
+            ConfirmAction::RemoveRoot(_) => None,
+        }
+    }
+
+    pub fn title(&self) -> String {
+        match self {
+            ConfirmAction::Apply(p) => format!("Appliquer « {} » au système ?", short_name(p)),
+            ConfirmAction::Push(p) => format!("Pousser « {} » ?", short_name(p)),
+            ConfirmAction::Role(p, a) => {
+                let n = short_name(p);
+                match a {
+                    RoleAction::SetSystem => format!("Définir « {n} » comme dépôt système ?"),
+                    RoleAction::Ignore => format!("Ignorer « {n} » ?"),
+                    RoleAction::Untrack => format!("Ne plus suivre « {n} » ?"),
+                    RoleAction::Track => format!("Suivre « {n} » ?"),
+                    RoleAction::Unignore => format!("Ne plus ignorer « {n} » ?"),
+                }
+            }
+            ConfirmAction::RemoveRoot(_) => "Retirer cette racine de scan ?".to_string(),
+        }
+    }
+
+    pub fn body(&self) -> String {
+        match self {
+            ConfirmAction::Apply(_) => "La configuration sera appliquée à cette machine \
+                (droits administrateur requis). Les changements prennent effet immédiatement."
+                .to_string(),
+            ConfirmAction::Push(_) => {
+                "Les commits locaux seront envoyés au dépôt distant (git push).".to_string()
+            }
+            ConfirmAction::Role(_, a) => match a {
+                RoleAction::SetSystem => "Il remplace le dépôt système actuel : c'est le seul \
+                    dont la mise à jour peut être appliquée au système."
+                    .to_string(),
+                RoleAction::Ignore => {
+                    "Il ne sera plus ni vérifié ni mis à jour (réversible à tout moment)."
+                        .to_string()
+                }
+                RoleAction::Untrack => {
+                    "Il ne sera plus vérifié ni mis à jour ; il redevient simplement détecté."
+                        .to_string()
+                }
+                RoleAction::Track => "Il sera vérifié et mis à jour.".to_string(),
+                RoleAction::Unignore => "Il redevient un dépôt détecté.".to_string(),
+            },
+            ConfirmAction::RemoveRoot(p) => format!(
+                "Les dépôts trouvés uniquement sous {} disparaîtront de la liste. \
+                 Rien n'est supprimé sur le disque.",
+                p.display()
+            ),
+        }
+    }
+
+    pub fn confirm_label(&self) -> &'static str {
+        match self {
+            ConfirmAction::Apply(_) => "Appliquer",
+            ConfirmAction::Push(_) => "Pousser",
+            ConfirmAction::Role(_, RoleAction::SetSystem) => "Définir comme système",
+            ConfirmAction::Role(_, RoleAction::Ignore) => "Ignorer",
+            ConfirmAction::Role(_, RoleAction::Untrack) => "Ne plus suivre",
+            ConfirmAction::Role(_, RoleAction::Track) => "Suivre",
+            ConfirmAction::Role(_, RoleAction::Unignore) => "Ne plus ignorer",
+            ConfirmAction::RemoveRoot(_) => "Retirer",
+        }
+    }
+
+    /// Bouton de confirmation « danger » (rouge) plutôt que primaire.
+    pub fn is_danger(&self) -> bool {
+        matches!(
+            self,
+            ConfirmAction::Apply(_)
+                | ConfirmAction::RemoveRoot(_)
+                | ConfirmAction::Role(_, RoleAction::Ignore | RoleAction::Untrack)
+        )
+    }
+}
+
 /// Dialogue modal en cours.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Modal {
@@ -336,20 +440,57 @@ pub enum Modal {
     },
     /// Après la mise à jour : proposition de commit de `flake.lock`.
     CommitLock { repo: PathBuf, message: String },
+    /// Confirmation d'une action lourde (Entrée valide, Échap annule).
+    Confirm(ConfirmAction),
 }
 
 impl Modal {
-    pub fn repo(&self) -> &Path {
+    /// Dépôt concerné, s'il y en a un.
+    pub fn repo(&self) -> Option<&Path> {
         match self {
-            Modal::CommitDirty { repo, .. } | Modal::CommitLock { repo, .. } => repo,
+            Modal::CommitDirty { repo, .. } | Modal::CommitLock { repo, .. } => Some(repo),
+            Modal::Confirm(a) => a.repo(),
         }
     }
 
-    pub fn message_mut(&mut self) -> &mut String {
+    /// Message de commit modifiable (absent pour une confirmation).
+    pub fn message_mut(&mut self) -> Option<&mut String> {
         match self {
-            Modal::CommitDirty { message, .. } | Modal::CommitLock { message, .. } => message,
+            Modal::CommitDirty { message, .. } | Modal::CommitLock { message, .. } => Some(message),
+            Modal::Confirm(_) => None,
         }
     }
+
+    pub fn is_confirm(&self) -> bool {
+        matches!(self, Modal::Confirm(_))
+    }
+}
+
+/// Affiche `m` tout de suite s'il n'y a pas de dialogue ouvert, sinon le met en file
+/// (un doublon exact déjà ouvert ou en attente est ignoré). Renvoie vrai s'il est affiché.
+pub fn enqueue_modal(current: &mut Option<Modal>, queue: &mut VecDeque<Modal>, m: Modal) -> bool {
+    if current.as_ref() == Some(&m) || queue.contains(&m) {
+        return false;
+    }
+    if current.is_none() {
+        *current = Some(m);
+        true
+    } else {
+        queue.push_back(m);
+        false
+    }
+}
+
+/// Après la fermeture du dialogue courant : le suivant de la file (s'il y en a un)
+/// devient le dialogue courant et est renvoyé.
+pub fn advance_modal(current: &mut Option<Modal>, queue: &mut VecDeque<Modal>) -> Option<Modal> {
+    *current = queue.pop_front();
+    current.clone()
+}
+
+/// Un message de commit est-il acceptable ? (non vide après suppression des blancs)
+pub fn commit_message_ok(message: &str) -> bool {
+    !message.trim().is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,8 +935,8 @@ mod tests {
             repo: "/r".into(),
             message: "a".into(),
         };
-        m.message_mut().push('b');
-        assert_eq!(m.repo(), Path::new("/r"));
+        m.message_mut().unwrap().push('b');
+        assert_eq!(m.repo(), Some(Path::new("/r")));
         assert_eq!(
             m,
             Modal::CommitLock {
@@ -803,6 +944,87 @@ mod tests {
                 message: "ab".into()
             }
         );
+    }
+
+    #[test]
+    fn roles_are_disabled_while_busy() {
+        let mut e = entry("/t", Role::Tracked);
+        let free = actions(&e);
+        assert!(free.untrack && free.set_system && free.ignore);
+        e.busy = Some(JobKind::Check);
+        let a = actions(&e);
+        assert!(!a.track && !a.untrack && !a.set_system && !a.ignore && !a.unignore);
+        let mut d = entry("/d", Role::Detected);
+        d.busy = Some(JobKind::Update);
+        assert!(!actions(&d).track);
+        let mut i = entry("/i", Role::Ignored);
+        i.busy = Some(JobKind::Push);
+        assert!(!actions(&i).unignore);
+    }
+
+    #[test]
+    fn confirmations_cover_the_heavy_actions() {
+        assert!(RoleAction::SetSystem.needs_confirm());
+        assert!(RoleAction::Ignore.needs_confirm());
+        assert!(RoleAction::Untrack.needs_confirm());
+        assert!(!RoleAction::Track.needs_confirm());
+        assert!(!RoleAction::Unignore.needs_confirm());
+        let apply = ConfirmAction::Apply("/home/u/nixos".into());
+        assert_eq!(apply.repo(), Some(Path::new("/home/u/nixos")));
+        assert!(apply.title().contains("nixos") && apply.is_danger());
+        assert_eq!(apply.confirm_label(), "Appliquer");
+        let push = ConfirmAction::Push("/r".into());
+        assert_eq!(push.confirm_label(), "Pousser");
+        assert!(!push.is_danger());
+        let rm = ConfirmAction::RemoveRoot("/srv".into());
+        assert_eq!(rm.repo(), None);
+        assert!(rm.body().contains("/srv"));
+        assert!(Modal::Confirm(rm).is_confirm());
+        assert!(Modal::Confirm(push).message_mut().is_none());
+    }
+
+    #[test]
+    fn modals_queue_instead_of_overwriting() {
+        let a = Modal::CommitDirty {
+            repo: "/a".into(),
+            dirty: vec!["x".into()],
+            message: "m".into(),
+        };
+        let b = Modal::CommitLock {
+            repo: "/b".into(),
+            message: "n".into(),
+        };
+        let c = Modal::Confirm(ConfirmAction::Push("/c".into()));
+        let (mut cur, mut q) = (None, VecDeque::new());
+        assert!(enqueue_modal(&mut cur, &mut q, a.clone()));
+        assert!(!enqueue_modal(&mut cur, &mut q, b.clone()));
+        assert!(!enqueue_modal(&mut cur, &mut q, c.clone()));
+        assert_eq!(
+            cur.as_ref(),
+            Some(&a),
+            "le dialogue ouvert n'est pas écrasé"
+        );
+        assert!(
+            !enqueue_modal(&mut cur, &mut q, b.clone()),
+            "doublon ignoré"
+        );
+        assert!(
+            !enqueue_modal(&mut cur, &mut q, a.clone()),
+            "doublon ignoré"
+        );
+        assert_eq!(q.len(), 2);
+        // Affichés l'un après l'autre, dans l'ordre d'arrivée.
+        assert_eq!(advance_modal(&mut cur, &mut q), Some(b));
+        assert_eq!(advance_modal(&mut cur, &mut q), Some(c));
+        assert_eq!(advance_modal(&mut cur, &mut q), None);
+        assert!(cur.is_none());
+    }
+
+    #[test]
+    fn empty_commit_messages_are_refused() {
+        assert!(commit_message_ok("fix: x"));
+        assert!(!commit_message_ok(""));
+        assert!(!commit_message_ok(" \n\t "));
     }
 
     #[test]
@@ -818,7 +1040,7 @@ mod tests {
         let h = Path::new("/home/u");
         assert_eq!(display_path(Path::new("/home/u/a/b"), Some(h)), "~/a/b");
         assert_eq!(display_path(h, Some(h)), "~");
-        assert_eq!(display_path(Path::new("/etc/nixos"), Some(h)), "/etc/nixos");
+        assert_eq!(display_path(Path::new("/srv/nixos"), Some(h)), "/srv/nixos");
         assert_eq!(display_path(Path::new("/home/u/x"), None), "/home/u/x");
     }
 

@@ -4,8 +4,9 @@ use crate::error::{Error, Result};
 use crate::lock::{self, InputChange, LockedInput};
 use crate::proc;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Résultat d'une mise à jour (réelle ou simulée).
+/// Résultat d'une ise à jour (réelle ou simulée).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateReport {
     pub repo: PathBuf,
@@ -45,7 +46,11 @@ fn is_ownership_error(e: &Error) -> bool {
     matches!(e, Error::Command { tail, .. } if tail.contains("not owned by current user"))
 }
 
-const OWNER_HINT: &str = "Ajoutez `services.nixos-flakes.systemRepo.owner = \"<utilisateur>\";` à la configuration NixOS puis reconstruisez : cela déclare le dépôt dans /etc/gitconfig (safe.directory) et accorde à cet utilisateur une ACL sur le dépôt.";
+/// Piste de correction citant le dépôt réellement configuré.
+fn owner_hint(repo: &Path) -> String {
+    let p = repo.display();
+    format!("Ajoutez `services.nixos-flakes.systemRepo.owner = \"<utilisateur>\";` à la configuration NixOS (avec `flakePath` ou `systemRepo.path` = {p}) puis reconstruisez : cela déclare {p} dans /etc/gitconfig (safe.directory) et accorde à cet utilisateur une ACL sur le dépôt.")
+}
 
 /// Fichiers seuls nécessaires à `nix flake update` (les sorties ne sont pas évaluées).
 const FLAKE_FILES: [&str; 2] = ["flake.nix", "flake.lock"];
@@ -67,7 +72,7 @@ fn copy_flake_files(repo: &Path, dst: &Path) -> Result<()> {
 /// Erreur finale quand le repli (copie de flake.nix/flake.lock) échoue aussi :
 /// garde l'erreur de propriété d'origine et ajoute une piste de correction.
 /// Les fichiers illisibles ne sont mentionnés que s'ils sont en cause.
-fn ownership_failure(original: Error, fallback: Error) -> Error {
+fn ownership_failure(repo: &Path, original: Error, fallback: Error) -> Error {
     let Error::Command {
         program,
         status,
@@ -94,7 +99,7 @@ fn ownership_failure(original: Error, fallback: Error) -> Error {
         }
         other => msg.push_str(&format!("Repli par copie également en échec : {other}\n")),
     }
-    msg.push_str(OWNER_HINT);
+    msg.push_str(&owner_hint(repo));
     Error::Command {
         program: program.clone(),
         status: status.clone(),
@@ -136,7 +141,7 @@ pub(crate) fn check_with(nix: &str, repo: &Path, token: Option<&str>) -> Result<
             let res = copy_flake_files(repo, &copy)
                 .and_then(|()| run_check(&format!("path:{}", copy.display())));
             if let Err(e2) = res {
-                return Err(ownership_failure(e, e2));
+                return Err(ownership_failure(repo, e, e2));
             }
         } else {
             return Err(e);
@@ -198,6 +203,18 @@ pub fn update_inputs(
     inputs: &[String],
     out: &mut dyn FnMut(&str),
 ) -> Result<UpdateReport> {
+    // Une seule opération modifiante à la fois par dépôt.
+    let _lock = crate::repo_lock::acquire(repo)?;
+    let _owner = crate::fsutil::OwnerGuard::new(repo);
+    update_inputs_unlocked(repo, inputs, out)
+}
+
+/// Comme `update_inputs`, sans prendre le verrou du dépôt (l'appelant le tient déjà).
+pub(crate) fn update_inputs_unlocked(
+    repo: &Path,
+    inputs: &[String],
+    out: &mut dyn FnMut(&str),
+) -> Result<UpdateReport> {
     let token = crate::token::load().ok().flatten();
     update_with("nix", repo, inputs, token.as_ref().map(|t| t.expose()), out)
 }
@@ -224,11 +241,6 @@ pub(crate) fn update_with(
     })
 }
 
-fn is_root() -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
-}
-
 /// Commande finale : `args` préfixé de `pkexec`/`sudo` sauf si déjà root.
 pub(crate) fn privileged(privilege: Privilege, root: bool, args: &[&str]) -> Vec<String> {
     let mut v = Vec::new();
@@ -246,9 +258,20 @@ pub(crate) fn privileged(privilege: Privilege, root: bool, args: &[&str]) -> Vec
 }
 
 fn run_privileged(privilege: Privilege, args: &[&str], out: &mut dyn FnMut(&str)) -> Result<()> {
-    let cmd = privileged(privilege, is_root(), args);
+    let cmd = privileged(privilege, crate::fsutil::is_root(), args);
     let rest: Vec<&str> = cmd[1..].iter().map(String::as_str).collect();
     proc::run(&cmd[0], &rest, None, out)
+}
+
+/// Délai de `nixos-rebuild switch` et `--rollback` : 6 h, aligné sur `TimeoutStartSec` du
+/// module NixOS. Une reconstruction légitime peut être très longue, et tuer le parent laisserait
+/// un `switch` orphelin. `NIXOS_FLAKES_TIMEOUT_SECS` ne s'y applique volontairement PAS.
+pub(crate) const SWITCH_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+fn run_switch(privilege: Privilege, args: &[&str], out: &mut dyn FnMut(&str)) -> Result<()> {
+    let cmd = privileged(privilege, crate::fsutil::is_root(), args);
+    let rest: Vec<&str> = cmd[1..].iter().map(String::as_str).collect();
+    proc::run_env_timeout(&cmd[0], &rest, None, &[], SWITCH_TIMEOUT, out)
 }
 
 /// Copie `src` sur `dest` avec élévation de privilèges (`cp` : propriétaire et droits
@@ -260,34 +283,73 @@ pub fn install_file(
     out: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let (s, d) = (src.to_string_lossy(), dest.to_string_lossy());
-    let tmp = format!("{d}.nixos-flakes-tmp");
-    // Atomique : copie sous un nom temporaire du même dossier (droits et propriétaire
-    // de `dest` reportés s'il existe), puis `mv` par-dessus `dest`.
+    // Atomique : copie sous un nom temporaire imprévisible (`mktemp`, créé exclusivement dans le
+    // dossier cible, avec les droits de la commande élevée), propriétaire et droits de `dest`
+    // reportés s'il existe, puis `mv` par-dessus `dest`.
     let script = r#"set -e
-trap 'rm -f -- "$3"' EXIT
-cp -- "$1" "$3"
+tmp=$(mktemp -- "$(dirname -- "$2")/.nixos-flakes-XXXXXXXX")
+trap 'rm -f -- "$tmp"' EXIT
+cat -- "$1" > "$tmp"
 if [ -e "$2" ]; then
-  chown --reference="$2" -- "$3"
-  chmod --reference="$2" -- "$3"
+  chown --reference="$2" -- "$tmp"
+  chmod --reference="$2" -- "$tmp"
+else
+  chmod --reference="$1" -- "$tmp"
 fi
-mv -f -- "$3" "$2"
+mv -f -- "$tmp" "$2"
 trap - EXIT"#;
-    run_privileged(privilege, &["sh", "-c", script, "sh", &s, &d, &tmp], out)
+    run_privileged(privilege, &["sh", "-c", script, "sh", &s, &d], out)
 }
 
-/// `nixos-rebuild switch --flake <repo>` avec élévation de privilèges.
-pub fn apply(repo: &Path, privilege: Privilege, out: &mut dyn FnMut(&str)) -> Result<()> {
-    let repo_s = repo.to_string_lossy().into_owned();
-    run_privileged(
-        privilege,
-        &["nixos-rebuild", "switch", "--flake", &repo_s],
-        out,
-    )
+/// Référence de flake pour `nixos-rebuild` : `<repo>` ou `<repo>#<attr>`.
+pub fn flake_ref(repo: &Path, attr: Option<&str>) -> String {
+    match attr {
+        Some(a) => format!("{}#{a}", repo.display()),
+        None => repo.to_string_lossy().into_owned(),
+    }
+}
+
+/// Arguments de `nixos-rebuild switch` pour `repo` (et `attr` s'il est défini).
+pub(crate) fn switch_args(repo: &Path, attr: Option<&str>) -> Result<Vec<String>> {
+    crate::config::validate_repo_path(repo)?;
+    if let Some(a) = attr {
+        crate::config::validate_attr(a)?;
+    }
+    Ok(vec![
+        "nixos-rebuild".into(),
+        "switch".into(),
+        "--flake".into(),
+        flake_ref(repo, attr),
+    ])
+}
+
+/// `nixos-rebuild switch --flake <repo>[#<attr>]` avec élévation de privilèges.
+pub fn apply(
+    repo: &Path,
+    attr: Option<&str>,
+    privilege: Privilege,
+    out: &mut dyn FnMut(&str),
+) -> Result<()> {
+    // Une seule opération modifiante à la fois par dépôt.
+    let _lock = crate::repo_lock::acquire(repo)?;
+    apply_unlocked(repo, attr, privilege, out)
+}
+
+/// Comme `apply`, sans prendre le verrou du dépôt (l'appelant le tient déjà).
+pub(crate) fn apply_unlocked(
+    repo: &Path,
+    attr: Option<&str>,
+    privilege: Privilege,
+    out: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let args = switch_args(repo, attr)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_switch(privilege, &args, out)
 }
 
 /// `nixos-rebuild switch --rollback` avec élévation de privilèges.
 pub fn rollback(privilege: Privilege, out: &mut dyn FnMut(&str)) -> Result<()> {
-    run_privileged(privilege, &["nixos-rebuild", "switch", "--rollback"], out)
+    run_switch(privilege, &["nixos-rebuild", "switch", "--rollback"], out)
 }
 
 #[cfg(test)]
@@ -628,6 +690,30 @@ esac
         let l = list_inputs(d.path()).unwrap();
         assert_eq!(l[0].name, "a");
         assert_eq!(l[0].short_rev.as_deref(), Some("1234567"));
+    }
+
+    #[test]
+    fn switch_args_rejects_ref_metacharacters() {
+        assert!(switch_args(Path::new("/srv/a#b"), None).is_err());
+        assert!(switch_args(Path::new("/srv/a?x=1"), Some("h")).is_err());
+    }
+
+    #[test]
+    fn switch_args_with_and_without_attr() {
+        let repo = Path::new("/home/u/ma config");
+        assert_eq!(
+            switch_args(repo, None).unwrap(),
+            ["nixos-rebuild", "switch", "--flake", "/home/u/ma config"]
+        );
+        assert_eq!(
+            switch_args(repo, Some("laptop")).unwrap()[3],
+            "/home/u/ma config#laptop"
+        );
+        assert!(switch_args(repo, Some("a b;rm")).is_err());
+        assert_eq!(
+            flake_ref(Path::new("/srv/nixos"), Some("h")),
+            "/srv/nixos#h"
+        );
     }
 
     #[test]

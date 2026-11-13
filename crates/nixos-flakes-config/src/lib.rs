@@ -9,6 +9,7 @@ mod edit;
 mod error;
 mod fsio;
 mod locate;
+mod run;
 mod search;
 #[cfg(test)]
 mod tests;

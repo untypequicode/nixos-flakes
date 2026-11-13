@@ -5,7 +5,9 @@
 use crate::app::Message;
 use crate::model::Tone;
 use crate::theme::{self, Btn};
-use crate::widgets::{self, action, dim, faint, hoverable, mono, pill, section_label, title, Ui};
+use crate::widgets::{
+    self, action, clear_button, dim, faint, hoverable, mono, pill, section_label, title, Ui,
+};
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
 use iced::{Element, Fill, Length};
 use nixos_flakes_config as cfg;
@@ -20,6 +22,9 @@ pub const SEARCH_LIMIT: usize = 30;
 /// Texte affiché pour un Emplacement qu'on ne sait pas modifier automatiquement.
 pub const READ_ONLY_NOTE: &str = "modifiable en code seulement";
 
+/// Identifiant du champ de recherche (focus par la touche « / »).
+pub const SEARCH_INPUT: &str = "packages-search";
+
 // -- messages ---------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -27,6 +32,8 @@ pub enum Msg {
     Open,
     Back,
     Query(String),
+    /// Vide le champ de recherche (et les résultats).
+    ClearQuery,
     Search,
     SearchDone(u64, Result<Vec<PackageHit>, String>),
     Reload,
@@ -371,10 +378,10 @@ pub fn hit_meta(h: &PackageHit) -> String {
     }
 }
 
-/// Intitulé d'un Emplacement : identifiant et portée `with`.
+/// Intitulé d'un Emplacement : identifiant et portée (le `with` de Nix).
 pub fn location_label(l: &Location) -> String {
     match &l.scope {
-        Some(s) => format!("{} · with {s}", l.id),
+        Some(s) => format!("{} · portée {s}", l.id),
         None => l.id.clone(),
     }
 }
@@ -510,6 +517,14 @@ fn write_all_with(
         done.push(c);
     }
     Ok(())
+}
+
+/// Message d'erreur d'une recherche : contexte (la requête) et piste (le réseau).
+pub fn search_error_text(query: &str, err: &str) -> String {
+    format!(
+        "La recherche de « {} » a échoué : {err}\nVérifiez la connexion réseau, puis relancez la recherche.",
+        query.trim()
+    )
 }
 
 // -- vue --------------------------------------------------------------------------
@@ -805,30 +820,35 @@ pub fn view<'a>(
 
     // Recherche.
     let can_search = !st.query.trim().is_empty() && !st.searching;
-    content = content.push(
-        row![
-            text_input("Rechercher un paquet nixpkgs…", &st.query)
-                .on_input(|s| msg(Msg::Query(s)))
-                .on_submit(msg(Msg::Search))
-                .style(theme::input_style(tk))
-                .size(13)
-                .padding([7, 10]),
-            action(
-                ui,
-                "pkg:search",
-                "Rechercher",
-                Btn::Primary,
-                Some("↵"),
-                can_search.then(|| msg(Msg::Search))
-            ),
-        ]
-        .spacing(8)
-        .align_y(iced::Center),
-    );
+    let mut search_row = row![text_input("Rechercher un paquet nixpkgs…", &st.query)
+        .id(SEARCH_INPUT)
+        .on_input(|s| msg(Msg::Query(s)))
+        .on_submit(msg(Msg::Search))
+        .style(theme::input_style(tk))
+        .size(13)
+        .padding([7, 10])]
+    .spacing(8)
+    .align_y(iced::Center);
+    if !st.query.is_empty() {
+        search_row = search_row.push(clear_button(ui, "pkg:clear", msg(Msg::ClearQuery)));
+    }
+    search_row = search_row.push(action(
+        ui,
+        "pkg:search",
+        "Rechercher",
+        Btn::Primary,
+        Some("↵"),
+        can_search.then(|| msg(Msg::Search)),
+    ));
+    content = content.push(search_row);
     if st.searching {
         content = content.push(dim(tk, "Recherche en cours…").size(12));
     } else if let Some(e) = &st.search_error {
-        content = content.push(text(e.clone()).size(12).color(tk.danger));
+        content = content.push(
+            text(search_error_text(&st.query, e))
+                .size(12)
+                .color(tk.danger),
+        );
     } else if st.searched && st.results.is_empty() {
         content = content.push(dim(tk, "Aucun résultat.").size(12));
     } else if !st.results.is_empty() {
@@ -986,6 +1006,13 @@ mod tests {
         assert!(st.finish_search(s2, Err("hors ligne".into())));
         assert!(st.results.is_empty());
         assert_eq!(st.search_error.as_deref(), Some("hors ligne"));
+    }
+
+    #[test]
+    fn search_error_has_context_and_a_hint() {
+        let t = search_error_text(" git ", "hors ligne");
+        assert!(t.contains("« git »") && t.contains("hors ligne"));
+        assert!(t.contains("réseau"));
     }
 
     #[test]

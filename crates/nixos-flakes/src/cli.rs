@@ -1,18 +1,66 @@
 //! Définition des arguments de la ligne de commande (clap).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
+
+/// Codes de sortie, documentés dans `--help`.
+pub const EXIT_HELP: &str = "\
+Codes de sortie :
+  0   succès
+  1   erreur
+  2   usage incorrect (arguments invalides)
+  3   annulé par l'utilisateur
+  4   dépôt occupé (une autre opération est en cours sur ce dépôt)
+  5   délai dépassé
+  10  « check --exit-code » : des mises à jour sont disponibles";
 
 /// Gestion des flakes Nix de la machine.
 #[derive(Debug, Parser, PartialEq, Eq)]
-#[command(name = "nixos-flakes", version, about, long_about = None)]
+#[command(name = "nixos-flakes", version, about, long_about = None, after_help = EXIT_HELP)]
 pub struct Cli {
     /// Fichier de configuration (défaut : $XDG_CONFIG_HOME/nixos-flakes/config.toml).
     #[arg(long, global = true, value_name = "FICHIER")]
     pub config: Option<PathBuf>,
 
+    /// Réduit la sortie : n'affiche que les résultats et les erreurs.
+    #[arg(long, short = 'q', global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Commande clap complète, avec l'aide intégrée en français.
+pub fn command() -> clap::Command {
+    let mut cmd = Cli::command();
+    cmd.build();
+    localize(cmd)
+}
+
+fn localize(cmd: clap::Command) -> clap::Command {
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    let mut cmd = cmd
+        .help_template("{about-with-newline}\nUtilisation : {usage}\n\n{all-args}{after-help}")
+        .subcommand_help_heading("Commandes")
+        .mut_arg("help", |a| a.help("Affiche l'aide"));
+    if cmd.get_arguments().any(|a| a.get_id() == "version") {
+        cmd = cmd.mut_arg("version", |a| a.help("Affiche la version"));
+    }
+    for name in names {
+        if name == "help" {
+            cmd = cmd.mut_subcommand(name, |s| {
+                s.about("Affiche l'aide d'une commande")
+                    .help_template("{about}\n\nUtilisation : {usage}")
+            });
+        } else {
+            cmd = cmd.mut_subcommand(name, localize);
+        }
+    }
+    cmd
 }
 
 /// Sous-commandes.
@@ -26,9 +74,16 @@ pub enum Command {
         /// Calcule les mises à jour en attente (lance nix, plus lent).
         #[arg(long)]
         check: bool,
+        /// Sortie JSON (tableau de dépôts).
+        #[arg(long)]
+        json: bool,
     },
     /// Recherche les dépôts flake sous les racines de scan.
-    Scan,
+    Scan {
+        /// Sortie JSON (tableau de dépôts).
+        #[arg(long)]
+        json: bool,
+    },
     /// Affiche les mises à jour en attente d'un dépôt, sans rien modifier.
     Check {
         /// Dépôt à vérifier (défaut : dépôt système).
@@ -36,6 +91,9 @@ pub enum Command {
         /// Sortie JSON pour Waybar ; sort toujours avec le code 0.
         #[arg(long)]
         waybar: bool,
+        /// Sort avec le code 10 si des mises à jour sont disponibles (0 sinon).
+        #[arg(long)]
+        exit_code: bool,
     },
     /// Met à jour les verrous (flake.lock) d'un dépôt.
     Update {
@@ -47,22 +105,52 @@ pub enum Command {
         /// Ne met à jour que cet input (répétable) ; sans option : tous les inputs.
         #[arg(long = "input", value_name = "NOM")]
         inputs: Vec<String>,
+        /// Montre ce qui changerait sans rien écrire (simulation).
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Applique la configuration d'un dépôt à la machine (nixos-rebuild switch).
     Apply {
         /// Dépôt à appliquer (défaut : dépôt système).
         path: Option<PathBuf>,
+        /// Configuration `nixosConfigurations.<NOM>` à appliquer (défaut : attribut enregistré, sinon nom d'hôte).
+        #[arg(long, value_name = "NOM")]
+        attr: Option<String>,
+        /// Ne demande pas de confirmation (la question n'est posée que sur un terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Mise à niveau automatique : mise à jour, application, retour arrière en cas d'échec.
     Upgrade {
         /// Dépôt à mettre à niveau (défaut : dépôt système).
         path: Option<PathBuf>,
+        /// Configuration `nixosConfigurations.<NOM>` à appliquer (défaut : attribut enregistré, sinon nom d'hôte).
+        #[arg(long, value_name = "NOM")]
+        attr: Option<String>,
         /// Envoie une notification de bureau.
         #[arg(long)]
         notify: bool,
         /// Élève les privilèges avec sudo au lieu de pkexec.
         #[arg(long)]
         sudo: bool,
+        /// Ne demande pas de confirmation (la question n'est posée que sur un terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Résumé : dépôts suivis, état git, mises à jour connues, démon, dernière mise à niveau.
+    Status {
+        /// Se limite à ce dépôt.
+        path: Option<PathBuf>,
+        /// Sortie JSON stable.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnostique l'installation (outils, configuration, dépôt système, jeton, démon).
+    Doctor,
+    /// Génère le script de complétion pour un interpréteur de commandes.
+    Completions {
+        /// Interpréteur cible (bash, zsh, fish, elvish, powershell).
+        shell: Shell,
     },
     /// Synchronise un dépôt avec son amont : fetch, avance/retard, puis pull en avance rapide.
     Sync {
@@ -98,10 +186,13 @@ pub enum Command {
         #[command(subcommand)]
         command: PkgCommand,
     },
-    /// Désigne le dépôt système (l'ancien devient suivi).
+    /// Désigne le dépôt système (l'ancien devient suivi) ; chemin relatif, `~` et liens acceptés.
     SetSystem {
-        /// Dossier du dépôt flake.
+        /// Dossier du dépôt flake (contenant flake.nix).
         path: PathBuf,
+        /// Configuration `nixosConfigurations.<NOM>` à appliquer (défaut : nom d'hôte).
+        #[arg(long, value_name = "NOM")]
+        attr: Option<String>,
     },
 }
 
@@ -191,7 +282,8 @@ mod tests {
             cli.command,
             Command::List {
                 all: true,
-                check: true
+                check: true,
+                json: false
             }
         );
         assert_eq!(cli.config, None);
@@ -207,12 +299,13 @@ mod tests {
 
     #[test]
     fn check_waybar_with_path() {
-        let cli = parse(&["check", "/etc/nixos", "--waybar"]).unwrap();
+        let cli = parse(&["check", "/srv/nixos", "--waybar"]).unwrap();
         assert_eq!(
             cli.command,
             Command::Check {
-                path: Some(PathBuf::from("/etc/nixos")),
-                waybar: true
+                path: Some(PathBuf::from("/srv/nixos")),
+                waybar: true,
+                exit_code: false
             }
         );
     }
@@ -224,12 +317,17 @@ mod tests {
             Command::Update {
                 path: None,
                 commit: false,
-                inputs: vec![]
+                inputs: vec![],
+                dry_run: false
             }
         );
         assert_eq!(
             parse(&["apply"]).unwrap().command,
-            Command::Apply { path: None }
+            Command::Apply {
+                path: None,
+                attr: None,
+                yes: false
+            }
         );
     }
 
@@ -237,7 +335,7 @@ mod tests {
     fn update_input_is_repeatable() {
         let cli = parse(&[
             "update",
-            "/etc/nixos",
+            "/srv/nixos",
             "--input",
             "nixpkgs",
             "--input",
@@ -247,9 +345,10 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Update {
-                path: Some(PathBuf::from("/etc/nixos")),
+                path: Some(PathBuf::from("/srv/nixos")),
                 commit: false,
-                inputs: vec!["nixpkgs".into(), "home".into()]
+                inputs: vec!["nixpkgs".into(), "home".into()],
+                dry_run: false
             }
         );
     }
@@ -261,8 +360,10 @@ mod tests {
             cli.command,
             Command::Upgrade {
                 path: None,
+                attr: None,
                 notify: true,
-                sudo: true
+                sudo: true,
+                yes: false
             }
         );
     }
@@ -286,7 +387,25 @@ mod tests {
         assert_eq!(
             parse(&["set-system", "/a"]).unwrap().command,
             Command::SetSystem {
-                path: PathBuf::from("/a")
+                path: PathBuf::from("/a"),
+                attr: None
+            }
+        );
+        assert_eq!(
+            parse(&["set-system", "~/nix", "--attr", "laptop"])
+                .unwrap()
+                .command,
+            Command::SetSystem {
+                path: PathBuf::from("~/nix"),
+                attr: Some("laptop".into())
+            }
+        );
+        assert_eq!(
+            parse(&["apply", "--attr", "x"]).unwrap().command,
+            Command::Apply {
+                path: None,
+                attr: Some("x".into()),
+                yes: false
             }
         );
     }
@@ -295,5 +414,54 @@ mod tests {
     fn unknown_subcommand_is_rejected() {
         assert!(parse(&["frobnicate"]).is_err());
         assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn new_subcommands_and_flags() {
+        assert_eq!(
+            parse(&["status", "--json", "/x"]).unwrap().command,
+            Command::Status {
+                path: Some(PathBuf::from("/x")),
+                json: true
+            }
+        );
+        assert_eq!(parse(&["doctor"]).unwrap().command, Command::Doctor);
+        assert_eq!(
+            parse(&["completions", "bash"]).unwrap().command,
+            Command::Completions { shell: Shell::Bash }
+        );
+        assert!(parse(&["completions", "nimporte"]).is_err());
+        assert!(matches!(
+            parse(&["check", "--exit-code"]).unwrap().command,
+            Command::Check {
+                exit_code: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["update", "--dry-run"]).unwrap().command,
+            Command::Update { dry_run: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["apply", "-y"]).unwrap().command,
+            Command::Apply { yes: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["upgrade", "--yes"]).unwrap().command,
+            Command::Upgrade { yes: true, .. }
+        ));
+        assert!(parse(&["scan", "--json"]).is_ok());
+        let q = parse(&["-q", "list"]).unwrap();
+        assert!(q.quiet);
+        assert!(parse(&["list", "--quiet"]).unwrap().quiet);
+    }
+
+    #[test]
+    fn localized_command_builds_and_documents_exit_codes() {
+        let mut c = command();
+        let help = c.render_long_help().to_string();
+        assert!(help.contains("Codes de sortie"), "{help}");
+        assert!(help.contains("Utilisation"), "{help}");
+        c.debug_assert();
     }
 }

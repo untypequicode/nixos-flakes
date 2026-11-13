@@ -55,7 +55,11 @@ pub struct StatusTray {
 
 /// Lance l'interface graphique (sans l'attendre plus qu'il ne faut).
 fn open_gui(command: &str) {
-    let mut parts = command.split_whitespace();
+    let Some(parts) = super::cmdline::split(command) else {
+        eprintln!("commande de l'interface invalide (guillemet non fermé) : {command}");
+        return;
+    };
+    let mut parts = parts.into_iter();
     let Some(program) = parts.next() else { return };
     match std::process::Command::new(program)
         .args(parts)

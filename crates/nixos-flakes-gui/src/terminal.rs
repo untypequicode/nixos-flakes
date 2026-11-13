@@ -2,6 +2,7 @@
 //! le dépôt de config système.
 
 use crate::theme::{self, Mode};
+use iced_term::bindings::{Binding, BindingAction, InputKind};
 use iced_term::settings::{BackendSettings, Settings, ThemeSettings};
 use iced_term::ColorPalette;
 use std::collections::HashMap;
@@ -115,7 +116,25 @@ pub fn spawn(
         theme: ThemeSettings::new(Box::new(palette(mode))),
         ..Default::default()
     };
-    iced_term::Terminal::new(TERM_ID, settings).map_err(|e| e.to_string())
+    let mut term = iced_term::Terminal::new(TERM_ID, settings).map_err(|e| e.to_string())?;
+    term.handle(iced_term::Command::AddBindings(palette_bindings()));
+    Ok(term)
+}
+
+/// Raccourci qui ne doit PAS atteindre le shell : Ctrl K ouvre la palette de commandes.
+/// Lié à une action sans effet (`LinkOpen`), le terminal n'écrit rien dans le shell
+/// (sinon readline recevrait Ctrl K = « effacer jusqu'à la fin de ligne ») et laisse
+/// l'événement à l'application.
+pub fn palette_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
+    vec![(
+        Binding {
+            target: InputKind::Char("k".to_string()),
+            modifiers: iced::keyboard::Modifiers::CTRL,
+            terminal_mode_include: iced_term::TermMode::empty(),
+            terminal_mode_exclude: iced_term::TermMode::empty(),
+        },
+        BindingAction::LinkOpen,
+    )]
 }
 
 #[cfg(test)]
@@ -126,6 +145,15 @@ mod tests {
     fn env_sets_a_valid_term() {
         assert_eq!(shell_env()["TERM"], "xterm-256color");
         assert_eq!(shell_env()["COLORTERM"], "truecolor");
+    }
+
+    #[test]
+    fn ctrl_k_is_kept_away_from_the_shell() {
+        let b = palette_bindings();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].0.target, InputKind::Char("k".into()));
+        assert_eq!(b[0].0.modifiers, iced::keyboard::Modifiers::CTRL);
+        assert_eq!(b[0].1, BindingAction::LinkOpen);
     }
 
     #[test]

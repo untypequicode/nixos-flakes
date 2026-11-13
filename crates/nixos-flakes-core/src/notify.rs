@@ -2,7 +2,10 @@
 
 use crate::lock::InputChange;
 use crate::proc;
-use std::process::Stdio;
+use std::time::Duration;
+
+/// Délai maximal de `notify-send`.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Vrai si `new` contient des mises à jour qu'on ne connaissait pas dans `old`.
 pub fn has_new_updates(old: Option<&[InputChange]>, new: &[InputChange]) -> bool {
@@ -37,12 +40,14 @@ fn args<'a>(title: &'a str, body: &'a str, critical: bool) -> [&'a str; 7] {
 
 /// Envoie une notification avec `notify-send` ; les erreurs sont ignorées.
 pub fn desktop(title: &str, body: &str, critical: bool) {
-    let _ = proc::command("notify-send")
-        .args(args(title, body, critical))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    // Délai court : un serveur de notifications bloqué ne doit rien figer.
+    let _ = proc::output_timeout(
+        "notify-send",
+        &args(title, body, critical),
+        None,
+        &[],
+        NOTIFY_TIMEOUT,
+    );
 }
 
 #[cfg(test)]

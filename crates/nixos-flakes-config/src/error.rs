@@ -23,6 +23,9 @@ pub enum Error {
     /// Aucune source de recherche de paquets n'a répondu (et pas de cache).
     #[error("recherche de paquets impossible : {0}")]
     Search(String),
+    /// Un programme externe a dépassé son délai.
+    #[error("« {program} » : délai de {secs} s dépassé")]
+    Timeout { program: String, secs: u64 },
     /// Erreur d'entrée/sortie sur un fichier.
     #[error("erreur d'entrée/sortie sur {path} : {source}")]
     Io {

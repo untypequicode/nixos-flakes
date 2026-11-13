@@ -27,34 +27,36 @@ pub(crate) trait Backend {
     fn rollback(&mut self, out: &mut dyn FnMut(&str)) -> Result<()>;
 }
 
-struct Real(Privilege);
+struct Real<'a>(Privilege, Option<&'a str>);
 
-impl Backend for Real {
+impl Backend for Real<'_> {
     fn update(
         &mut self,
         repo: &Path,
         inputs: &[String],
         out: &mut dyn FnMut(&str),
     ) -> Result<UpdateReport> {
-        nix::update_inputs(repo, inputs, out)
+        // Le verrou du dépôt est déjà tenu par `upgrade_inputs`.
+        nix::update_inputs_unlocked(repo, inputs, out)
     }
     fn apply(&mut self, repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
-        nix::apply(repo, self.0, out)
+        nix::apply_unlocked(repo, self.1, self.0, out)
     }
     fn rollback(&mut self, out: &mut dyn FnMut(&str)) -> Result<()> {
         nix::rollback(self.0, out)
     }
 }
 
-/// Met à jour `repo`, l'applique si des inputs ont changé ; si l'application
+/// Met à jour `repo`, l'applique (configuration `attr`, sinon le nom d'hôte) si des inputs ont changé ; si l'application
 /// échoue, restaure le `flake.lock` d'origine puis revient à la génération
 /// précédente.
 pub fn upgrade(
     repo: &Path,
+    attr: Option<&str>,
     privilege: Privilege,
     out: &mut dyn FnMut(&str),
 ) -> Result<UpgradeOutcome> {
-    upgrade_inputs(repo, &[], privilege, out)
+    upgrade_inputs(repo, &[], attr, privilege, out)
 }
 
 /// Comme `upgrade`, limité aux inputs `inputs` (vide = tous). En cas d'échec
@@ -62,19 +64,41 @@ pub fn upgrade(
 pub fn upgrade_inputs(
     repo: &Path,
     inputs: &[String],
+    attr: Option<&str>,
     privilege: Privilege,
     out: &mut dyn FnMut(&str),
 ) -> Result<UpgradeOutcome> {
-    upgrade_with(&mut Real(privilege), repo, inputs, out)
+    if let Some(a) = attr {
+        crate::config::validate_attr(a)?;
+    }
+    // Verrou pris une seule fois pour toute la séquence ; `Real` appelle les
+    // variantes sans verrou de `nix` (sinon auto-blocage).
+    let _lock = crate::repo_lock::acquire(repo)?;
+    // Les fichiers créés par root dans le dépôt reviennent à leur propriétaire d'origine.
+    let _owner = crate::fsutil::OwnerGuard::new(repo);
+    upgrade_with(&mut Real(privilege, attr), repo, inputs, out)
 }
 
 fn restore_lock(path: &Path, backup: &Option<Vec<u8>>) -> Result<()> {
     match backup {
-        Some(bytes) => std::fs::write(path, bytes).map_err(|e| Error::io(path, e)),
+        Some(bytes) => crate::fsutil::write_atomic(path, bytes, None),
         None => match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::io(path, e)),
             _ => Ok(()),
         },
+    }
+}
+
+/// Vrai si l'échec prouve que `nixos-rebuild switch` n'a pas été lancé
+/// (programme introuvable, élévation de privilèges refusée ou fermée) : un
+/// retour arrière serait alors inutile, voire nuisible.
+fn switch_never_started(e: &Error) -> bool {
+    match e {
+        Error::Spawn { .. } => true,
+        Error::Command {
+            program, status, ..
+        } => program == "pkexec" && (status == "code 126" || status == "code 127"),
+        _ => false,
     }
 }
 
@@ -95,8 +119,13 @@ pub(crate) fn upgrade_with(
     let report = match backend.update(repo, inputs, out) {
         Ok(r) => r,
         Err(e) => {
-            let _ = restore_lock(&lock_path, &backup);
-            return Err(e);
+            return Err(match restore_lock(&lock_path, &backup) {
+                Ok(()) => e,
+                Err(re) => Error::RestoreFailed {
+                    original: e.to_string(),
+                    restore: re.to_string(),
+                },
+            });
         }
     };
     if report.changes.is_empty() {
@@ -108,6 +137,13 @@ pub(crate) fn upgrade_with(
     match backend.apply(repo, out) {
         Ok(()) => Ok(UpgradeOutcome::Applied(report)),
         Err(apply_err) => {
+            // Délai dépassé : un `switch` orphelin peut encore tourner. Toucher à flake.lock ou
+            // lancer un retour arrière en parallèle serait dangereux : on s'arrête là.
+            if let Error::Timeout { secs, .. } = &apply_err {
+                out(&format!("Échec de l'application : {apply_err}"));
+                out("Pas de retour arrière ni de restauration de flake.lock : un switch interrompu peut encore tourner.");
+                return Err(Error::ApplyTimedOut { secs: *secs });
+            }
             let mut reason = apply_err.to_string();
             out(&format!("Échec de l'application : {apply_err}"));
             if let Err(e) = restore_lock(&lock_path, &backup) {
@@ -115,9 +151,13 @@ pub(crate) fn upgrade_with(
             } else {
                 out("flake.lock d'origine restauré.");
             }
-            out("Retour à la génération précédente…");
-            if let Err(e) = backend.rollback(out) {
-                reason.push_str(&format!("\nRetour arrière impossible : {e}"));
+            if switch_never_started(&apply_err) {
+                out("L'application n'a pas démarré : pas de retour arrière nécessaire.");
+            } else {
+                out("Retour à la génération précédente…");
+                if let Err(e) = backend.rollback(out) {
+                    reason.push_str(&format!("\nRetour arrière impossible : {e}"));
+                }
             }
             Ok(UpgradeOutcome::RolledBack { report, reason })
         }
@@ -136,6 +176,7 @@ mod tests {
         apply_ok: bool,
         rollback_ok: bool,
         update_ok: bool,
+        apply_err: Option<Error>,
         calls: Vec<&'static str>,
     }
 
@@ -146,6 +187,7 @@ mod tests {
             apply_ok,
             rollback_ok: true,
             update_ok: true,
+            apply_err: None,
             calls: vec![],
         }
     }
@@ -185,6 +227,9 @@ mod tests {
         }
         fn apply(&mut self, _: &Path, _: &mut dyn FnMut(&str)) -> Result<()> {
             self.calls.push("apply");
+            if let Some(e) = self.apply_err.take() {
+                return Err(e);
+            }
             if self.apply_ok {
                 Ok(())
             } else {
@@ -248,6 +293,23 @@ mod tests {
             "ORIGINE"
         );
         assert!(lines.iter().any(|l| l.contains("restauré")));
+    }
+
+    #[test]
+    fn apply_timeout_neither_rolls_back_nor_restores_lock() {
+        let d = repo_with_lock("ORIGINE");
+        let mut f = fake(1, false);
+        f.apply_err = Some(Error::Timeout {
+            command: "nixos-rebuild switch".into(),
+            secs: 21600,
+        });
+        let r = upgrade_with(&mut f, d.path(), &[], &mut |_| {});
+        assert!(matches!(r, Err(Error::ApplyTimedOut { secs: 21600 })));
+        assert_eq!(f.calls, ["update", "apply"]);
+        assert_eq!(
+            fs::read_to_string(d.path().join("flake.lock")).unwrap(),
+            "NOUVEAU"
+        );
     }
 
     #[test]

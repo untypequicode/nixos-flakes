@@ -551,6 +551,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,9 +2025,12 @@ name = "nixos-flakes"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "clap_complete",
  "ksni",
  "nixos-flakes-config",
  "nixos-flakes-core",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "zbus",
@@ -2039,6 +2051,7 @@ dependencies = [
 name = "nixos-flakes-core"
 version = "0.1.0"
 dependencies = [
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",

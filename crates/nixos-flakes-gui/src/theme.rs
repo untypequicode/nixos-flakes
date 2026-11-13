@@ -76,8 +76,8 @@ pub fn tokens(mode: Mode) -> Tokens {
             border: rgba(255, 255, 255, 0.07),
             border_strong: rgba(255, 255, 255, 0.12),
             text: rgb(0xED, 0xED, 0xEF),
-            text2: rgb(0x8A, 0x8F, 0x98),
-            text3: rgb(0x62, 0x66, 0x6D),
+            text2: rgb(0x9A, 0x9F, 0xA8),
+            text3: rgb(0x81, 0x86, 0x8F),
             accent: rgb(0x5E, 0x6A, 0xD2),
             accent_hover: rgb(0x6F, 0x7B, 0xE0),
             on_accent: rgb(0xFF, 0xFF, 0xFF),
@@ -95,8 +95,8 @@ pub fn tokens(mode: Mode) -> Tokens {
             border: rgba(0, 0, 0, 0.08),
             border_strong: rgba(0, 0, 0, 0.14),
             text: rgb(0x1F, 0x20, 0x23),
-            text2: rgb(0x62, 0x66, 0x6D),
-            text3: rgb(0x8A, 0x8F, 0x98),
+            text2: rgb(0x50, 0x54, 0x5B),
+            text3: rgb(0x68, 0x6D, 0x75),
             accent: rgb(0x5E, 0x6A, 0xD2),
             accent_hover: rgb(0x4F, 0x5B, 0xC4),
             on_accent: rgb(0xFF, 0xFF, 0xFF),
@@ -644,6 +644,16 @@ mod tests {
             let t = tokens(mode);
             assert!(ratio(t.text, t.panel) >= 7.0, "{mode:?} texte");
             assert!(ratio(t.text2, t.panel) >= 4.5, "{mode:?} texte secondaire");
+            // Le texte discret (compteurs, aides, désactivé) reste lisible : panneau et barre latérale.
+            assert!(
+                ratio(t.text3, t.panel) >= 4.5,
+                "{mode:?} texte discret (panneau)"
+            );
+            assert!(ratio(t.text3, t.bg) >= 4.5, "{mode:?} texte discret (fond)");
+            assert!(
+                ratio(t.text3, t.raised) >= 4.5,
+                "{mode:?} texte discret (dialogue)"
+            );
             assert!(
                 ratio(t.on_accent, t.accent) >= 4.0,
                 "{mode:?} bouton primaire"

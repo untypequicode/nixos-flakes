@@ -1,7 +1,11 @@
 //! Exécution des sous-commandes et mise en forme de leur sortie.
 
-use crate::cli::{Cli, Command};
-use nixos_flakes_core::config::{Config, Role};
+use crate::cli::{Cli, Command, PkgCommand};
+use crate::failure::{Failure, EXIT_CANCELLED, EXIT_UPDATES};
+use crate::report::{self, DaemonJson, RepoJson, ScanJson, StatusJson};
+use crate::ui::{self, format_table, format_table_styled, info, progress, Style};
+use crate::{dbus, doctor};
+use nixos_flakes_core::config::{self, Config, Role, SYSTEM_REPO_HINT};
 use nixos_flakes_core::daemon::{self as daemon_api, UpgradeOutcomeKind, UpgradeRecord};
 use nixos_flakes_core::error::Error as CoreError;
 use nixos_flakes_core::git::{self, GitState};
@@ -11,63 +15,186 @@ use nixos_flakes_core::scan;
 use nixos_flakes_core::status::{self, RepoStatus};
 use nixos_flakes_core::upgrade::{self, UpgradeOutcome};
 use nixos_flakes_core::{notify, waybar};
+use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Dépôt système de repli si la configuration n'en désigne aucun.
-const DEFAULT_SYSTEM_REPO: &str = "/etc/nixos";
+/// Résultat d'une commande.
+pub type CmdResult = Result<ExitCode, Failure>;
 
-/// Exécute la commande demandée. `Err` = message d'erreur à afficher (code 1).
-pub fn run(cli: Cli) -> Result<ExitCode, String> {
-    let config_path = cli.config.unwrap_or_else(Config::default_path);
+/// Exécute la commande demandée.
+pub fn run(cli: Cli) -> CmdResult {
+    ui::set_quiet(cli.quiet);
+
+    // Sans configuration : complétions et recherche de paquets (même si la config est cassée).
+    match &cli.command {
+        Command::Completions { shell } => {
+            let mut cmd = crate::cli::command();
+            clap_complete::generate(*shell, &mut cmd, "nixos-flakes", &mut std::io::stdout());
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Pkg {
+            command: PkgCommand::Search { query, limit },
+        } => return crate::pkg::search(query, *limit),
+        _ => {}
+    }
+
+    // Les commandes qui ÉCRIVENT la configuration exigent un emplacement utilisateur ; les autres
+    // (lecture seule, dont `upgrade` lancé par un service root sans HOME) retombent sur les
+    // défauts système (Config::load d'un fichier absent donne les valeurs par défaut).
+    let writes_config = matches!(
+        cli.command,
+        Command::Track { .. }
+            | Command::Untrack { .. }
+            | Command::Ignore { .. }
+            | Command::SetSystem { .. }
+    );
+    let config_path = resolve_config_path(cli.config, writes_config)?;
 
     // Waybar : toujours du JSON et code 0, même si la configuration est illisible.
-    if let Command::Check { path, waybar: true } = &cli.command {
+    if let Command::Check {
+        path, waybar: true, ..
+    } = &cli.command
+    {
         return Ok(check_waybar(&config_path, path.as_deref()));
     }
 
-    // Démon : relit lui-même la configuration à chaque vérification.
+    // Démon : relit lui-même la configuration (celle de `--config`) à chaque vérification.
     if let Command::Daemon { gui_command } = &cli.command {
-        return crate::daemon::run(gui_command.clone());
+        return Ok(crate::daemon::run(gui_command.clone(), config_path)?);
     }
 
-    let mut config = Config::load(&config_path).map_err(|e| e.to_string())?;
+    // Diagnostic : la configuration illisible est un résultat, pas une erreur fatale.
+    if let Command::Doctor = &cli.command {
+        return Ok(doctor_cmd(&config_path));
+    }
+
+    let mut config = Config::load(&config_path)?;
     match cli.command {
-        Command::List { all, check } => list(&config, all, check),
-        Command::Scan => scan_cmd(&config),
-        Command::Check { path, waybar: _ } => check(&config, path.as_deref()),
+        Command::List { all, check, json } => list(&config, all, check, json),
+        Command::Scan { json } => scan_cmd(&config, json),
+        Command::Check {
+            path,
+            waybar: _,
+            exit_code,
+        } => check(&config, path.as_deref(), exit_code),
         Command::Update {
             path,
             commit,
             inputs,
-        } => update(&config, path.as_deref(), commit, &inputs),
-        Command::Apply { path } => apply(&config, path.as_deref()),
-        Command::Upgrade { path, notify, sudo } => {
-            upgrade_cmd(&config, path.as_deref(), notify, sudo)
-        }
+            dry_run,
+        } => update(&config, path.as_deref(), commit, &inputs, dry_run),
+        Command::Apply { path, attr, yes } => apply(&config, path.as_deref(), attr.as_deref(), yes),
+        Command::Upgrade {
+            path,
+            attr,
+            notify,
+            sudo,
+            yes,
+        } => upgrade_cmd(&config, path.as_deref(), attr.as_deref(), notify, sudo, yes),
+        Command::Status { path, json } => status_cmd(&config, &config_path, path.as_deref(), json),
         Command::Sync { path, check } => sync_cmd(&config, path.as_deref(), check),
-        Command::Daemon { .. } => unreachable!("traité plus haut"),
         Command::Pkg { command } => crate::pkg::run(command, &config),
         Command::Track { path } => set_role(&mut config, &config_path, &path, Role::Tracked),
         Command::Untrack { path } => set_role(&mut config, &config_path, &path, Role::Detected),
         Command::Ignore { path } => set_role(&mut config, &config_path, &path, Role::Ignored),
-        Command::SetSystem { path } => set_role(&mut config, &config_path, &path, Role::System),
+        Command::SetSystem { path, attr } => {
+            set_system(&mut config, &config_path, &path, attr.as_deref())
+        }
+        Command::Daemon { .. } | Command::Doctor | Command::Completions { .. } => {
+            unreachable!("traité plus haut")
+        }
     }
 }
 
-/// Dépôt demandé, sinon dépôt système, sinon `/etc/nixos`.
-pub(crate) fn resolve_repo(config: &Config, path: Option<&Path>) -> PathBuf {
-    path.map(Path::to_path_buf)
-        .or_else(|| config.system_repo.clone())
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SYSTEM_REPO))
+/// Fichier de configuration : `--config`, sinon l'emplacement utilisateur. Sans HOME ni
+/// XDG_CONFIG_HOME, c'est une erreur seulement si `writes` ; en lecture on utilise le fichier de
+/// défauts système (`/etc/nixos-flakes/config.toml`, ou `NIXOS_FLAKES_SYSTEM_DEFAULTS`).
+pub(crate) fn resolve_config_path(
+    explicit: Option<PathBuf>,
+    writes: bool,
+) -> Result<PathBuf, Failure> {
+    match explicit {
+        Some(p) => Ok(p),
+        None => match Config::default_path() {
+            Ok(p) => Ok(p),
+            Err(e) if writes => Err(Failure::from(e)),
+            Err(_) => Ok(std::env::var_os(config::ENV_SYSTEM_DEFAULTS)
+                .filter(|v| !v.is_empty())
+                .map_or_else(
+                    || PathBuf::from(config::SYSTEM_DEFAULTS_PATH),
+                    PathBuf::from,
+                )),
+        },
+    }
+}
+
+/// Échec « aucun dépôt système » avec la piste de configuration.
+pub(crate) fn no_system_repo() -> Failure {
+    Failure::new("aucun dépôt système défini").with_hint(SYSTEM_REPO_HINT)
+}
+
+/// Dépôt demandé, sinon dépôt système résolu (configuration, environnement,
+/// défaut système, `/etc/nixos`) ; erreur claire si aucun n'existe.
+pub(crate) fn resolve_repo(config: &Config, path: Option<&Path>) -> Result<PathBuf, Failure> {
+    match path {
+        Some(p) => Ok(p.to_path_buf()),
+        None => config
+            .system_repo_resolved()
+            .map(|r| r.path)
+            .ok_or_else(no_system_repo),
+    }
+}
+
+/// Attribut `nixosConfigurations` à utiliser : celui demandé, sinon celui du
+/// dépôt système (seulement si `repo` est ce dépôt), sinon aucun (nom d'hôte).
+pub(crate) fn resolve_attr(
+    config: &Config,
+    repo: &Path,
+    requested: Option<&str>,
+) -> Option<String> {
+    if let Some(a) = requested {
+        return Some(a.to_string());
+    }
+    if config.role(repo) == Role::System {
+        return config.system_repo_resolved().and_then(|r| r.attr);
+    }
+    None
+}
+
+/// Affiche un objet sérialisable en JSON indenté.
+fn print_json<T: serde::Serialize>(value: &T) -> CmdResult {
+    let text =
+        serde_json::to_string_pretty(value).map_err(|e| Failure::new(format!("JSON : {e}")))?;
+    println!("{text}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Pose la question sur un terminal ; `Ok(true)` sans question si `yes` ou si l'entrée
+/// n'est pas un terminal (minuteur systemd, scripts : comportement inchangé).
+fn confirm_action(yes: bool, question: &str) -> bool {
+    if yes || !std::io::stdin().is_terminal() {
+        return true;
+    }
+    confirm_from(question, &mut std::io::stdin().lock())
+}
+
+fn confirm_from(question: &str, input: &mut dyn BufRead) -> bool {
+    eprint!("{question} [o/N] ");
+    let mut line = String::new();
+    input.read_line(&mut line).is_ok() && crate::pkg::is_yes(&line)
+}
+
+fn cancelled() -> ExitCode {
+    println!("Annulé : rien n'a été fait.");
+    ExitCode::from(EXIT_CANCELLED)
 }
 
 /// `sync` : fetch, avance/retard, puis `pull --ff-only` (refusé si arbre sale ou historiques divergés).
-fn sync_cmd(config: &Config, path: Option<&Path>, check_only: bool) -> Result<ExitCode, String> {
-    let repo = resolve_repo(config, path);
-    let err = |e: CoreError| e.to_string();
-    git::fetch(&repo, &mut stream_to_stderr).map_err(err)?;
-    let status = git::sync_status(&repo).map_err(err)?;
+fn sync_cmd(config: &Config, path: Option<&Path>, check_only: bool) -> CmdResult {
+    let repo = resolve_repo(config, path)?;
+    git::fetch(&repo, &mut stream_to_stderr)?;
+    let status = git::sync_status(&repo)?;
     println!(
         "{} : {}{}",
         repo.display(),
@@ -80,28 +207,35 @@ fn sync_cmd(config: &Config, path: Option<&Path>, check_only: bool) -> Result<Ex
     if check_only {
         return Ok(ExitCode::SUCCESS);
     }
-    git::pull_ff(&repo, &mut stream_to_stderr).map_err(err)?;
+    git::pull_ff(&repo, &mut stream_to_stderr)?;
     if status.behind > 0 {
-        println!("Synchronisé : {} commit(s) récupéré(s).", status.behind);
+        info(&format!(
+            "Synchronisé : {} commit(s) récupéré(s).",
+            status.behind
+        ));
     }
     Ok(ExitCode::SUCCESS)
 }
 
 fn stream_to_stderr(line: &str) {
-    eprintln!("{line}");
+    progress(line);
 }
 
 fn check_waybar(config_path: &Path, path: Option<&Path>) -> ExitCode {
-    let report: Result<UpdateReport, CoreError> =
-        Config::load(config_path).and_then(|config| nix::check(&resolve_repo(&config, path)));
+    let report: Result<UpdateReport, CoreError> = Config::load(config_path).and_then(|config| {
+        let repo = resolve_repo(&config, path).map_err(|f| CoreError::Config(f.message))?;
+        nix::check(&repo)
+    });
     println!("{}", waybar::waybar_json(report.as_ref()));
     ExitCode::SUCCESS
 }
 
-fn list(config: &Config, all: bool, check: bool) -> Result<ExitCode, String> {
+/// Dépôts à lister : système, suivis, et détectés si `all`.
+fn list_repos(config: &Config, all: bool) -> Vec<(PathBuf, Role)> {
     let mut repos: Vec<(PathBuf, Role)> = Vec::new();
-    if let Some(system) = &config.system_repo {
-        repos.push((system.clone(), Role::System));
+    // Toujours présent, même hors des racines de scan.
+    if let Some(system) = config.system_repo_resolved() {
+        repos.push((system.path, Role::System));
     }
     for tracked in &config.tracked {
         if config.role(tracked) == Role::Tracked {
@@ -115,35 +249,76 @@ fn list(config: &Config, all: bool, check: bool) -> Result<ExitCode, String> {
             }
         }
     }
+    repos
+}
 
+/// Couleur d'une cellule du tableau des dépôts (colonnes : rôle, chemin, git, mises à jour).
+fn repo_cell_style(col: usize, cell: &str) -> Option<Style> {
+    match col {
+        0 if cell == role_label(Role::System) => Some(Style::Bold),
+        2 if cell == "hors git" => Some(Style::Dim),
+        2 if cell.ends_with("propre") => Some(Style::Green),
+        2 => Some(Style::Yellow),
+        3 if cell == "à jour" => Some(Style::Green),
+        3 if cell.ends_with("en attente") => Some(Style::Yellow),
+        3 if cell.starts_with("erreur") => Some(Style::Red),
+        3 => Some(Style::Dim),
+        _ => None,
+    }
+}
+
+fn list(config: &Config, all: bool, check: bool, json: bool) -> CmdResult {
+    let repos = list_repos(config, all);
+    let statuses: Vec<RepoStatus> = repos
+        .iter()
+        .map(|(path, role)| status::status(path, *role, check))
+        .collect();
+
+    if json {
+        let items: Vec<RepoJson> = statuses.iter().map(RepoJson::from).collect();
+        return print_json(&items);
+    }
     if repos.is_empty() {
-        println!("Aucun dépôt suivi. Lancez « nixos-flakes scan » pour voir les dépôts détectés.");
+        info("Aucun dépôt suivi. Lancez « nixos-flakes scan » pour voir les dépôts détectés.");
         return Ok(ExitCode::SUCCESS);
     }
-
-    let rows: Vec<Vec<String>> = repos
+    let rows: Vec<Vec<String>> = statuses
         .iter()
-        .map(|(path, role)| {
-            let st = status::status(path, *role, check);
+        .map(|st| {
             vec![
                 role_label(st.role).to_string(),
                 st.path.display().to_string(),
                 git_label(&st.git),
-                pending_label(&st, check),
+                pending_label(st, check),
             ]
         })
         .collect();
     print!(
         "{}",
-        format_table(&["Rôle", "Chemin", "Git", "Mises à jour"], &rows)
+        format_table_styled(
+            &["Rôle", "Chemin", "Git", "Mises à jour"],
+            &rows,
+            &repo_cell_style,
+            ui::stdout_color()
+        )
     );
     Ok(ExitCode::SUCCESS)
 }
 
-fn scan_cmd(config: &Config) -> Result<ExitCode, String> {
+fn scan_cmd(config: &Config, json: bool) -> CmdResult {
     let found = scan::scan(&config.scan_roots, config.scan_depth);
+    if json {
+        let items: Vec<ScanJson> = found
+            .iter()
+            .map(|p| ScanJson {
+                path: p.display().to_string(),
+                role: report::role_key(config.role(p)),
+            })
+            .collect();
+        return print_json(&items);
+    }
     if found.is_empty() {
-        println!("Aucun dépôt flake trouvé.");
+        info("Aucun dépôt flake trouvé.");
         return Ok(ExitCode::SUCCESS);
     }
     let rows: Vec<Vec<String>> = found
@@ -159,9 +334,9 @@ fn scan_cmd(config: &Config) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn check(config: &Config, path: Option<&Path>) -> Result<ExitCode, String> {
-    let repo = resolve_repo(config, path);
-    let report = nix::check(&repo).map_err(|e| e.to_string())?;
+fn check(config: &Config, path: Option<&Path>, exit_code: bool) -> CmdResult {
+    let repo = resolve_repo(config, path)?;
+    let report = nix::check(&repo)?;
     println!("Dépôt : {}", repo.display());
     if report.changes.is_empty() {
         println!("Aucune mise à jour en attente.");
@@ -171,6 +346,9 @@ fn check(config: &Config, path: Option<&Path>) -> Result<ExitCode, String> {
             println!("  {}", change_line(c));
         }
     }
+    if exit_code && !report.changes.is_empty() {
+        return Ok(ExitCode::from(EXIT_UPDATES));
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -179,73 +357,132 @@ fn update(
     path: Option<&Path>,
     commit: bool,
     inputs: &[String],
-) -> Result<ExitCode, String> {
-    let repo = resolve_repo(config, path);
-    let report =
-        nix::update_inputs(&repo, inputs, &mut stream_to_stderr).map_err(|e| e.to_string())?;
+    dry_run: bool,
+) -> CmdResult {
+    let repo = resolve_repo(config, path)?;
+    if dry_run {
+        return update_dry_run(&repo, inputs, commit);
+    }
+    let report = nix::update_inputs(&repo, inputs, &mut stream_to_stderr)?;
     print_summary(&repo, &report);
 
     if commit {
         if report.changes.is_empty() {
-            println!("Aucun input n'a changé : rien à valider.");
-        } else if git::state(&repo).map_err(|e| e.to_string())?.is_repo {
+            info("Aucun input n'a changé : rien à valider.");
+        } else if git::state(&repo)?.is_repo {
             let message = git::lock_commit_message(&report.changes);
-            git::commit_lock(&repo, &message, &mut stream_to_stderr).map_err(|e| e.to_string())?;
-            println!("flake.lock validé dans git.");
+            git::commit_lock(&repo, &message, &mut stream_to_stderr)?;
+            info("flake.lock validé dans git.");
         } else {
-            println!("Ce dépôt n'est pas un dépôt git : aucun commit.");
+            info("Ce dépôt n'est pas un dépôt git : aucun commit.");
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn apply(config: &Config, path: Option<&Path>) -> Result<ExitCode, String> {
-    let repo = resolve_repo(config, path);
-    warn_if_not_system(config, &repo);
-    nix::apply(&repo, Privilege::Pkexec, &mut stream_to_stderr).map_err(|e| e.to_string())?;
-    println!("Configuration appliquée depuis {}.", repo.display());
+/// `update --dry-run` : réutilise la simulation de `nix::check`, sans rien écrire.
+fn update_dry_run(repo: &Path, inputs: &[String], commit: bool) -> CmdResult {
+    if !inputs.is_empty() {
+        nix::validate_inputs(repo, inputs)?;
+    }
+    let mut report = nix::check(repo)?;
+    if !inputs.is_empty() {
+        report.changes.retain(|c| inputs.contains(&c.name));
+    }
+    println!("Simulation (--dry-run) pour {} :", repo.display());
+    if report.changes.is_empty() {
+        println!("Aucun input ne changerait.");
+    } else {
+        println!("{} input(s) changeraient :", report.changes.len());
+        for c in &report.changes {
+            println!("  {}", change_line(c));
+        }
+    }
+    if commit {
+        info("--commit ignoré en simulation.");
+    }
+    info("Rien n'a été écrit.");
     Ok(ExitCode::SUCCESS)
+}
+
+fn apply(config: &Config, path: Option<&Path>, attr: Option<&str>, yes: bool) -> CmdResult {
+    let repo = resolve_repo(config, path)?;
+    let attr = resolve_attr(config, &repo, attr);
+    warn_if_not_system(config, &repo);
+    let target = nix::flake_ref(&repo, attr.as_deref());
+    if !confirm_action(yes, &format!("Appliquer la configuration de {target} ?")) {
+        return Ok(cancelled());
+    }
+    nix::apply(
+        &repo,
+        attr.as_deref(),
+        Privilege::Pkexec,
+        &mut stream_to_stderr,
+    )?;
+    info(&format!(
+        "Configuration appliquée depuis {}.",
+        repo.display()
+    ));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Mémorise l'issue pour le démon de session ; un échec d'écriture est signalé, pas ignoré.
+fn write_record(outcome: UpgradeOutcomeKind, message: String) {
+    let record = UpgradeRecord {
+        outcome,
+        finished_at: daemon_api::now_unix(),
+        message,
+    };
+    let path = daemon_api::status_file_path();
+    if let Err(e) = daemon_api::write_upgrade_record(&path, &record) {
+        eprintln!(
+            "attention : état de la mise à niveau non enregistré dans {} : {e}",
+            path.display()
+        );
+    }
 }
 
 fn upgrade_cmd(
     config: &Config,
     path: Option<&Path>,
+    attr: Option<&str>,
     notify_desktop: bool,
     sudo: bool,
-) -> Result<ExitCode, String> {
-    let repo = resolve_repo(config, path);
+    yes: bool,
+) -> CmdResult {
+    let repo = resolve_repo(config, path)?;
+    let attr = resolve_attr(config, &repo, attr);
     warn_if_not_system(config, &repo);
     let privilege = if sudo {
         Privilege::Sudo
     } else {
         Privilege::Pkexec
     };
+    if !confirm_action(
+        yes,
+        &format!(
+            "Mettre à niveau et appliquer {} ?",
+            nix::flake_ref(&repo, attr.as_deref())
+        ),
+    ) {
+        return Ok(cancelled());
+    }
     let notify_failure = |body: &str| {
         if notify_desktop {
             notify::desktop("Mise à niveau automatique échouée", body, true);
         }
     };
 
-    // Mémorise l'issue pour le démon de session ; sans droit d'écriture, on l'ignore.
-    let record = |outcome, message: String| {
-        let record = UpgradeRecord {
-            outcome,
-            finished_at: daemon_api::now_unix(),
-            message,
-        };
-        let _ = daemon_api::write_upgrade_record(&daemon_api::status_file_path(), &record);
-    };
-
-    match upgrade::upgrade(&repo, privilege, &mut stream_to_stderr) {
+    match upgrade::upgrade(&repo, attr.as_deref(), privilege, &mut stream_to_stderr) {
         Ok(UpgradeOutcome::AlreadyUpToDate) => {
-            record(UpgradeOutcomeKind::UpToDate, "tout est à jour".into());
-            println!("Tout est à jour.");
+            write_record(UpgradeOutcomeKind::UpToDate, "tout est à jour".into());
+            info("Tout est à jour.");
             Ok(ExitCode::SUCCESS)
         }
         Ok(UpgradeOutcome::Applied(report)) => {
             let body = upgrade_body(&report.changes);
-            println!("Mise à niveau appliquée : {body}.");
-            record(UpgradeOutcomeKind::Applied, body.clone());
+            info(&format!("Mise à niveau appliquée : {body}."));
+            write_record(UpgradeOutcomeKind::Applied, body.clone());
             if notify_desktop {
                 notify::desktop("Mise à niveau automatique réussie", &body, false);
             }
@@ -256,40 +493,210 @@ fn upgrade_cmd(
                 "Échec de l'application ; retour à la génération précédente ({}).\n{reason}",
                 upgrade_body(&report.changes)
             );
-            eprintln!("{message}");
-            record(UpgradeOutcomeKind::RolledBack, message.clone());
+            write_record(UpgradeOutcomeKind::RolledBack, message.clone());
             notify_failure("Retour à la génération précédente effectué.");
-            Ok(ExitCode::FAILURE)
+            Err(Failure::new(message).with_hint(
+                "le flake.lock d'origine est restauré et la génération précédente réactivée ; corrigez la cause ci-dessus (sortie de nixos-rebuild) puis relancez.",
+            ))
         }
         Err(e) => {
-            record(UpgradeOutcomeKind::Failed, e.to_string());
+            write_record(UpgradeOutcomeKind::Failed, e.to_string());
             notify_failure(&e.to_string());
-            Err(e.to_string())
+            Err(e.into())
         }
     }
 }
 
-fn set_role(
+/// Chemin saisi (relatif, `~`, lien symbolique) ramené à un dépôt flake existant.
+fn flake_dir(path: &Path) -> Result<PathBuf, Failure> {
+    let canon = config::normalize_user_path(&path.to_string_lossy())?;
+    if !canon.join("flake.nix").is_file() {
+        return Err(Failure::new(format!("pas de flake.nix dans {}", canon.display()))
+            .with_hint("indiquez le dossier qui contient flake.nix (il peut être un sous-dossier d'un dépôt git)"));
+    }
+    Ok(canon)
+}
+
+fn set_role(config: &mut Config, config_path: &Path, path: &Path, role: Role) -> CmdResult {
+    let path = flake_dir(path)?;
+    config.set_role(&path, role);
+    config.save(config_path)?;
+    info(&format!("{} : {}.", path.display(), role_label(role)));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `set-system` : dépôt système (et attribut) enregistrés dans la configuration utilisateur.
+fn set_system(
     config: &mut Config,
     config_path: &Path,
     path: &Path,
-    role: Role,
-) -> Result<ExitCode, String> {
-    if !path.join("flake.nix").is_file() {
-        return Err(format!("pas de flake.nix dans {}", path.display()));
+    attr: Option<&str>,
+) -> CmdResult {
+    let path = flake_dir(path)?;
+    config::validate_repo_path(&path)?;
+    if let Some(a) = attr {
+        config::validate_attr(a)?;
     }
-    let previous_system = config.system_repo.clone();
-    config.set_role(path, role);
-    config.save(config_path).map_err(|e| e.to_string())?;
+    let previous = config.system_repo.clone();
+    config.set_role(&path, Role::System);
+    config.system_attr = attr.map(str::to_string);
+    config.save(config_path)?;
 
-    println!("{} : {}.", path.display(), role_label(role));
-    if role == Role::System {
-        if let Some(old) = previous_system.filter(|old| old != path) {
+    info(&format!(
+        "{} : {}{}.",
+        path.display(),
+        role_label(Role::System),
+        attr.map_or_else(String::new, |a| format!(" (configuration {a})"))
+    ));
+    if let Some(old) = previous.filter(|old| {
+        config::normalize_user_path(&old.to_string_lossy())
+            .ok()
+            .as_deref()
+            != Some(path.as_path())
+    }) {
+        info(&format!(
+            "L'ancien dépôt système ({}) est devenu dépôt suivi.",
+            old.display()
+        ));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `doctor` : code 1 si une ligne est en échec.
+fn doctor_cmd(config_path: &Path) -> ExitCode {
+    let checks = doctor::run(config_path);
+    print!(
+        "{}",
+        doctor::render(&checks, ui::stdout_color(), ui::is_quiet())
+    );
+    if doctor::has_failure(&checks) {
+        ExitCode::from(crate::failure::EXIT_ERROR)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Durée écoulée lisible : « il y a 5 min ».
+pub fn ago(now: i64, then: i64) -> String {
+    let secs = now.saturating_sub(then).max(0);
+    match secs {
+        0..=59 => "à l'instant".to_string(),
+        60..=3599 => format!("il y a {} min", secs / 60),
+        3600..=86399 => format!("il y a {} h", secs / 3600),
+        _ => format!("il y a {} j", secs / 86400),
+    }
+}
+
+fn upgrade_label(r: &UpgradeRecord) -> &'static str {
+    match r.outcome {
+        UpgradeOutcomeKind::UpToDate => "à jour",
+        UpgradeOutcomeKind::Applied => "appliquée",
+        UpgradeOutcomeKind::RolledBack => "échouée (retour arrière)",
+        UpgradeOutcomeKind::Failed => "échouée",
+    }
+}
+
+/// `status` : résumé lisible ou JSON stable.
+fn status_cmd(config: &Config, config_path: &Path, path: Option<&Path>, json: bool) -> CmdResult {
+    let system = config.system_repo_resolved();
+    let repos: Vec<(PathBuf, Role)> = match path {
+        Some(p) => vec![(p.to_path_buf(), config.role(p))],
+        None => list_repos(config, false),
+    };
+    let statuses: Vec<RepoStatus> = repos
+        .iter()
+        .map(|(p, role)| status::status(p, *role, false))
+        .collect();
+    let daemon = dbus::query_daemon();
+    let last_upgrade = daemon_api::read_upgrade_record(&daemon_api::status_file_path());
+
+    if json {
+        return print_json(&StatusJson {
+            schema: report::SCHEMA_VERSION,
+            config_path: config_path.display().to_string(),
+            system_repo: system.as_ref().map(|r| r.path.display().to_string()),
+            system_repo_source: system.as_ref().map(|r| report::source_key(r.source)),
+            system_attr: system.as_ref().and_then(|r| r.attr.clone()),
+            repos: statuses.iter().map(RepoJson::from).collect(),
+            daemon: match &daemon {
+                Ok(s) => DaemonJson {
+                    reachable: true,
+                    error: None,
+                    status: Some(s.clone()),
+                },
+                Err(e) => DaemonJson {
+                    reachable: false,
+                    error: Some(e.clone()),
+                    status: None,
+                },
+            },
+            last_upgrade,
+        });
+    }
+
+    let now = daemon_api::now_unix();
+    println!("Configuration : {}", config_path.display());
+    match &system {
+        Some(r) => println!(
+            "Dépôt système : {} ({}{})",
+            r.path.display(),
+            r.source.label(),
+            r.attr
+                .as_deref()
+                .map_or_else(String::new, |a| format!(", configuration {a}"))
+        ),
+        None => println!("Dépôt système : non défini ({SYSTEM_REPO_HINT})"),
+    }
+    if statuses.is_empty() {
+        println!("Dépôts suivis : aucun");
+    } else {
+        let rows: Vec<Vec<String>> = statuses
+            .iter()
+            .map(|st| {
+                vec![
+                    role_label(st.role).to_string(),
+                    st.path.display().to_string(),
+                    git_label(&st.git),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            format_table_styled(
+                &["Rôle", "Chemin", "Git"],
+                &rows,
+                &repo_cell_style,
+                ui::stdout_color()
+            )
+        );
+        for st in statuses.iter().filter(|s| s.error.is_some()) {
             println!(
-                "L'ancien dépôt système ({}) est devenu dépôt suivi.",
-                old.display()
+                "  {} : {}",
+                st.path.display(),
+                st.error.as_deref().unwrap_or_default()
             );
         }
+    }
+    match &daemon {
+        Ok(s) => {
+            let when = s
+                .checked_at
+                .map_or_else(|| "pas encore vérifié".to_string(), |t| ago(now, t));
+            println!(
+                "Démon : joignable ({} mise(s) à jour connue(s), {when})",
+                s.updates
+            );
+        }
+        Err(e) => println!("Démon : injoignable ({e})"),
+    }
+    match &last_upgrade {
+        Some(r) => println!(
+            "Dernière mise à niveau : {}, {} ({})",
+            upgrade_label(r),
+            ago(now, r.finished_at),
+            r.message.lines().next().unwrap_or_default()
+        ),
+        None => println!("Dernière mise à niveau : inconnue"),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -306,18 +713,18 @@ fn warn_if_not_system(config: &Config, repo: &Path) {
 /// Affiche le résultat d'une mise à jour.
 fn print_summary(repo: &Path, report: &UpdateReport) {
     if report.changes.is_empty() {
-        println!(
+        info(&format!(
             "Verrous de {} à jour : aucun input n'a changé.",
             repo.display()
-        );
+        ));
     } else {
-        println!(
+        info(&format!(
             "Verrous de {} mis à jour : {} input(s) changé(s) :",
             repo.display(),
             report.changes.len()
-        );
+        ));
         for c in &report.changes {
-            println!("  {}", change_line(c));
+            info(&format!("  {}", change_line(c)));
         }
     }
 }
@@ -387,32 +794,6 @@ pub fn upgrade_body(changes: &[InputChange]) -> String {
             .collect::<Vec<_>>()
             .join(", "),
     }
-}
-
-/// Tableau aligné : chaque colonne a la largeur de sa plus grande cellule.
-pub fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    for row in rows {
-        for (w, cell) in widths.iter_mut().zip(row) {
-            *w = (*w).max(cell.chars().count());
-        }
-    }
-    let mut out = String::new();
-    let mut push_row = |cells: &[&str]| {
-        let line: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, &w)| format!("{cell:<w$}"))
-            .collect();
-        out.push_str(line.join("  ").trim_end());
-        out.push('\n');
-    };
-    push_row(headers);
-    for row in rows {
-        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
-        push_row(&cells);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -537,20 +918,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_repo_prefers_argument_then_system_then_default() {
-        let mut config = Config {
-            system_repo: None,
+    fn resolve_repo_prefers_argument_then_system() {
+        let config = Config {
+            system_repo: Some(PathBuf::from("/sys")),
+            system_attr: Some("laptop".into()),
             ..Config::default()
         };
         assert_eq!(
-            resolve_repo(&config, Some(Path::new("/x"))),
+            resolve_repo(&config, Some(Path::new("/x"))).unwrap(),
             PathBuf::from("/x")
         );
+        assert_eq!(resolve_repo(&config, None).unwrap(), PathBuf::from("/sys"));
+        // L'attribut du dépôt système ne s'applique qu'à ce dépôt ; `--attr` prime.
         assert_eq!(
-            resolve_repo(&config, None),
-            PathBuf::from(DEFAULT_SYSTEM_REPO)
+            resolve_attr(&config, Path::new("/sys"), None).as_deref(),
+            Some("laptop")
         );
-        config.system_repo = Some(PathBuf::from("/sys"));
-        assert_eq!(resolve_repo(&config, None), PathBuf::from("/sys"));
+        assert_eq!(resolve_attr(&config, Path::new("/x"), None), None);
+        assert_eq!(
+            resolve_attr(&config, Path::new("/sys"), Some("a")).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn ago_labels() {
+        assert_eq!(ago(100, 100), "à l'instant");
+        assert_eq!(ago(200, 100), "il y a 1 min");
+        assert_eq!(ago(100 + 7200, 100), "il y a 2 h");
+        assert_eq!(ago(100 + 3 * 86400, 100), "il y a 3 j");
+        assert_eq!(ago(10, 100), "à l'instant");
+    }
+
+    #[test]
+    fn confirmation_answers() {
+        assert!(confirm_from("?", &mut "oui\n".as_bytes()));
+        assert!(!confirm_from("?", &mut "\n".as_bytes()));
+        assert!(!confirm_from("?", &mut "".as_bytes()));
     }
 }

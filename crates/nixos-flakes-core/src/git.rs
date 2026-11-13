@@ -3,7 +3,8 @@
 use crate::error::{Error, Result};
 use crate::lock::InputChange;
 use crate::proc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 
 /// État git d'un dépôt flake.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -16,50 +17,130 @@ pub struct GitState {
     pub lock_dirty: bool,
 }
 
-/// Arguments communs : `safe.directory=*` évite les refus « dubious ownership ».
-fn base<'a>(repo: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
-    let mut v = vec!["-c", "safe.directory=*", "-C", repo];
-    v.extend_from_slice(rest);
+/// Racine de l'arbre de travail de `repo` : premier ancêtre portant `.git`
+/// (le flake peut être dans un sous-dossier), sinon `repo` lui-même.
+pub(crate) fn worktree_root(repo: &Path) -> PathBuf {
+    let canon = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    canon
+        .ancestors()
+        .find(|a| a.join(".git").exists())
+        .map_or(canon.clone(), Path::to_path_buf)
+}
+
+/// Arguments communs : `safe.directory` déclare les chemins exacts du dépôt
+/// (jamais `*`) pour éviter les refus « dubious ownership ».
+fn base(repo: &Path, rest: &[&str]) -> Vec<String> {
+    let mut safe: Vec<String> = vec![
+        repo.to_string_lossy().into_owned(),
+        repo.canonicalize()
+            .unwrap_or_else(|_| repo.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+        worktree_root(repo).to_string_lossy().into_owned(),
+    ];
+    safe.sort();
+    safe.dedup();
+    let mut v = Vec::new();
+    for s in safe {
+        v.push("-c".to_string());
+        v.push(format!("safe.directory={s}"));
+    }
+    v.push("-C".to_string());
+    v.push(repo.to_string_lossy().into_owned());
+    v.extend(rest.iter().map(|s| (*s).to_string()));
     v
 }
 
-fn repo_str(repo: &Path) -> String {
-    repo.to_string_lossy().into_owned()
+/// Exécute git et renvoie la sortie brute (messages en anglais pour pouvoir
+/// reconnaître « not a git repository »). Erreur seulement si git ne se lance
+/// pas ou dépasse son délai.
+fn git_output(repo: &Path, rest: &[&str]) -> Result<Output> {
+    let args = base(repo, rest);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    proc::output_env("git", &args, None, &[("LC_ALL", "C")])
 }
 
-/// État git de `repo`. Jamais d'erreur : un dossier hors git (ou sans binaire
-/// `git`) donne `is_repo = false`.
-pub fn state(repo: &Path) -> Result<GitState> {
-    Ok(state_inner(repo).unwrap_or_default())
-}
-
-fn state_inner(repo: &Path) -> Option<GitState> {
-    let r = repo_str(repo);
-    let git = |rest: &[&str]| -> Option<String> {
-        let o = proc::output("git", &base(&r, rest), None).ok()?;
+/// Message d'erreur git : première ligne utile de stderr.
+fn git_failure(rest: &[&str], o: &Output) -> Error {
+    let err = String::from_utf8_lossy(&o.stderr);
+    let msg = err.trim();
+    Error::Git(format!(
+        "« git {} » a échoué ({}){}",
+        rest.first().copied().unwrap_or(""),
         o.status
-            .success()
-            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
-    };
-    if git(&["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
-        return None;
+            .code()
+            .map_or_else(|| o.status.to_string(), |c| format!("code {c}")),
+        if msg.is_empty() {
+            String::new()
+        } else {
+            format!(" : {msg}")
+        }
+    ))
+}
+
+/// Sortie standard de git ; toute erreur (lancement ou code non nul) est remontée.
+fn git_ok(repo: &Path, rest: &[&str]) -> Result<String> {
+    let o = git_output(repo, rest)?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    } else {
+        Err(git_failure(rest, &o))
     }
-    let prefix = git(&["rev-parse", "--show-prefix"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let branch = git(&["symbolic-ref", "--short", "-q", "HEAD"])
+}
+
+/// Comme `git_ok`, mais un code non nul donne `None` (cas attendu : pas de
+/// branche, pas d'amont…). Les échecs de lancement restent des erreurs.
+fn git_opt(repo: &Path, rest: &[&str]) -> Result<Option<String>> {
+    let o = git_output(repo, rest)?;
+    Ok(o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned()))
+}
+
+/// `Ok(true)` dans un arbre de travail git, `Ok(false)` si `repo` n'est pas un
+/// dépôt (dossier absent ou « not a git repository »), `Err` pour tout autre
+/// échec de git (binaire absent, délai, propriétaire douteux, dépôt corrompu…).
+fn is_work_tree(repo: &Path) -> Result<bool> {
+    if !repo.is_dir() {
+        return Ok(false);
+    }
+    let rest = ["rev-parse", "--is-inside-work-tree"];
+    let o = git_output(repo, &rest)?;
+    if o.status.success() {
+        return Ok(String::from_utf8_lossy(&o.stdout).trim() == "true");
+    }
+    if String::from_utf8_lossy(&o.stderr).contains("not a git repository") {
+        return Ok(false);
+    }
+    Err(git_failure(&rest, &o))
+}
+
+/// État git de `repo`. Un dossier qui n'est pas un dépôt donne `is_repo =
+/// false` ; un échec de git (binaire absent, délai dépassé, dépôt illisible…)
+/// est une erreur, pas un « pas un dépôt ».
+pub fn state(repo: &Path) -> Result<GitState> {
+    if !is_work_tree(repo)? {
+        return Ok(GitState::default());
+    }
+    let prefix = git_ok(repo, &["rev-parse", "--show-prefix"])?
+        .trim()
+        .to_string();
+    let branch = git_opt(repo, &["symbolic-ref", "--short", "-q", "HEAD"])?
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let porcelain = git(&[
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-        "--",
-        ".",
-    ])?;
+    let porcelain = git_ok(
+        repo,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )?;
     let (dirty, lock_dirty) = parse_porcelain(&porcelain, &prefix);
-    Some(GitState {
+    Ok(GitState {
         is_repo: true,
         branch,
         dirty,
@@ -93,14 +174,16 @@ fn parse_porcelain(text: &str, prefix: &str) -> (Vec<String>, bool) {
 }
 
 fn run_git(repo: &Path, rest: &[&str], out: &mut dyn FnMut(&str)) -> Result<()> {
-    let r = repo_str(repo);
-    proc::run("git", &base(&r, rest), None, out)
+    let args = base(repo, rest);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    proc::run("git", &args, None, out)
 }
 
-/// `git add -A` puis `git commit -m <message>`.
+/// `git add -A -- .` puis `git commit -m <message> -- .` : limité au dossier du
+/// flake (ni le reste de l'arbre de travail, ni ce qui est déjà indexé ailleurs).
 pub fn commit_all(repo: &Path, message: &str, out: &mut dyn FnMut(&str)) -> Result<()> {
-    run_git(repo, &["add", "-A"], out)?;
-    run_git(repo, &["commit", "-m", message], out)
+    run_git(repo, &["add", "-A", "--", "."], out)?;
+    run_git(repo, &["commit", "-m", message, "--", "."], out)
 }
 
 /// Commit de `flake.lock` seul, quel que soit le reste de l'index.
@@ -174,51 +257,54 @@ fn non_interactive() -> Vec<(String, String)> {
 
 /// `git fetch` (met à jour les références distantes, ne touche pas à l'arbre de travail).
 pub fn fetch(repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
-    let r = repo_str(repo);
-    proc::run_env("git", &base(&r, &["fetch"]), None, &non_interactive(), out)
+    let args = base(repo, &["fetch"]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    proc::run_env("git", &args, None, &non_interactive(), out)
 }
 
 /// Avance/retard de `repo` par rapport à son amont (sans accès réseau : voir [`fetch`]).
+/// Un échec de git (autre qu'« aucun amont ») est une erreur : on ne le
+/// confond pas avec un arbre propre.
 pub fn sync_status(repo: &Path) -> Result<SyncStatus> {
-    let r = repo_str(repo);
-    let git = |rest: &[&str]| -> Option<String> {
-        let o = proc::output("git", &base(&r, rest), None).ok()?;
-        o.status
-            .success()
-            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
-    };
-    if git(&["rev-parse", "--is-inside-work-tree"])
-        .as_deref()
-        .map(str::trim)
-        != Some("true")
-    {
+    if !is_work_tree(repo)? {
         return Err(Error::Git(format!(
             "{} n'est pas un dépôt git",
             repo.display()
         )));
     }
-    let branch = git(&["symbolic-ref", "--short", "-q", "HEAD"])
+    let branch = git_opt(repo, &["symbolic-ref", "--short", "-q", "HEAD"])?
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let upstream = git(&[
-        "rev-parse",
-        "--abbrev-ref",
-        "--symbolic-full-name",
-        "@{upstream}",
-    ])
+    let upstream = git_opt(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )?
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty());
     let (ahead, behind) = if upstream.is_some() {
-        git(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
-            .and_then(|s| {
-                let mut it = s.split_whitespace().map(|n| n.parse::<u32>().ok());
-                Some((it.next()??, it.next()??))
-            })
-            .unwrap_or((0, 0))
+        let counts = git_ok(
+            repo,
+            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        )?;
+        let mut it = counts.split_whitespace().map(|n| n.parse::<u32>().ok());
+        match (it.next().flatten(), it.next().flatten()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                return Err(Error::Git(format!(
+                    "sortie inattendue de « git rev-list » : {}",
+                    counts.trim()
+                )))
+            }
+        }
     } else {
         (0, 0)
     };
-    let porcelain = git(&["status", "--porcelain=v1", "--untracked-files=no"]).unwrap_or_default();
+    let porcelain = git_ok(repo, &["status", "--porcelain=v1", "--untracked-files=no"])?;
     let dirty = porcelain
         .lines()
         .filter(|l| l.len() > 3)
@@ -242,14 +328,9 @@ pub fn pull_ff(repo: &Path, out: &mut dyn FnMut(&str)) -> Result<()> {
         out("Déjà à jour, rien à récupérer.");
         return Ok(());
     }
-    let r = repo_str(repo);
-    proc::run_env(
-        "git",
-        &base(&r, &["pull", "--ff-only"]),
-        None,
-        &non_interactive(),
-        out,
-    )
+    let args = base(repo, &["pull", "--ff-only"]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    proc::run_env("git", &args, None, &non_interactive(), out)
 }
 
 fn short(rev: &Option<String>) -> String {
@@ -293,6 +374,41 @@ mod tests {
             old_date: None,
             new_date: None,
         }
+    }
+
+    #[test]
+    fn git_failure_is_an_error_not_a_non_repo() {
+        // Dépôt corrompu : git échoue autrement que par « not a git repository ».
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        init_repo(p);
+        fs::write(p.join(".git/config"), "[core\nrubbish\n").unwrap();
+        let e = state(p).unwrap_err().to_string();
+        assert!(e.contains("git"), "{e}");
+        assert!(sync_status(p).is_err());
+    }
+
+    #[test]
+    fn safe_directory_is_exact_never_wildcard() {
+        let d = tempfile::tempdir().unwrap();
+        let args = base(d.path(), &["status"]);
+        assert!(args.iter().all(|a| a != "safe.directory=*"));
+        let want = format!("safe.directory={}", d.path().display());
+        assert!(args.contains(&want), "{args:?}");
+    }
+
+    #[test]
+    fn commit_all_is_limited_to_flake_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        init_repo(p);
+        fs::create_dir(p.join("sub")).unwrap();
+        fs::write(p.join("sub/a"), "").unwrap();
+        fs::write(p.join("hors"), "").unwrap();
+        commit_all(&p.join("sub"), "m", &mut |_| {}).unwrap();
+        let files = git(p, &["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(files.trim(), "sub/a");
+        assert!(state(p).unwrap().dirty.contains(&"hors".to_string()));
     }
 
     #[test]

@@ -151,3 +151,131 @@ body {
     color: #5c5c61;
     font-size: 13px;
 }
+
+/* Ajouts : états, accessibilité, thème sombre */
+[hidden] {
+    display: none !important;
+}
+.header-actions {
+    display: flex;
+    gap: 6px;
+}
+#refresh {
+    background: transparent;
+    color: inherit;
+    border: 1px solid #c4c4cc;
+    padding: 5px 9px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+#refresh:hover:not(:disabled) {
+    background: #e0e0e6;
+}
+button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+    outline: 2px solid #0060df;
+    outline-offset: 2px;
+}
+#status {
+    padding: 6px 12px;
+    font-size: 12px;
+    background: #eef6ee;
+    color: #1d5c2a;
+    border-bottom: 1px solid #e0e0e6;
+    word-break: break-word;
+}
+#status.error {
+    background: #fdeaea;
+    color: #a4000f;
+}
+.img-container:focus-within .overlay {
+    opacity: 1;
+}
+.broken-msg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    font-size: 11px;
+    color: #5c5c61;
+}
+@media (prefers-color-scheme: dark) {
+    body {
+        background-color: #1c1b22;
+        color: #fbfbfe;
+    }
+    #header,
+    #toolbar {
+        background: #2b2a33;
+        border-color: #52525e;
+    }
+    #toolbar {
+        color: #cfcfd8;
+    }
+    #toolbar select,
+    #toolbar input {
+        background: #1c1b22;
+        color: #fbfbfe;
+        border-color: #52525e;
+    }
+    #refresh {
+        border-color: #52525e;
+    }
+    #refresh:hover:not(:disabled) {
+        background: #42414d;
+    }
+    .img-container {
+        background: #2b2a33;
+        border-color: #52525e;
+    }
+    .overlay {
+        background: rgba(28, 27, 34, 0.92);
+    }
+    .action-btn {
+        background: #42414d;
+        color: #fbfbfe;
+        border-color: #52525e;
+    }
+    .action-btn:hover {
+        background: #52525e;
+    }
+    .action-btn.primary {
+        background: #0060df;
+        border-color: #0060df;
+    }
+    .message,
+    .broken-msg {
+        color: #cfcfd8;
+    }
+    #status {
+        background: #1f3a26;
+        color: #b6e8c1;
+        border-color: #52525e;
+    }
+    #status.error {
+        background: #4a1f24;
+        color: #ffb3b8;
+    }
+}
+#notice {
+    padding: 6px 12px;
+    font-size: 12px;
+    background: #fff4d6;
+    color: #6b4b00;
+    border-bottom: 1px solid #e0e0e6;
+    word-break: break-word;
+}
+@media (prefers-color-scheme: dark) {
+    #notice {
+        background: #4a3a14;
+        color: #ffe3a3;
+        border-color: #52525e;
+    }
+}

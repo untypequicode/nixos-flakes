@@ -271,6 +271,16 @@ pub fn mini_button<'a>(
     }
 }
 
+/// Bouton « × » qui vide un champ de saisie (infobulle « Effacer »).
+pub fn clear_button<'a>(ui: &Ui<'_>, key: &str, msg: Message) -> Element<'a, Message> {
+    tip(
+        ui,
+        mini_button(ui, key, "×", false, Some(msg)),
+        "Effacer",
+        tooltip::Position::Top,
+    )
+}
+
 /// Rangée d'état de 28 px : pastille, texte court sur une ligne (infobulle `detail`),
 /// puis actions alignées à droite.
 pub fn status_row<'a>(

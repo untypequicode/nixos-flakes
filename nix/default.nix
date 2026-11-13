@@ -18,7 +18,8 @@ let
 
   cargoLock.lockFile = root + "/Cargo.lock";
 
-  version = (builtins.fromTOML (builtins.readFile (root + "/Cargo.toml"))).workspace.package.version;
+  cargoToml = builtins.fromTOML (builtins.readFile (root + "/Cargo.toml"));
+  version = cargoToml.workspace.package.version;
 
   # Bibliothèques chargées dynamiquement (dlopen) par winit/wgpu/iced.
   guiLibs = with pkgs; [
@@ -46,7 +47,16 @@ let
 
   # Réglages propres à certains outils, indexés par nom de crate.
   extras = {
-    nixos-flakes = { };
+    nixos-flakes = {
+      nativeBuildInputs = [ pkgs.installShellFiles ];
+      # Complétions générées par le binaire lui-même (impossible en compilation croisée).
+      postInstall = lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+        installShellCompletion --cmd nixos-flakes \
+          --bash <($out/bin/nixos-flakes completions bash) \
+          --zsh <($out/bin/nixos-flakes completions zsh) \
+          --fish <($out/bin/nixos-flakes completions fish)
+      '';
+    };
     nixos-flakes-gui = {
       buildInputs = guiLibs;
       nativeBuildInputs = [
@@ -116,6 +126,7 @@ let
         '';
         meta = {
           inherit (crate) description;
+          homepage = cargoToml.workspace.package.repository;
           license = lib.licenses.gpl3Plus;
           mainProgram = lib.head crate.bins;
           platforms = lib.platforms.linux;
@@ -129,7 +140,13 @@ let
   default = pkgs.symlinkJoin {
     name = "nixos-flakes-all-${version}";
     paths = lib.attrValues tools;
-    meta.description = "Tous les outils de nixos-flakes";
+    meta = {
+      description = "Tous les outils de nixos-flakes";
+      homepage = cargoToml.workspace.package.repository;
+      license = lib.licenses.gpl3Plus;
+      mainProgram = "nixos-flakes";
+      platforms = lib.platforms.linux;
+    };
   };
 
   # Dérivation de contrôle sur tout le workspace (sources + dépendances vendorées).
