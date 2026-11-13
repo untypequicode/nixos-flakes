@@ -6,7 +6,8 @@ use crate::daemon_link;
 use crate::demo;
 use crate::keys::{self, KeyContext, Shortcut};
 use crate::model::{
-    self, Actions, JobKind, Modal, RepoEntry, RoleAction, UpdatePlan, DIRTY_COMMIT_MESSAGE,
+    self, Actions, ConfirmAction, JobKind, Modal, RepoEntry, RoleAction, UpdatePlan,
+    DIRTY_COMMIT_MESSAGE,
 };
 use crate::packages::{self, PackagesState};
 use crate::palette::{self, Command, PaletteState};
@@ -29,6 +30,8 @@ use nixos_flakes_core::status::RepoStatus;
 use nixos_flakes_core::token::Source as TokenSource;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Nombre maximal de lignes conservées dans la console.
@@ -37,8 +40,16 @@ pub const LOG_CAPACITY: usize = 3000;
 pub const CONSOLE_HEIGHT: f32 = 190.0;
 /// Identifiant du champ de saisie de la palette.
 pub const PALETTE_INPUT: &str = "palette-input";
-/// Nombre maximal de lignes affichées dans la palette.
-pub const PALETTE_ROWS: usize = 9;
+/// Champ de saisie du dépôt système (page Réglages).
+pub const SYSTEM_REPO_INPUT: &str = "system-repo-input";
+/// Hauteur visible de la liste de la palette (la liste défile au-delà).
+pub const PALETTE_LIST_HEIGHT: f32 = 330.0;
+/// Identifiant de la liste défilante de la palette.
+pub const PALETTE_LIST: &str = "palette-list";
+/// Hauteur d'une ligne de la palette (34 px + 1 px d'espacement).
+const PALETTE_ROW_H: f32 = 35.0;
+/// Hauteur approximative d'un intitulé de section de la palette.
+const PALETTE_HEADING_H: f32 = 26.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -77,6 +88,17 @@ pub enum Followup {
     Update,
 }
 
+/// Verdict avant de lancer une commande depuis un dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Le dépôt est libre.
+    Go,
+    /// Le dépôt est occupé : le dialogue reste ouvert.
+    Wait,
+    /// Le dépôt a disparu de la liste : le dialogue se ferme.
+    Gone,
+}
+
 /// Sélection en bloc des inputs d'un dépôt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputSelect {
@@ -89,7 +111,8 @@ pub enum InputSelect {
 pub enum Message {
     // Données
     Rescan,
-    ScanDone(Vec<RepoStatus>),
+    /// Résultat d'un scan (numéro de séquence : seul le dernier compte) ou erreur.
+    ScanDone(u64, Result<Vec<RepoStatus>, String>),
     Select(PathBuf),
     // Commandes
     Check(PathBuf),
@@ -105,6 +128,10 @@ pub enum Message {
     Apply(PathBuf),
     Push(PathBuf),
     Role(PathBuf, RoleAction),
+    /// Demande une action lourde : ouvre un dialogue de confirmation (ou l'exécute si anodine).
+    Ask(ConfirmAction),
+    /// Valide le dialogue de confirmation.
+    ModalConfirm,
     Job {
         repo: PathBuf,
         event: JobEvent,
@@ -120,6 +147,24 @@ pub enum Message {
     Noop,
     ToggleSidebar,
     OpenSettings,
+    /// Ouvre les réglages et met le focus sur le champ du dépôt système.
+    OpenSystemRepoSettings,
+    FocusSystemRepo,
+    /// Retour à la page principale.
+    GoMain,
+    OpenHelp,
+    CloseHelp,
+    /// Résultat d'un enregistrement de la config (texte de succès éventuel).
+    /// Fin d'un enregistrement : `Ok(false)` = périmé (un plus récent a suivi) ; la config
+    /// enregistrée et la génération servent à restaurer l'état en cas d'échec.
+    ConfigSaved(Result<bool, String>, Option<String>, Box<Config>, u64),
+    /// État du jeton lu au démarrage.
+    TokenLoaded(bool, TokenSource),
+    TokenSaved(Result<(), String>),
+    TokenCleared(Result<(bool, TokenSource), String>),
+    /// Préférence de thème du système, détectée hors du fil de l'interface.
+    /// Mode détecté hors du fil de l'interface (`None` : détection impossible, ignoré).
+    ModeDetected(Option<Mode>),
     Settings(settings::Msg),
     Packages(packages::Msg),
     SystemTheme(iced::theme::Mode),
@@ -153,17 +198,30 @@ pub enum Message {
     Terminal(iced_term::Event),
 }
 
+/// Délai après la fermeture d'un dialogue pendant lequel Entrée ne confirme pas le suivant.
+const MODAL_ENTER_GUARD: Duration = Duration::from_millis(400);
+
 pub struct App {
     pub cli: Cli,
     pub cfg: Config,
     pub cfg_path: PathBuf,
+    /// Dernière config connue pour être sur le disque (restaurée si un enregistrement échoue).
+    pub cfg_persisted: Config,
+    /// Génération du dernier enregistrement demandé (les plus anciens ne s'écrivent pas).
+    pub save_gen: Arc<AtomicU64>,
+    /// Jusqu'à cet instant, Entrée ne confirme pas le dialogue qui vient d'apparaître.
+    pub modal_guard_until: Option<Instant>,
     pub home: Option<PathBuf>,
     pub entries: Vec<RepoEntry>,
     pub selected: Option<PathBuf>,
     pub scanning: bool,
+    /// Numéro du dernier scan lancé : un résultat d'un scan antérieur est ignoré.
+    pub scan_seq: u64,
     pub log: VecDeque<LogLine>,
     pub console_open: bool,
     pub modal: Option<Modal>,
+    /// Dialogues en attente : affichés l'un après l'autre, jamais l'un sur l'autre.
+    pub modal_queue: VecDeque<Modal>,
     pub editor: text_editor::Content,
     pub page: Page,
     pub tab: Tab,
@@ -190,6 +248,16 @@ pub struct App {
     /// Origine du jeton (fichier Nix = lecture seule). Toujours `Aucun`/`Interface` en démo.
     pub token_source: nixos_flakes_core::token::Source,
     pub new_root: String,
+    /// Erreur de la dernière tentative d'ajout d'une racine (affichée sous le champ).
+    pub root_error: Option<String>,
+    /// Saisies du formulaire « Dépôt système » (chemin et attribut) et son erreur en ligne.
+    pub sys_repo_input: String,
+    pub sys_attr_input: String,
+    pub sys_error: Option<String>,
+    /// Un enregistrement ou effacement du jeton est en cours.
+    pub token_busy: bool,
+    /// L'aide des raccourcis est affichée.
+    pub help_open: bool,
     // -- animation et présentation --
     /// Dernier instant connu (mis à jour à chaque message).
     pub now: Instant,
@@ -231,7 +299,11 @@ pub fn window_settings() -> window::Settings {
 
 /// Démarrage : charge la config, enregistre éventuellement l'icône, ouvre la fenêtre.
 pub fn boot(cli: Cli) -> (App, Task<Message>) {
-    let cfg_path = cli.config.clone().unwrap_or_else(Config::default_path);
+    let cfg_path = cli
+        .config
+        .clone()
+        .or_else(|| Config::default_path().ok())
+        .unwrap_or_default(); // chemin vide : `load`/`save` renvoient alors une erreur explicite
     let mut early_log = Vec::new();
     let cfg = match Config::load(&cfg_path) {
         Ok(c) => c,
@@ -250,25 +322,28 @@ pub fn boot(cli: Cli) -> (App, Task<Message>) {
     // En démo, le thème reste celui demandé (vue « clair ») au lieu de suivre le système.
     if !app.cli.demo {
         tasks.push(iced::system::theme().map(Message::SystemTheme));
+        // Détection (gsettings/dconf) et lecture du jeton : sorties du fil de l'interface.
+        tasks.push(Task::perform(
+            tasks::blocking(theme::detect_system_mode),
+            Message::ModeDetected,
+        ));
+        tasks.push(Task::perform(
+            tasks::blocking(|| {
+                (
+                    nixos_flakes_core::token::exists(),
+                    nixos_flakes_core::token::source(),
+                )
+            }),
+            |r| {
+                let (saved, source) = r.unwrap_or((false, TokenSource::Aucun));
+                Message::TokenLoaded(saved, source)
+            },
+        ));
     }
     tasks.push(app.open_window());
     // Un seul fetch à l'ouverture ; ensuite uniquement sur demande.
     tasks.push(app.sync_task(false));
     (app, Task::batch(tasks))
-}
-
-/// Un jeton est-il déjà enregistré ? (Jamais en démo : on ne touche pas au vrai fichier.)
-fn demo_token_saved(demo: bool) -> bool {
-    !demo && nixos_flakes_core::token::exists()
-}
-
-/// Origine du jeton ; en démo on ignore l'environnement et le vrai fichier.
-fn demo_token_source(demo: bool) -> nixos_flakes_core::token::Source {
-    if demo {
-        nixos_flakes_core::token::Source::Aucun
-    } else {
-        nixos_flakes_core::token::source()
-    }
 }
 
 /// Commande de mise à jour : tout si `inputs` est vide, sinon ces inputs seulement.
@@ -298,10 +373,16 @@ impl App {
                 cfg.set_role(&s.path, s.role);
             }
         }
+        let cfg_sys_repo = settings::system_repo_prefill(&cfg);
+        let cfg_sys_attr = cfg.system_attr.clone().unwrap_or_default();
+        let cfg_persisted = cfg.clone();
         App {
             cli,
             cfg,
             cfg_path,
+            cfg_persisted,
+            save_gen: Arc::new(AtomicU64::new(0)),
+            modal_guard_until: None,
             home: if demo {
                 Some(PathBuf::from(demo::HOME))
             } else {
@@ -312,17 +393,16 @@ impl App {
             entries: Vec::new(),
             selected: None,
             scanning: false,
+            scan_seq: 0,
             log: VecDeque::new(),
             console_open: true,
             modal: None,
+            modal_queue: VecDeque::new(),
             editor: text_editor::Content::new(),
             page: Page::Main,
             tab: Tab::Updates,
-            mode: if demo {
-                Mode::Dark
-            } else {
-                theme::detect_system_mode()
-            },
+            // Le vrai mode système est détecté hors du fil de l'interface (`ModeDetected`).
+            mode: Mode::Dark,
             window: None,
             sidebar_open: false,
             queue: VecDeque::new(),
@@ -335,9 +415,16 @@ impl App {
             terminal: None,
             terminal_error: None,
             token_input: String::new(),
-            token_saved: demo_token_saved(demo),
-            token_source: demo_token_source(demo),
+            // Lus hors du fil de l'interface au démarrage (`TokenLoaded`) ; jamais en démo.
+            token_saved: false,
+            token_source: TokenSource::Aucun,
             new_root: String::new(),
+            root_error: None,
+            sys_repo_input: cfg_sys_repo,
+            sys_attr_input: cfg_sys_attr,
+            sys_error: None,
+            token_busy: false,
+            help_open: false,
             now,
             epoch: now,
             fades: Fades::default(),
@@ -515,6 +602,9 @@ impl App {
 
     fn scan_task(&mut self) -> Task<Message> {
         self.scanning = true;
+        self.scan_seq += 1;
+        let seq = self.scan_seq;
+        let interrupted = || "analyse interrompue".to_string();
         if self.cli.demo {
             let now = unix_now();
             return Task::perform(
@@ -522,12 +612,12 @@ impl App {
                     std::thread::sleep(Duration::from_millis(900));
                     demo::statuses(now)
                 }),
-                |r| Message::ScanDone(r.unwrap_or_default()),
+                move |r| Message::ScanDone(seq, r.ok_or_else(interrupted)),
             );
         }
         let cfg = self.cfg.clone();
-        Task::perform(tasks::blocking(move || tasks::scan_all(&cfg)), |r| {
-            Message::ScanDone(r.unwrap_or_default())
+        Task::perform(tasks::blocking(move || tasks::scan_all(&cfg)), move |r| {
+            Message::ScanDone(seq, r.ok_or_else(interrupted))
         })
     }
 
@@ -537,11 +627,23 @@ impl App {
         let name = self.repo_name(repo);
         let demo_mode = self.cli.demo;
         let Some(entry) = self.entry_mut(repo) else {
+            self.push_log(
+                LogKind::Error,
+                format!("{name} : dépôt introuvable, commande ignorée."),
+            );
+            self.toast(
+                ToastKind::Error,
+                &format!("Dépôt introuvable\n{name} n'est plus dans la liste."),
+            );
             return Task::none();
         };
         if let Some(busy) = entry.busy {
-            let msg = format!("{name} : {} déjà en cours.", busy.label());
-            self.push_log(LogKind::Error, msg);
+            let what = busy.label();
+            self.push_log(LogKind::Error, format!("{name} : {what} déjà en cours."));
+            self.toast(
+                ToastKind::Error,
+                &format!("{name} est occupé\n{what} déjà en cours : réessayez ensuite."),
+            );
             return Task::none();
         }
         entry.busy = Some(kind);
@@ -590,7 +692,12 @@ impl App {
 
     fn begin_check_all(&mut self) -> Task<Message> {
         if !self.queue.is_empty() {
-            return Task::none();
+            if self.entries.iter().any(|e| e.busy == Some(JobKind::Check)) {
+                self.toast(ToastKind::Info, "Vérification déjà en cours");
+                return Task::none();
+            }
+            // File périmée (plus aucune vérification ne tourne) : on repart de zéro.
+            self.queue.clear();
         }
         self.queue = model::check_all_targets(&self.entries).into();
         if self.queue.is_empty() {
@@ -611,6 +718,16 @@ impl App {
         match model::plan_update(&entry.git) {
             UpdatePlan::Proceed => self.start_job(repo, update_job(inputs)),
             UpdatePlan::AskCommit => {
+                if self.has_dirty_modal(repo) {
+                    let name = self.repo_name(repo);
+                    self.toast(
+                        ToastKind::Info,
+                        &format!(
+                            "Demande déjà en attente\n{name} attend votre réponse au dialogue de commit."
+                        ),
+                    );
+                    return Task::none();
+                }
                 let dirty = entry.git.dirty.clone();
                 self.update_request.insert(repo.to_path_buf(), inputs);
                 self.open_modal(Modal::CommitDirty {
@@ -623,42 +740,90 @@ impl App {
         }
     }
 
+    /// Ouvre un dialogue ; s'il y en a déjà un, le nouveau attend son tour (jamais d'écrasement).
     fn open_modal(&mut self, modal: Modal) {
-        let text = match &modal {
-            Modal::CommitDirty { message, .. } | Modal::CommitLock { message, .. } => {
+        if model::enqueue_modal(&mut self.modal, &mut self.modal_queue, modal) {
+            self.show_current_modal();
+        }
+    }
+
+    /// Prépare l'affichage du dialogue courant (éditeur, animation d'entrée).
+    fn show_current_modal(&mut self) {
+        let text = match &self.modal {
+            Some(Modal::CommitDirty { message, .. } | Modal::CommitLock { message, .. }) => {
                 message.clone()
             }
+            _ => String::new(),
         };
         self.editor = text_editor::Content::with_text(&text);
-        self.modal = Some(modal);
         self.modal_leaving = None;
         self.modal_t.retarget(1.0, self.now, anim::SLOW);
         self.reset_hover();
     }
 
-    /// Ferme le dialogue (animation de sortie) et le renvoie.
+    /// Un dialogue de commit pour ce dépôt est-il ouvert ou en attente ?
+    fn has_dirty_modal(&self, repo: &Path) -> bool {
+        self.modal
+            .iter()
+            .chain(self.modal_queue.iter())
+            .any(|m| matches!(m, Modal::CommitDirty { repo: r, .. } if r == repo))
+    }
+
+    /// Ferme le dialogue (animation de sortie), le renvoie, puis affiche le suivant de la file.
     fn take_modal(&mut self) -> Option<Modal> {
         let m = self.modal.take();
         if m.is_some() {
             self.modal_leaving = m.clone();
             self.modal_t.retarget(0.0, self.now, anim::BASE);
             self.reset_hover();
+            if model::advance_modal(&mut self.modal, &mut self.modal_queue).is_some() {
+                self.show_current_modal();
+                // Garde : un double Entrée rapide ne doit pas confirmer le dialogue suivant.
+                self.modal_guard_until = Some(self.now + MODAL_ENTER_GUARD);
+            }
         }
         m
     }
 
     // -- config -------------------------------------------------------------
 
-    fn save_config(&mut self) {
+    /// Enregistre la config hors du fil de l'interface ; `ok` : toast de succès éventuel.
+    /// En démo rien n'est écrit (le toast de succès est tout de même montré).
+    fn save_config(&mut self, ok: Option<&str>) -> Task<Message> {
         if self.cli.demo {
-            return;
+            if let Some(t) = ok {
+                self.toast(ToastKind::Success, t);
+            }
+            return Task::none();
         }
-        if let Err(e) = tasks::save_config(&self.cfg, &self.cfg_path) {
-            self.push_log(
-                LogKind::Error,
-                format!("Enregistrement de la configuration impossible : {e}"),
-            );
-        }
+        let (cfg, path) = (self.cfg.clone(), self.cfg_path.clone());
+        let ok = ok.map(str::to_string);
+        let counter = Arc::clone(&self.save_gen);
+        let generation = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let snapshot = Box::new(cfg.clone());
+        Task::perform(
+            tasks::blocking(move || tasks::save_config(&counter, generation, &cfg, &path)),
+            move |r| {
+                Message::ConfigSaved(
+                    r.unwrap_or_else(|| Err("enregistrement interrompu".to_string())),
+                    ok,
+                    snapshot,
+                    generation,
+                )
+            },
+        )
+    }
+
+    /// Dépôt système effectif (configuration utilisateur, environnement, défaut système).
+    pub fn system_repo_path(&self) -> Option<PathBuf> {
+        self.cfg.system_repo_resolved().map(|r| r.path)
+    }
+
+    /// Attribut `nixosConfigurations` à appliquer pour `repo` (seulement le dépôt système).
+    fn apply_attr(&self, repo: &Path) -> Option<String> {
+        (self.cfg.role(repo) == Role::System)
+            .then(|| self.cfg.system_repo_resolved().and_then(|r| r.attr))
+            .flatten()
     }
 
     fn refresh_roles(&mut self) {
@@ -678,8 +843,24 @@ impl App {
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Rescan => self.scan_task(),
-            Message::ScanDone(fresh) => {
+            Message::ScanDone(seq, res) => {
+                if seq != self.scan_seq {
+                    // Résultat d'un scan périmé : un scan plus récent est en cours ou terminé.
+                    return Task::none();
+                }
                 self.scanning = false;
+                let fresh = match res {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Échec : on garde la liste précédente au lieu de vider les dépôts.
+                        self.push_log(LogKind::Error, format!("Scan impossible : {e}"));
+                        self.toast(
+                            ToastKind::Error,
+                            &format!("Scan impossible\n{e}\nLa liste précédente est conservée."),
+                        );
+                        return Task::none();
+                    }
+                };
                 let fresh: Vec<RepoStatus> = fresh
                     .into_iter()
                     .map(|mut s| {
@@ -769,13 +950,19 @@ impl App {
                     Err(e) => {
                         self.inputs.remove(&p);
                         self.push_log(LogKind::Error, format!("Inputs illisibles : {e}"));
+                        let name = self.repo_name(&p);
+                        self.toast(
+                            ToastKind::Error,
+                            &format!("Inputs illisibles\n{name} : {e}"),
+                        );
                     }
                 }
                 Task::none()
             }
             Message::Apply(p) => {
                 if self.actions_for(&p).apply {
-                    self.start_job(&p, Job::Apply)
+                    let attr = self.apply_attr(&p);
+                    self.start_job(&p, Job::Apply(attr))
                 } else {
                     Task::none()
                 }
@@ -787,29 +974,56 @@ impl App {
                     Task::none()
                 }
             }
+            Message::Ask(action) => self.ask(action),
             Message::Role(p, action) => {
+                let name = self.repo_name(&p);
+                if let Some(busy) = self.entry(&p).and_then(|e| e.busy) {
+                    self.toast(
+                        ToastKind::Error,
+                        &format!(
+                            "{name} est occupé\n{} en cours : changement de rôle impossible pour l'instant.",
+                            busy.label()
+                        ),
+                    );
+                    return Task::none();
+                }
                 self.cfg.set_role(&p, action.target());
-                self.save_config();
                 self.refresh_roles();
-                Task::none()
+                let ok = format!(
+                    "Rôle modifié\n{name} : {}",
+                    model::role_singular(action.target())
+                );
+                self.save_config(Some(&ok))
             }
+            Message::ModalConfirm => self.on_modal_confirm(),
             Message::Job { repo, event } => self.on_job_event(repo, event),
             Message::EditorAction(action) => {
                 self.editor.perform(action);
                 let text = self.editor.text();
-                if let Some(m) = self.modal.as_mut() {
-                    *m.message_mut() = text;
+                if let Some(msg) = self.modal.as_mut().and_then(Modal::message_mut) {
+                    *msg = text;
                 }
                 Task::none()
             }
             Message::ModalCommit => self.on_modal_commit(),
-            Message::ModalContinue => match self.take_modal() {
-                Some(Modal::CommitDirty { repo, .. }) => {
-                    let inputs = self.update_request.remove(&repo).unwrap_or_default();
-                    self.start_job(&repo, update_job(inputs))
+            Message::ModalContinue => {
+                let Some(Modal::CommitDirty { repo, .. }) = self.modal.clone() else {
+                    return Task::none();
+                };
+                match self.gate(Some(&repo)) {
+                    Gate::Wait => Task::none(),
+                    Gate::Gone => {
+                        self.take_modal();
+                        self.update_request.remove(&repo);
+                        Task::none()
+                    }
+                    Gate::Go => {
+                        self.take_modal();
+                        let inputs = self.update_request.remove(&repo).unwrap_or_default();
+                        self.start_job(&repo, update_job(inputs))
+                    }
                 }
-                _ => Task::none(),
-            },
+            }
             Message::ModalCancel => {
                 if let Some(Modal::CommitDirty { repo, .. }) = self.take_modal() {
                     self.update_request.remove(&repo);
@@ -833,8 +1047,82 @@ impl App {
             }
             Message::OpenSettings => {
                 self.page = Page::Settings;
+                self.sidebar_open = false;
                 self.restart_panel();
                 self.reset_hover();
+                Task::none()
+            }
+            Message::OpenSystemRepoSettings => {
+                self.page = Page::Settings;
+                self.sidebar_open = false;
+                self.restart_panel();
+                self.reset_hover();
+                Task::batch([
+                    iced::widget::operation::focus(SYSTEM_REPO_INPUT),
+                    Task::perform(
+                        tasks::blocking(|| std::thread::sleep(Duration::from_millis(40))),
+                        |_| Message::FocusSystemRepo,
+                    ),
+                ])
+            }
+            Message::FocusSystemRepo => iced::widget::operation::focus(SYSTEM_REPO_INPUT),
+            Message::GoMain => {
+                self.page = Page::Main;
+                self.restart_panel();
+                self.reset_hover();
+                Task::none()
+            }
+            Message::OpenHelp => {
+                self.help_open = true;
+                self.reset_hover();
+                Task::none()
+            }
+            Message::CloseHelp => {
+                self.help_open = false;
+                self.reset_hover();
+                Task::none()
+            }
+            Message::ConfigSaved(res, ok, saved, generation) => {
+                match res {
+                    Ok(written) => {
+                        if written {
+                            self.cfg_persisted = *saved;
+                        }
+                        if let Some(t) = ok {
+                            self.toast(ToastKind::Success, &t);
+                        }
+                    }
+                    Err(e) => {
+                        self.push_log(
+                            LogKind::Error,
+                            format!("Enregistrement de la configuration impossible : {e}"),
+                        );
+                        self.toast(ToastKind::Error, &format!("Enregistrement impossible\n{e}"));
+                        // L'affichage doit refléter le disque : retour à la dernière config
+                        // écrite (sauf si un enregistrement plus récent est encore en vol).
+                        if generation == self.save_gen.load(Ordering::SeqCst) {
+                            self.cfg = self.cfg_persisted.clone();
+                            self.sys_repo_input = settings::system_repo_prefill(&self.cfg);
+                            self.sys_attr_input = self.cfg.system_attr.clone().unwrap_or_default();
+                            self.sys_error = None;
+                            self.refresh_roles();
+                            return self.scan_task();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::TokenLoaded(saved, source) => {
+                self.token_saved = saved;
+                self.token_source = source;
+                Task::none()
+            }
+            Message::TokenSaved(res) => self.on_token_saved(res),
+            Message::TokenCleared(res) => self.on_token_cleared(res),
+            Message::ModeDetected(m) => {
+                if let Some(m) = m {
+                    self.set_theme_mode(m);
+                }
                 Task::none()
             }
             Message::Settings(msg) => self.on_settings(msg),
@@ -857,7 +1145,15 @@ impl App {
                 Task::none()
             }
             Message::DaemonCheckNow => {
-                if self.cli.demo || self.daemon.is_none() {
+                if self.cli.demo {
+                    self.toast(ToastKind::Info, "Mode démo : pas de démon");
+                    return Task::none();
+                }
+                if self.daemon.is_none() {
+                    self.toast(
+                        ToastKind::Error,
+                        "Démon absent\nLancez nixos-flakes daemon (ou son service), puis réessayez.",
+                    );
                     return Task::none();
                 }
                 Task::perform(daemon_link::check_now(), Message::DaemonCheckSent)
@@ -877,6 +1173,7 @@ impl App {
             Message::SyncDone(res) => self.on_sync_done(res),
             Message::OpenTerminal => {
                 self.page = Page::Terminal;
+                self.sidebar_open = false;
                 self.restart_panel();
                 self.reset_hover();
                 if self.terminal.is_none() && self.terminal_error.is_none() {
@@ -948,7 +1245,7 @@ impl App {
             Message::PaletteInput(q) => {
                 self.palette.set_query(q);
                 self.sync_palette_fades();
-                Task::none()
+                self.scroll_palette_to_selection()
             }
             Message::PaletteRun(i) => self.run_palette(i),
             Message::FocusPalette => {
@@ -968,7 +1265,7 @@ impl App {
             self.packages.set_files(demo::config_files());
             return Task::none();
         }
-        let Some(repo) = self.cfg.system_repo.clone() else {
+        let Some(repo) = self.system_repo_path() else {
             return Task::none();
         };
         self.packages.loading = true;
@@ -1024,6 +1321,12 @@ impl App {
                 self.packages.query = q;
                 Task::none()
             }
+            Msg::ClearQuery => {
+                self.packages.query.clear();
+                // Une requête vide remet aussi à zéro les résultats et l'erreur.
+                let _ = self.packages.begin_search();
+                iced::widget::operation::focus(packages::SEARCH_INPUT)
+            }
             Msg::Search => match self.packages.begin_search() {
                 Some((seq, q)) => self.packages_search_task(seq, q),
                 None => Task::none(),
@@ -1038,6 +1341,10 @@ impl App {
                     Ok(files) => self.packages.set_files(files),
                     Err(e) => {
                         self.push_log(LogKind::Error, format!("Paquets : {e}"));
+                        self.toast(
+                            ToastKind::Error,
+                            &format!("Lecture du dépôt impossible\n{e}"),
+                        );
                         self.packages.set_load_error(e);
                     }
                 }
@@ -1098,7 +1405,10 @@ impl App {
                             "Configuration modifiée. Rien n'est appliqué.",
                         );
                     }
-                    Err(e) => self.push_log(LogKind::Error, format!("Paquets : {e}")),
+                    Err(e) => {
+                        self.push_log(LogKind::Error, format!("Paquets : {e}"));
+                        self.toast(ToastKind::Error, &format!("Écriture impossible\n{e}"));
+                    }
                 }
                 self.packages.finish_write(res);
                 if ok && !self.cli.demo {
@@ -1112,100 +1422,333 @@ impl App {
     fn on_settings(&mut self, msg: settings::Msg) -> Task<Message> {
         use settings::Msg;
         match msg {
-            Msg::InputChanged(s) => self.new_root = s,
+            Msg::InputChanged(s) => {
+                self.new_root = s;
+                self.root_error = None;
+            }
+            Msg::ClearInput => {
+                self.new_root.clear();
+                self.root_error = None;
+            }
             Msg::AddRoot => {
-                let input = std::mem::take(&mut self.new_root);
+                let input = self.new_root.clone();
                 match settings::add_root(&mut self.cfg, &input, self.home.as_deref()) {
-                    Ok(()) => {
-                        self.save_config();
-                        return self.scan_task();
+                    Ok(root) => {
+                        self.new_root.clear();
+                        self.root_error = None;
+                        let ok = format!("Racine ajoutée\n{}", root.display());
+                        return Task::batch([self.save_config(Some(&ok)), self.scan_task()]);
                     }
                     Err(e) => {
-                        self.new_root = input;
-                        self.push_log(LogKind::Error, e);
+                        // Le texte saisi est conservé ; l'erreur s'affiche sous le champ.
+                        self.push_log(LogKind::Error, format!("Racine refusée : {e}"));
+                        self.root_error = Some(e);
                     }
                 }
             }
+            Msg::AskRemoveRoot(i) => {
+                if let Some(root) = self.cfg.scan_roots.get(i).cloned() {
+                    self.open_modal(Modal::Confirm(ConfirmAction::RemoveRoot(root)));
+                }
+            }
             Msg::RemoveRoot(i) => {
+                let root = self.cfg.scan_roots.get(i).cloned();
                 if settings::remove_root(&mut self.cfg, i) {
-                    self.save_config();
-                    return self.scan_task();
+                    let ok = format!(
+                        "Racine retirée\n{}",
+                        root.map(|r| r.display().to_string()).unwrap_or_default()
+                    );
+                    return Task::batch([self.save_config(Some(&ok)), self.scan_task()]);
                 }
             }
             Msg::Depth(up) => {
                 self.cfg.scan_depth = settings::step_depth(self.cfg.scan_depth, up);
-                self.save_config();
+                let ok = format!("Profondeur de scan : {}", self.cfg.scan_depth);
+                return self.save_config(Some(&ok));
             }
             Msg::Interval(up) => {
                 self.cfg.check_interval_minutes =
                     settings::step_interval(self.cfg.check_interval_minutes, up);
-                self.save_config();
+                let ok = format!(
+                    "Intervalle de vérification : {}",
+                    settings::interval_label(self.cfg.check_interval_minutes)
+                );
+                return self.save_config(Some(&ok));
             }
             Msg::TokenInput(s) => self.token_input = s.0,
             Msg::TokenSave => return self.save_token(),
-            Msg::TokenClear => self.clear_token(),
+            Msg::TokenClear => return self.clear_token(),
             Msg::Rescan => return self.scan_task(),
+            Msg::SysRepoInput(s) => {
+                self.sys_repo_input = s;
+                self.sys_error = settings::system_form_error(
+                    &self.sys_repo_input,
+                    &self.sys_attr_input,
+                    self.home.as_deref(),
+                );
+            }
+            Msg::SysAttrInput(s) => {
+                self.sys_attr_input = s;
+                self.sys_error = settings::system_form_error(
+                    &self.sys_repo_input,
+                    &self.sys_attr_input,
+                    self.home.as_deref(),
+                );
+            }
+            Msg::SysRepoSave => {
+                match settings::apply_system_repo(
+                    &mut self.cfg,
+                    &self.sys_repo_input,
+                    &self.sys_attr_input,
+                    self.home.as_deref(),
+                ) {
+                    Ok(path) => {
+                        self.sys_error = None;
+                        self.sys_repo_input = path.display().to_string();
+                        self.refresh_roles();
+                        let ok = format!("Dépôt système enregistré\n{}", path.display());
+                        return Task::batch([self.save_config(Some(&ok)), self.scan_task()]);
+                    }
+                    Err(e) => {
+                        self.push_log(LogKind::Error, format!("Dépôt système refusé : {e}"));
+                        self.sys_error = Some(e);
+                    }
+                }
+            }
+            Msg::SysRepoReset => {
+                if settings::reset_system_repo(&mut self.cfg) {
+                    self.sys_repo_input = settings::system_repo_prefill(&self.cfg);
+                    self.sys_attr_input.clear();
+                    self.sys_error = None;
+                    self.refresh_roles();
+                    let ok = match self.cfg.system_repo_resolved() {
+                        Some(r) => format!("Dépôt système réinitialisé\n{}", r.path.display()),
+                        None => "Dépôt système réinitialisé\nAucun défaut système".to_string(),
+                    };
+                    return Task::batch([self.save_config(Some(&ok)), self.scan_task()]);
+                }
+            }
             Msg::Back => self.page = Page::Main,
         }
         Task::none()
     }
 
-    /// Enregistre le jeton saisi (la saisie est vidée dans tous les cas), puis relance une vérification.
+    /// Enregistre le jeton saisi hors du fil de l'interface. La saisie n'est vidée qu'une fois
+    /// l'enregistrement réussi (sinon l'utilisateur la perdrait sans rien voir).
     fn save_token(&mut self) -> Task<Message> {
-        let input = std::mem::take(&mut self.token_input);
-        let token = input.trim();
-        if token.is_empty() || matches!(self.token_source, TokenSource::Fichier(_)) {
+        let token = self.token_input.trim().to_string();
+        if token.is_empty()
+            || self.token_busy
+            || matches!(self.token_source, TokenSource::Fichier(_))
+        {
             return Task::none();
         }
         if self.cli.demo {
+            self.token_input.clear();
             self.toast(ToastKind::Info, "Mode démo : jeton non enregistré");
             return Task::none();
         }
-        match nixos_flakes_core::token::save(token) {
+        self.token_busy = true;
+        Task::perform(
+            tasks::blocking(move || {
+                nixos_flakes_core::token::save(&token).map_err(|e| e.to_string())
+            }),
+            |r| Message::TokenSaved(r.unwrap_or_else(|| Err("enregistrement interrompu".into()))),
+        )
+    }
+
+    fn on_token_saved(&mut self, res: Result<(), String>) -> Task<Message> {
+        self.token_busy = false;
+        match res {
             Ok(()) => {
+                self.token_input.clear();
                 self.token_saved = true;
                 self.token_source = TokenSource::Interface;
                 self.push_log(LogKind::Success, "Jeton GitHub enregistré.");
-                return self.begin_check_all();
+                self.toast(ToastKind::Success, "Jeton GitHub enregistré");
+                self.begin_check_all()
             }
-            Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non enregistré : {e}")),
+            Err(e) => {
+                self.push_log(LogKind::Error, format!("Jeton GitHub non enregistré : {e}"));
+                self.toast(
+                    ToastKind::Error,
+                    &format!("Jeton non enregistré\n{e}\nVotre saisie est conservée."),
+                );
+                Task::none()
+            }
+        }
+    }
+
+    fn clear_token(&mut self) -> Task<Message> {
+        self.token_input.clear();
+        if self.token_busy
+            || matches!(
+                self.token_source,
+                TokenSource::Fichier(_) | TokenSource::Systeme { .. }
+            )
+        {
+            return Task::none();
+        }
+        if self.cli.demo {
+            self.token_saved = false;
+            self.toast(ToastKind::Success, "Jeton GitHub effacé");
+            return Task::none();
+        }
+        self.token_busy = true;
+        Task::perform(
+            tasks::blocking(|| {
+                nixos_flakes_core::token::clear().map_err(|e| e.to_string())?;
+                // Le fichier système peut reprendre le relais une fois le jeton effacé.
+                Ok((
+                    nixos_flakes_core::token::exists(),
+                    nixos_flakes_core::token::source(),
+                ))
+            }),
+            |r| Message::TokenCleared(r.unwrap_or_else(|| Err("effacement interrompu".into()))),
+        )
+    }
+
+    fn on_token_cleared(&mut self, res: Result<(bool, TokenSource), String>) -> Task<Message> {
+        self.token_busy = false;
+        match res {
+            Ok((saved, source)) => {
+                self.token_saved = saved;
+                self.token_source = source;
+                self.push_log(LogKind::Info, "Jeton GitHub effacé.");
+                self.toast(ToastKind::Success, "Jeton GitHub effacé");
+            }
+            Err(e) => {
+                self.push_log(LogKind::Error, format!("Jeton GitHub non effacé : {e}"));
+                self.toast(ToastKind::Error, &format!("Jeton non effacé\n{e}"));
+            }
         }
         Task::none()
     }
 
-    fn clear_token(&mut self) {
-        self.token_input.clear();
-        if matches!(
-            self.token_source,
-            TokenSource::Fichier(_) | TokenSource::Systeme { .. }
-        ) {
-            return;
-        }
-        if self.cli.demo {
-            self.token_saved = false;
-            return;
-        }
-        match nixos_flakes_core::token::clear() {
-            Ok(()) => {
-                // Le fichier système peut reprendre le relais une fois le jeton effacé.
-                self.token_saved = nixos_flakes_core::token::exists();
-                self.token_source = nixos_flakes_core::token::source();
-                self.push_log(LogKind::Info, "Jeton GitHub effacé.");
+    /// Le dépôt visé peut-il recevoir une commande maintenant ? Sinon, refus visible (toast) :
+    /// `Wait` = occupé (le dialogue reste ouvert), `Gone` = dépôt disparu (le dialogue se ferme).
+    fn gate(&mut self, repo: Option<&Path>) -> Gate {
+        let Some(repo) = repo else {
+            return Gate::Go;
+        };
+        let name = self.repo_name(repo);
+        match self.entry(repo).map(|e| e.busy) {
+            None => {
+                self.toast(
+                    ToastKind::Error,
+                    &format!("Dépôt introuvable\n{name} n'est plus dans la liste."),
+                );
+                Gate::Gone
             }
-            Err(e) => self.push_log(LogKind::Error, format!("Jeton GitHub non effacé : {e}")),
+            Some(Some(busy)) => {
+                self.toast(
+                    ToastKind::Error,
+                    &format!(
+                        "{name} est occupé\n{} en cours : réessayez quand elle sera terminée.",
+                        busy.label()
+                    ),
+                );
+                Gate::Wait
+            }
+            Some(None) => Gate::Go,
+        }
+    }
+
+    /// Demande une action lourde : confirmation par dialogue, sauf changement de rôle anodin.
+    fn ask(&mut self, action: ConfirmAction) -> Task<Message> {
+        let allowed = match &action {
+            ConfirmAction::Apply(p) => self.actions_for(p).apply,
+            ConfirmAction::Push(p) => self.actions_for(p).push,
+            ConfirmAction::Role(p, _) => self.entry(p).is_none_or(|e| e.busy.is_none()),
+            ConfirmAction::RemoveRoot(_) => true,
+        };
+        if !allowed {
+            // Occupé : le refus est expliqué ; sinon l'action n'est simplement pas disponible.
+            if let Some(busy) = action
+                .repo()
+                .and_then(|p| self.entry(p))
+                .and_then(|e| e.busy)
+            {
+                let name = self.repo_name(action.repo().unwrap_or(Path::new("")));
+                self.toast(
+                    ToastKind::Error,
+                    &format!(
+                        "{name} est occupé\n{} en cours : réessayez ensuite.",
+                        busy.label()
+                    ),
+                );
+            }
+            return Task::none();
+        }
+        if let ConfirmAction::Role(p, a) = &action {
+            if !a.needs_confirm() {
+                return self.update_inner(Message::Role(p.clone(), *a));
+            }
+        }
+        self.open_modal(Modal::Confirm(action));
+        Task::none()
+    }
+
+    /// Valide le dialogue de confirmation et exécute l'action.
+    fn on_modal_confirm(&mut self) -> Task<Message> {
+        let Some(Modal::Confirm(action)) = self.modal.clone() else {
+            return Task::none();
+        };
+        match self.gate(action.repo()) {
+            Gate::Wait => return Task::none(),
+            Gate::Gone => {
+                self.take_modal();
+                return Task::none();
+            }
+            Gate::Go => {}
+        }
+        self.take_modal();
+        match action {
+            ConfirmAction::Apply(p) => self.update_inner(Message::Apply(p)),
+            ConfirmAction::Push(p) => self.update_inner(Message::Push(p)),
+            ConfirmAction::Role(p, a) => self.update_inner(Message::Role(p, a)),
+            ConfirmAction::RemoveRoot(root) => {
+                match self.cfg.scan_roots.iter().position(|r| *r == root) {
+                    Some(i) => self.on_settings(settings::Msg::RemoveRoot(i)),
+                    None => Task::none(),
+                }
+            }
         }
     }
 
     fn on_modal_commit(&mut self) -> Task<Message> {
-        match self.take_modal() {
-            Some(Modal::CommitDirty { repo, message, .. }) => {
-                self.followups.insert(repo.clone(), Followup::Update);
-                self.start_job(&repo, Job::Commit(message.trim_end().to_string()))
+        let Some(modal) = self.modal.clone() else {
+            return Task::none();
+        };
+        let (repo, message, dirty) = match &modal {
+            Modal::CommitDirty { repo, message, .. } => (repo.clone(), message.clone(), true),
+            Modal::CommitLock { repo, message } => (repo.clone(), message.clone(), false),
+            Modal::Confirm(_) => return self.on_modal_confirm(),
+        };
+        if !model::commit_message_ok(&message) {
+            self.toast(
+                ToastKind::Error,
+                "Message de commit vide\nSaisissez un message pour committer.",
+            );
+            return Task::none();
+        }
+        // Occupé ou disparu : refus visible AVANT de fermer le dialogue ou de consommer la requête.
+        match self.gate(Some(&repo)) {
+            Gate::Wait => return Task::none(),
+            Gate::Gone => {
+                self.take_modal();
+                self.update_request.remove(&repo);
+                return Task::none();
             }
-            Some(Modal::CommitLock { repo, message }) => {
-                self.start_job(&repo, Job::CommitLock(message.trim_end().to_string()))
-            }
-            None => Task::none(),
+            Gate::Go => {}
+        }
+        self.take_modal();
+        let message = message.trim_end().to_string();
+        if dirty {
+            self.followups.insert(repo.clone(), Followup::Update);
+            self.start_job(&repo, Job::Commit(message))
+        } else {
+            self.start_job(&repo, Job::CommitLock(message))
         }
     }
 
@@ -1223,43 +1766,55 @@ impl App {
     fn on_finished(&mut self, repo: PathBuf, name: String, f: Finished) -> Task<Message> {
         let Finished { outcome, git } = f;
         let followup = self.followups.remove(&repo);
+        let is_check = matches!(
+            outcome,
+            Outcome::Check(_) | Outcome::Aborted(JobKind::Check, _)
+        );
         let Some(entry) = self.entry_mut(&repo) else {
-            return Task::none();
+            // Le dépôt a disparu pendant la commande : on nettoie tout et la file continue.
+            self.update_request.remove(&repo);
+            self.push_log(
+                LogKind::Info,
+                format!("{name} : dépôt disparu de la liste, résultat ignoré."),
+            );
+            return if is_check {
+                self.start_next_in_queue()
+            } else {
+                Task::none()
+            };
         };
         entry.busy = None;
         entry.git = git.clone();
         let mut next = Task::none();
         let mut logs: Vec<(LogKind, String)> = Vec::new();
-        let mut is_check = false;
         let mut modal = None;
         let mut reload_inputs = false;
+        // Une requête de mise à jour en attente d'un commit n'a plus lieu d'être.
+        let mut drop_request = false;
 
         match outcome {
-            Outcome::Check(res) => {
-                is_check = true;
-                match res {
-                    Ok(report) => {
-                        let n = report.changes.len();
-                        entry.pending = Some(report.changes);
-                        entry.error = None;
-                        logs.push((
-                            LogKind::Success,
-                            if n == 0 {
-                                format!("✓ {name} : à jour")
-                            } else {
-                                format!("✓ {name} : {n} mise(s) à jour disponible(s)")
-                            },
-                        ));
-                    }
-                    Err(e) => {
-                        entry.error = Some(e.clone());
-                        logs.push((
-                            LogKind::Error,
-                            format!("✕ {name} : vérification échouée\n{e}"),
-                        ));
-                    }
+            Outcome::Check(res) => match res {
+                Ok(report) => {
+                    let n = report.changes.len();
+                    entry.pending = Some(report.changes);
+                    entry.error = None;
+                    logs.push((
+                        LogKind::Success,
+                        if n == 0 {
+                            format!("✓ {name} : à jour")
+                        } else {
+                            format!("✓ {name} : {n} mise(s) à jour disponible(s)")
+                        },
+                    ));
                 }
-            }
+                Err(e) => {
+                    entry.error = Some(e.clone());
+                    logs.push((
+                        LogKind::Error,
+                        format!("✕ {name} : vérification échouée\n{e}"),
+                    ));
+                }
+            },
             Outcome::Update(inputs, res) => match res {
                 Ok(report) => {
                     entry.error = None;
@@ -1295,7 +1850,7 @@ impl App {
                 Ok(()) => {
                     entry.error = None;
                     let hint = if kind == JobKind::CommitLock {
-                        " — pensez à pousser (bouton Push)"
+                        " — pensez à pousser (bouton Pousser)"
                     } else {
                         ""
                     };
@@ -1310,12 +1865,25 @@ impl App {
                 }
                 Err(e) => {
                     entry.error = Some(e.clone());
+                    drop_request = kind == JobKind::Commit;
                     logs.push((
                         LogKind::Error,
                         format!("✕ {name} : {} échoué\n{e}", kind.label()),
                     ));
                 }
             },
+            Outcome::Aborted(kind, detail) => {
+                let why = Outcome::aborted_text(&detail);
+                entry.error = Some(why.clone());
+                drop_request = kind == JobKind::Commit;
+                logs.push((
+                    LogKind::Error,
+                    format!("✕ {name} : {} — {why}", kind.label()),
+                ));
+            }
+        }
+        if drop_request {
+            self.update_request.remove(&repo);
         }
 
         for (k, t) in logs {
@@ -1368,7 +1936,30 @@ impl App {
                 ));
             }
             if a.apply {
-                items.push(action(Command::Apply, "Appliquer au système", name, None));
+                items.push(action(
+                    Command::Apply,
+                    "Appliquer au système",
+                    name.clone(),
+                    Some("A"),
+                ));
+            }
+            if a.push {
+                items.push(action(Command::Push, "Pousser", name.clone(), None));
+            }
+            for (on, act, label) in [
+                (a.track, RoleAction::Track, "Suivre ce dépôt"),
+                (a.untrack, RoleAction::Untrack, "Ne plus suivre ce dépôt"),
+                (
+                    a.set_system,
+                    RoleAction::SetSystem,
+                    "Définir comme dépôt système",
+                ),
+                (a.ignore, RoleAction::Ignore, "Ignorer ce dépôt"),
+                (a.unignore, RoleAction::Unignore, "Ne plus ignorer ce dépôt"),
+            ] {
+                if on {
+                    items.push(action(Command::Role(act), label, name.clone(), None));
+                }
             }
         }
         items.push(action(
@@ -1378,7 +1969,54 @@ impl App {
             None,
         ));
         items.push(action(Command::Rescan, "Rescanner", String::new(), None));
-        items.push(action(Command::Settings, "Réglages", String::new(), None));
+        items.push(action(Command::Packages, "Paquets", String::new(), None));
+        items.push(action(Command::Terminal, "Terminal", String::new(), None));
+        items.push(action(
+            Command::Settings,
+            "Réglages",
+            String::new(),
+            Some(","),
+        ));
+        items.push(action(
+            Command::SetSystemRepo,
+            "Définir le dépôt système…",
+            String::new(),
+            None,
+        ));
+        if self.system_repo_path().is_some() && !self.cli.demo {
+            if !self.sync.busy() {
+                items.push(action(
+                    Command::SyncFetch,
+                    "Actualiser le dépôt système (fetch)",
+                    String::new(),
+                    None,
+                ));
+            }
+            let failed = matches!(self.sync, SyncState::Failed(_));
+            let behind = matches!(&self.sync, SyncState::Ready(s) if s.behind > 0);
+            if (behind || failed) && !self.sync.busy() {
+                items.push(action(
+                    Command::SyncPull,
+                    "Synchroniser le dépôt système (pull)",
+                    String::new(),
+                    None,
+                ));
+            }
+        }
+        if self.daemon.as_ref().is_some_and(|d| !d.checking) {
+            items.push(action(
+                Command::DaemonCheck,
+                "Vérifier via le démon",
+                String::new(),
+                None,
+            ));
+        }
+        items.push(action(
+            Command::Help,
+            "Raccourcis clavier",
+            String::new(),
+            Some("?"),
+        ));
         items.push(action(
             Command::ToggleConsole,
             if self.console_open {
@@ -1404,15 +2042,13 @@ impl App {
         items
     }
 
-    /// Lignes visibles de la palette pour la saisie courante.
+    /// Lignes de la palette pour la saisie courante (toutes : la liste défile).
     pub fn palette_results(&self) -> Vec<palette::Item> {
-        let mut r = palette::filter(&self.palette_items(), &self.palette.query);
-        r.truncate(PALETTE_ROWS);
-        r
+        palette::filter(&self.palette_items(), &self.palette.query)
     }
 
     fn open_palette(&mut self) -> Task<Message> {
-        if self.modal.is_some() {
+        if self.modal.is_some() || self.help_open {
             return Task::none();
         }
         self.palette.reset();
@@ -1433,11 +2069,32 @@ impl App {
 
     /// Met en surbrillance (en fondu) la ligne sélectionnée de la palette.
     fn sync_palette_fades(&mut self) {
-        for i in 0..PALETTE_ROWS {
+        // Toutes les lignes possibles (la liste n'est plus tronquée).
+        for i in 0..self.palette_items().len().max(1) {
             let on = f32::from(u8::from(i == self.palette.selected));
             self.fades
                 .set(&format!("sel:pal:{i}"), on, 0.0, self.now, anim::FAST);
         }
+    }
+
+    /// Fait défiler la liste de la palette pour garder la ligne sélectionnée visible.
+    fn scroll_palette_to_selection(&self) -> Task<Message> {
+        let results = self.palette_results();
+        let sel = self.palette.selected.min(results.len().saturating_sub(1));
+        let headings = self.palette.query.trim().is_empty();
+        let mut top = sel as f32 * PALETTE_ROW_H;
+        if headings {
+            // « Actions » en tête, puis « Dépôts » avant le premier dépôt.
+            top += PALETTE_HEADING_H;
+            if results.iter().take(sel + 1).any(|i| i.is_repo) {
+                top += PALETTE_HEADING_H;
+            }
+        }
+        let y = (top - PALETTE_LIST_HEIGHT / 2.0 + PALETTE_ROW_H / 2.0).max(0.0);
+        iced::widget::operation::scroll_to(
+            PALETTE_LIST,
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y },
+        )
     }
 
     fn close_palette(&mut self) {
@@ -1460,28 +2117,50 @@ impl App {
             Command::Goto(p) => Some(Message::Select(p)),
             Command::Check => selected.map(Message::Check),
             Command::Update => selected.map(Message::Update),
-            Command::Apply => selected.map(Message::Apply),
+            Command::Apply => selected.map(|p| Message::Ask(ConfirmAction::Apply(p))),
+            Command::Push => selected.map(|p| Message::Ask(ConfirmAction::Push(p))),
+            Command::Role(a) => selected.map(|p| Message::Ask(ConfirmAction::Role(p, a))),
             Command::CheckAll => Some(Message::CheckAll),
             Command::Rescan => Some(Message::Rescan),
             Command::Settings => Some(Message::OpenSettings),
+            Command::SetSystemRepo => Some(Message::OpenSystemRepoSettings),
+            Command::Packages => Some(Message::Packages(packages::Msg::Open)),
+            Command::Terminal => Some(Message::OpenTerminal),
             Command::ToggleConsole => Some(Message::ToggleConsole),
+            Command::SyncPull => Some(Message::SyncPull),
+            Command::SyncFetch => Some(Message::SyncFetch),
+            Command::DaemonCheck => Some(Message::DaemonCheckNow),
+            Command::Help => Some(Message::OpenHelp),
         };
         msg.map_or_else(Task::none, |m| self.update_inner(m))
     }
 
     fn on_key(&mut self, key: &Key, mods: Modifiers, captured: bool) -> Task<Message> {
-        // Dans le terminal, toutes les touches vont au shell (Échap, Ctrl K… inclus).
-        if self.page == Page::Terminal && !self.palette_open && self.modal.is_none() {
-            return Task::none();
-        }
         let ctx = KeyContext {
             modal: self.modal.is_some(),
+            confirm: self.modal.as_ref().is_some_and(Modal::is_confirm),
             palette: self.palette_open,
+            help: self.help_open,
             settings: self.page != Page::Main,
+            packages: self.page == Page::Packages,
         };
         let Some(shortcut) = keys::resolve(key, mods, captured, ctx) else {
             return Task::none();
         };
+        // Dans le terminal, toutes les touches vont au shell, sauf Ctrl K (palette), que le
+        // terminal laisse passer (voir `terminal::spawn`) : les autres couches restent actives.
+        if self.page == Page::Terminal
+            && !self.palette_open
+            && self.modal.is_none()
+            && !self.help_open
+            && shortcut != Shortcut::OpenPalette
+        {
+            return Task::none();
+        }
+        // L'aide ne laisse passer que sa propre fermeture.
+        if self.help_open && !matches!(shortcut, Shortcut::Escape | Shortcut::Help) {
+            return Task::none();
+        }
         match shortcut {
             Shortcut::OpenPalette => {
                 if self.palette_open {
@@ -1495,15 +2174,40 @@ impl App {
                 if self.palette_open {
                     self.close_palette();
                     Task::none()
+                } else if self.help_open {
+                    self.update_inner(Message::CloseHelp)
                 } else if self.modal.is_some() {
                     self.update_inner(Message::ModalCancel)
-                } else if self.page != Page::Main {
-                    self.page = Page::Main;
-                    self.restart_panel();
-                    self.reset_hover();
+                } else if self.page == Page::Packages && self.packages.flow.is_some() {
+                    // Sur Paquets, Échap annule d'abord le flux en cours.
+                    self.packages.cancel();
                     Task::none()
+                } else if self.page != Page::Main {
+                    self.update_inner(Message::GoMain)
                 } else {
                     Task::none()
+                }
+            }
+            Shortcut::Help => {
+                if self.help_open {
+                    self.update_inner(Message::CloseHelp)
+                } else {
+                    self.update_inner(Message::OpenHelp)
+                }
+            }
+            Shortcut::OpenSettings => {
+                if self.page == Page::Settings {
+                    Task::none()
+                } else {
+                    self.update_inner(Message::OpenSettings)
+                }
+            }
+            Shortcut::FocusSearch => iced::widget::operation::focus(packages::SEARCH_INPUT),
+            Shortcut::Tab(i) => {
+                let tab = [Tab::Updates, Tab::Git, Tab::Repo].get(i).copied();
+                match tab {
+                    Some(t) if self.selected.is_some() => self.update_inner(Message::SetTab(t)),
+                    _ => Task::none(),
                 }
             }
             Shortcut::Move(d) => {
@@ -1511,12 +2215,12 @@ impl App {
                     let n = self.palette_results().len();
                     self.palette.move_by(d, n);
                     self.sync_palette_fades();
-                } else {
-                    let order = model::nav_order(&self.entries, &self.collapsed);
-                    if let Some(p) = keys::step_selection(&order, self.selected.as_deref(), d) {
-                        if self.selected.as_ref() != Some(&p) {
-                            return self.update_inner(Message::Select(p));
-                        }
+                    return self.scroll_palette_to_selection();
+                }
+                let order = model::nav_order(&self.entries, &self.collapsed);
+                if let Some(p) = keys::step_selection(&order, self.selected.as_deref(), d) {
+                    if self.selected.as_ref() != Some(&p) {
+                        return self.update_inner(Message::Select(p));
                     }
                 }
                 Task::none()
@@ -1525,6 +2229,11 @@ impl App {
                 if self.palette_open {
                     let i = self.palette.selected;
                     self.run_palette(i)
+                } else if self.modal.as_ref().is_some_and(Modal::is_confirm) {
+                    if self.modal_guard_until.is_some_and(|t| self.now < t) {
+                        return Task::none();
+                    }
+                    self.update_inner(Message::ModalConfirm)
                 } else if let Some(p) = self.selected.clone() {
                     self.update_inner(Message::Select(p))
                 } else {
@@ -1537,6 +2246,10 @@ impl App {
             },
             Shortcut::Update => match self.selected.clone() {
                 Some(p) => self.update_inner(Message::Update(p)),
+                None => Task::none(),
+            },
+            Shortcut::Apply => match self.selected.clone() {
+                Some(p) => self.update_inner(Message::Ask(ConfirmAction::Apply(p))),
                 None => Task::none(),
             },
         }
@@ -1619,7 +2332,7 @@ impl App {
         if self.cli.demo || self.sync.busy() {
             return Task::none();
         }
-        let Some(repo) = self.cfg.system_repo.clone() else {
+        let Some(repo) = self.system_repo_path() else {
             return Task::none();
         };
         self.sync = if pull {
@@ -1674,7 +2387,7 @@ impl App {
             return;
         }
         match terminal::spawn(
-            self.cfg.system_repo.as_deref(),
+            self.system_repo_path().as_deref(),
             self.home.as_deref(),
             self.mode,
         ) {
@@ -1722,9 +2435,22 @@ fn key_events(
     _window: window::Id,
 ) -> Option<Message> {
     match event {
-        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => Some(
-            Message::Key(key, modifiers, status == iced::event::Status::Captured),
-        ),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        }) => {
+            // Entrée maintenue ne doit jamais valider un dialogue à répétition.
+            if repeat && key == Key::Named(iced::keyboard::key::Named::Enter) {
+                return None;
+            }
+            Some(Message::Key(
+                key,
+                modifiers,
+                status == iced::event::Status::Captured,
+            ))
+        }
         _ => None,
     }
 }
@@ -1760,6 +2486,11 @@ mod tests {
         };
         let a = App::new(Cli::default(), cfg, d.path().join("config.toml"));
         (a, d)
+    }
+
+    /// Résultat de scan « courant » (même numéro de séquence que le dernier scan lancé).
+    fn scanned(a: &App, v: Vec<RepoStatus>) -> Message {
+        Message::ScanDone(a.scan_seq, Ok(v))
     }
 
     fn status(path: &str, git: GitState) -> RepoStatus {
@@ -1803,7 +2534,7 @@ mod tests {
         let mut s = status("/r", git);
         s.role = role;
         a.cfg.set_role(Path::new("/r"), role);
-        let _ = a.update(Message::ScanDone(vec![s]));
+        let _ = a.update(scanned(&a, vec![s]));
         (a, d)
     }
 
@@ -1811,10 +2542,13 @@ mod tests {
     fn scan_populates_and_selects_first() {
         let (mut a, _d) = app();
         a.scanning = true;
-        let _ = a.update(Message::ScanDone(vec![
-            status("/b", GitState::default()),
-            status("/a", GitState::default()),
-        ]));
+        let _ = a.update(scanned(
+            &a,
+            vec![
+                status("/b", GitState::default()),
+                status("/a", GitState::default()),
+            ],
+        ));
         assert!(!a.scanning);
         assert_eq!(a.entries.len(), 2);
         assert_eq!(a.selected.as_deref(), Some(Path::new("/a")));
@@ -1822,12 +2556,12 @@ mod tests {
 
     #[test]
     fn role_change_is_persisted_and_applied() {
-        let (mut a, d) = app();
-        let _ = a.update(Message::ScanDone(vec![status("/r", GitState::default())]));
+        let (mut a, _d) = app();
+        let _ = a.update(scanned(&a, vec![status("/r", GitState::default())]));
         let _ = a.update(Message::Role("/r".into(), RoleAction::Track));
         assert_eq!(a.entries[0].role, Role::Tracked);
-        let saved = Config::load(&d.path().join("config.toml")).unwrap();
-        assert!(saved.tracked.contains(Path::new("/r")));
+        // L'enregistrement part en arrière-plan : la config en mémoire est déjà à jour.
+        assert!(a.cfg.tracked.contains(Path::new("/r")));
         let _ = a.update(Message::Role("/r".into(), RoleAction::SetSystem));
         assert_eq!(a.entries[0].role, Role::System);
         let _ = a.update(Message::Role("/r".into(), RoleAction::Ignore));
@@ -2065,11 +2799,14 @@ mod tests {
     #[test]
     fn check_all_queues_system_and_tracked() {
         let (mut a, _d) = app();
-        let _ = a.update(Message::ScanDone(vec![
-            status("/a", GitState::default()),
-            status("/b", GitState::default()),
-            status("/c", GitState::default()),
-        ]));
+        let _ = a.update(scanned(
+            &a,
+            vec![
+                status("/a", GitState::default()),
+                status("/b", GitState::default()),
+                status("/c", GitState::default()),
+            ],
+        ));
         let _ = a.update(Message::Role("/a".into(), RoleAction::Track));
         let _ = a.update(Message::Role("/b".into(), RoleAction::SetSystem));
         let _ = a.update(Message::CheckAll);
@@ -2094,16 +2831,18 @@ mod tests {
     fn settings_changes_are_saved() {
         let (mut a, d) = app();
         let _ = a.update(Message::Settings(settings::Msg::InputChanged(
-            "/srv".into(),
+            d.path().display().to_string(),
         )));
         let _ = a.update(Message::Settings(settings::Msg::AddRoot));
         let _ = a.update(Message::Settings(settings::Msg::Depth(true)));
         let _ = a.update(Message::Settings(settings::Msg::Interval(true)));
-        let saved = Config::load(&d.path().join("config.toml")).unwrap();
-        assert_eq!(saved.scan_roots, [PathBuf::from("/srv")]);
-        assert_eq!(saved.scan_depth, 5);
-        assert_eq!(saved.check_interval_minutes, 120);
+        // L'enregistrement part en arrière-plan : on vérifie la config en mémoire (celle
+        // qui est envoyée au thread d'enregistrement).
+        assert_eq!(a.cfg.scan_roots, [d.path().to_path_buf()]);
+        assert_eq!(a.cfg.scan_depth, 5);
+        assert_eq!(a.cfg.check_interval_minutes, 120);
         assert!(a.new_root.is_empty());
+        assert!(a.scanning, "l'ajout d'une racine relance un scan");
     }
 
     #[test]
@@ -2150,11 +2889,14 @@ mod tests {
 
     fn three_repos() -> (App, tempfile::TempDir) {
         let (mut a, d) = app();
-        let _ = a.update(Message::ScanDone(vec![
-            status("/a", GitState::default()),
-            status("/b", GitState::default()),
-            status("/c", GitState::default()),
-        ]));
+        let _ = a.update(scanned(
+            &a,
+            vec![
+                status("/a", GitState::default()),
+                status("/b", GitState::default()),
+                status("/c", GitState::default()),
+            ],
+        ));
         for p in ["/a", "/b", "/c"] {
             let _ = a.update(Message::Role(p.into(), RoleAction::Track));
         }
@@ -2458,7 +3200,7 @@ mod tests {
             ..Cli::default()
         };
         let mut a = App::new(cli, Config::default(), path.clone());
-        let _ = a.update(Message::ScanDone(demo::statuses(1_700_000_000)));
+        let _ = a.update(scanned(&a, demo::statuses(1_700_000_000)));
         let roles: HashSet<Role> = a.entries.iter().map(|e| e.role).collect();
         assert_eq!(roles.len(), 4, "tous les rôles présents");
         let _ = a.update(Message::Role(a.entries[0].path.clone(), RoleAction::Ignore));
@@ -2475,9 +3217,810 @@ mod tests {
         };
         let d = tempfile::tempdir().unwrap();
         let mut a = App::new(cli, Config::default(), d.path().join("c.toml"));
-        let _ = a.update(Message::ScanDone(demo::statuses(1_700_000_000)));
+        let _ = a.update(scanned(&a, demo::statuses(1_700_000_000)));
         assert!(matches!(a.modal, Some(Modal::CommitDirty { .. })));
         assert_eq!(a.mode, Mode::Light);
         assert!(a.demo_views.is_empty(), "appliquées une seule fois");
+    }
+
+    // -- robustesse, confirmations, file de dialogues ---------------------------
+
+    fn toast_titles(a: &App) -> Vec<String> {
+        a.toasts.items().iter().map(|t| t.title.clone()).collect()
+    }
+
+    fn has_toast(a: &App, kind: ToastKind, needle: &str) -> bool {
+        a.toasts.items().iter().any(|t| {
+            t.kind == kind
+                && (t.title.contains(needle)
+                    || t.body.as_deref().is_some_and(|b| b.contains(needle)))
+        })
+    }
+
+    #[test]
+    fn role_change_shows_a_success_toast_and_busy_repos_refuse() {
+        let (mut a, _d) = with_repo(Role::Detected, GitState::default());
+        let _ = a.update(Message::Role("/r".into(), RoleAction::Track));
+        assert_eq!(a.entries[0].role, Role::Tracked);
+        // Occupé : le rôle ne change pas et le refus est visible.
+        a.entries[0].busy = Some(JobKind::Check);
+        let _ = a.update(Message::Role("/r".into(), RoleAction::Ignore));
+        assert_eq!(a.entries[0].role, Role::Tracked);
+        assert!(has_toast(&a, ToastKind::Error, "occupé"));
+        let _ = a.update(Message::Ask(ConfirmAction::Role(
+            "/r".into(),
+            RoleAction::Ignore,
+        )));
+        assert!(a.modal.is_none(), "pas de dialogue pour un dépôt occupé");
+    }
+
+    #[test]
+    fn heavy_role_changes_ask_for_confirmation_light_ones_do_not() {
+        let (mut a, _d) = with_repo(Role::Detected, GitState::default());
+        let _ = a.update(Message::Ask(ConfirmAction::Role(
+            "/r".into(),
+            RoleAction::Track,
+        )));
+        assert!(a.modal.is_none());
+        assert_eq!(a.entries[0].role, Role::Tracked, "suivre : sans dialogue");
+        let _ = a.update(Message::Ask(ConfirmAction::Role(
+            "/r".into(),
+            RoleAction::Ignore,
+        )));
+        assert_eq!(a.entries[0].role, Role::Tracked, "pas encore appliqué");
+        assert!(matches!(a.modal, Some(Modal::Confirm(_))));
+        let _ = a.update(Message::ModalCancel);
+        assert_eq!(a.entries[0].role, Role::Tracked);
+        let _ = a.update(Message::Ask(ConfirmAction::Role(
+            "/r".into(),
+            RoleAction::SetSystem,
+        )));
+        let _ = a.update(named(Named::Enter));
+        assert!(a.modal.is_none());
+        assert_eq!(a.entries[0].role, Role::System, "Entrée valide");
+    }
+
+    #[test]
+    fn apply_and_push_are_confirmed_before_running() {
+        let (mut a, _d) = with_repo(Role::System, dirty());
+        let _ = a.update(Message::Ask(ConfirmAction::Apply("/r".into())));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm(ConfirmAction::Apply(_)))
+        ));
+        assert_eq!(a.entries[0].busy, None, "rien ne part sans confirmation");
+        let _ = a.update(named(Named::Escape));
+        assert!(a.modal.is_none());
+        assert_eq!(a.entries[0].busy, None, "Échap annule");
+        let _ = a.update(key("a"));
+        assert!(matches!(a.modal, Some(Modal::Confirm(_))), "touche a");
+        let _ = a.update(Message::ModalConfirm);
+        assert_eq!(a.entries[0].busy, Some(JobKind::Apply));
+        // Push sur un dépôt libre.
+        a.entries[0].busy = None;
+        let _ = a.update(Message::Ask(ConfirmAction::Push("/r".into())));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm(ConfirmAction::Push(_)))
+        ));
+        let _ = a.update(Message::ModalConfirm);
+        assert_eq!(a.entries[0].busy, Some(JobKind::Push));
+    }
+
+    #[test]
+    fn confirmation_stays_open_with_a_toast_when_the_repo_got_busy() {
+        let (mut a, _d) = with_repo(Role::System, GitState::default());
+        let _ = a.update(Message::Ask(ConfirmAction::Apply("/r".into())));
+        a.entries[0].busy = Some(JobKind::Check);
+        let _ = a.update(Message::ModalConfirm);
+        assert!(a.modal.is_some(), "le dialogue n'est pas consommé");
+        assert!(has_toast(&a, ToastKind::Error, "occupé"));
+        assert_eq!(a.entries[0].busy, Some(JobKind::Check));
+    }
+
+    #[test]
+    fn remove_root_needs_confirmation() {
+        let (mut a, d) = app();
+        let root = d.path().to_path_buf();
+        a.cfg.scan_roots = vec![root.clone()];
+        let _ = a.update(Message::Settings(settings::Msg::AskRemoveRoot(0)));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm(ConfirmAction::RemoveRoot(_)))
+        ));
+        assert_eq!(a.cfg.scan_roots.len(), 1);
+        let _ = a.update(Message::ModalConfirm);
+        assert!(a.cfg.scan_roots.is_empty());
+        assert!(a.scanning, "rescan après retrait");
+    }
+
+    #[test]
+    fn modals_never_overwrite_each_other() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        let _ = a.update(Message::Update("/r".into()));
+        let first = a.modal.clone();
+        assert!(matches!(first, Some(Modal::CommitDirty { .. })));
+        // Un commit de flake.lock arrive pendant que le premier dialogue est ouvert.
+        a.entries[0].busy = Some(JobKind::Update);
+        let mut g = dirty();
+        g.dirty.clear();
+        g.lock_dirty = true;
+        let report = UpdateReport {
+            repo: "/r".into(),
+            changes: vec![change()],
+        };
+        let _ = a.update(finished(Outcome::Update(Vec::new(), Ok(report)), g));
+        assert_eq!(a.modal, first, "le dialogue ouvert est conservé");
+        assert_eq!(a.modal_queue.len(), 1);
+        // Après la fermeture du premier, le second apparaît.
+        let _ = a.update(Message::ModalCancel);
+        assert!(matches!(a.modal, Some(Modal::CommitLock { .. })));
+        assert!(a.modal_queue.is_empty());
+        assert!(a.editor.text().starts_with("flake.lock: update inputs"));
+        let _ = a.update(Message::ModalCancel);
+        assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn a_second_update_request_does_not_duplicate_the_commit_dialog() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        let _ = a.update(Message::UpdateInputs("/r".into(), vec!["hm".into()]));
+        let _ = a.update(Message::Update("/r".into()));
+        assert!(a.modal_queue.is_empty());
+        assert_eq!(
+            a.update_request[Path::new("/r")],
+            vec!["hm".to_string()],
+            "la requête d'origine n'est pas écrasée"
+        );
+    }
+
+    #[test]
+    fn commit_refused_when_busy_keeps_the_dialog_and_the_request() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        let _ = a.update(Message::UpdateInputs("/r".into(), vec!["hm".into()]));
+        a.entries[0].busy = Some(JobKind::Check);
+        let _ = a.update(Message::ModalCommit);
+        assert!(a.modal.is_some(), "dialogue conservé");
+        assert!(a.followups.is_empty());
+        assert_eq!(a.update_request.len(), 1);
+        assert!(has_toast(&a, ToastKind::Error, "occupé"));
+        let _ = a.update(Message::ModalContinue);
+        assert!(a.modal.is_some());
+        // Une fois libre, « continuer » fonctionne et consomme la requête.
+        a.entries[0].busy = None;
+        let _ = a.update(Message::ModalContinue);
+        assert!(a.modal.is_none());
+        assert!(a.update_request.is_empty());
+        assert_eq!(a.entries[0].busy, Some(JobKind::Update));
+    }
+
+    #[test]
+    fn commit_dialog_for_a_vanished_repo_closes_and_cleans_up() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        let _ = a.update(Message::Update("/r".into()));
+        let _ = a.update(scanned(&a, vec![]));
+        let _ = a.update(Message::ModalCommit);
+        assert!(a.modal.is_none());
+        assert!(a.update_request.is_empty() && a.followups.is_empty());
+        assert!(has_toast(&a, ToastKind::Error, "introuvable"));
+    }
+
+    #[test]
+    fn empty_commit_message_is_refused() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        let _ = a.update(Message::Update("/r".into()));
+        if let Some(m) = a.modal.as_mut().and_then(Modal::message_mut) {
+            *m = "  \n ".to_string();
+        }
+        let _ = a.update(Message::ModalCommit);
+        assert!(a.modal.is_some());
+        assert_eq!(a.entries[0].busy, None);
+        assert!(has_toast(&a, ToastKind::Error, "vide"));
+    }
+
+    #[test]
+    fn stale_scan_results_are_ignored() {
+        let (mut a, _d) = app();
+        let _ = a.update(Message::Rescan);
+        let _ = a.update(Message::Rescan);
+        assert_eq!(a.scan_seq, 2);
+        assert!(a.scanning);
+        // Le premier scan finit après le second : ignoré.
+        let _ = a.update(Message::ScanDone(
+            1,
+            Ok(vec![status("/vieux", GitState::default())]),
+        ));
+        assert!(a.entries.is_empty());
+        assert!(a.scanning, "le scan courant n'est pas terminé");
+        let _ = a.update(Message::ScanDone(
+            2,
+            Ok(vec![status("/neuf", GitState::default())]),
+        ));
+        assert!(!a.scanning);
+        assert_eq!(a.entries.len(), 1);
+        assert_eq!(a.entries[0].path, Path::new("/neuf"));
+    }
+
+    #[test]
+    fn failed_scan_keeps_the_previous_list_and_toasts() {
+        let (mut a, _d) = three_repos();
+        let _ = a.update(Message::Rescan);
+        let seq = a.scan_seq;
+        let _ = a.update(Message::ScanDone(seq, Err("analyse interrompue".into())));
+        assert_eq!(a.entries.len(), 3, "la liste n'est pas vidée");
+        assert!(!a.scanning);
+        assert!(has_toast(&a, ToastKind::Error, "Scan impossible"));
+        // Un résultat vide réel, lui, vide bien la liste.
+        let _ = a.update(Message::Rescan);
+        let seq = a.scan_seq;
+        let _ = a.update(Message::ScanDone(seq, Ok(vec![])));
+        assert!(a.entries.is_empty());
+    }
+
+    #[test]
+    fn finished_for_a_vanished_repo_still_resumes_the_check_all_queue() {
+        let (mut a, _d) = three_repos();
+        // « /gone » a disparu pendant sa vérification ; /b attend dans la file.
+        a.queue.push_back("/b".into());
+        a.followups.insert("/gone".into(), Followup::Update);
+        a.update_request.insert("/gone".into(), vec![]);
+        let report = UpdateReport {
+            repo: "/gone".into(),
+            changes: vec![],
+        };
+        let _ = a.update(Message::Job {
+            repo: "/gone".into(),
+            event: JobEvent::Finished(Box::new(Finished {
+                outcome: Outcome::Check(Ok(report)),
+                git: GitState::default(),
+            })),
+        });
+        assert_eq!(a.entries[1].busy, Some(JobKind::Check), "la file continue");
+        assert!(a.queue.is_empty());
+        assert!(a.followups.is_empty() && a.update_request.is_empty());
+    }
+
+    #[test]
+    fn a_panicked_job_reports_an_error_and_frees_the_repo() {
+        let (mut a, _d) = three_repos();
+        a.queue.push_back("/b".into());
+        a.entries[0].busy = Some(JobKind::Check);
+        let _ = a.update(Message::Job {
+            repo: "/a".into(),
+            event: JobEvent::Finished(Box::new(Finished {
+                outcome: Outcome::Aborted(JobKind::Check, "boum".into()),
+                git: GitState::default(),
+            })),
+        });
+        assert_eq!(a.entries[0].busy, None);
+        assert_eq!(
+            a.entries[0].error.as_deref(),
+            Some("tâche interrompue : boum")
+        );
+        assert_eq!(model::badge(&a.entries[0]), Badge::Error);
+        assert!(has_toast(&a, ToastKind::Error, "tâche interrompue"));
+        assert_eq!(a.entries[1].busy, Some(JobKind::Check), "file reprise");
+    }
+
+    #[test]
+    fn aborted_commit_clears_followup_and_request() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        a.entries[0].busy = Some(JobKind::Commit);
+        a.followups.insert("/r".into(), Followup::Update);
+        a.update_request.insert("/r".into(), vec![]);
+        let _ = a.update(finished(
+            Outcome::Aborted(JobKind::Commit, String::new()),
+            dirty(),
+        ));
+        assert!(a.followups.is_empty() && a.update_request.is_empty());
+        assert_eq!(a.entries[0].busy, None);
+    }
+
+    #[test]
+    fn failed_commit_clears_the_pending_update_request() {
+        let (mut a, _d) = with_repo(Role::Tracked, dirty());
+        a.entries[0].busy = Some(JobKind::Commit);
+        a.followups.insert("/r".into(), Followup::Update);
+        a.update_request.insert("/r".into(), vec!["hm".into()]);
+        let _ = a.update(finished(
+            Outcome::Done(JobKind::Commit, Err("refus".into())),
+            dirty(),
+        ));
+        assert!(a.update_request.is_empty());
+    }
+
+    #[test]
+    fn refused_jobs_are_visible_toasts() {
+        let (mut a, _d) = with_repo(Role::Tracked, GitState::default());
+        let _ = a.update(Message::Check("/r".into()));
+        let _ = a.update(Message::Check("/r".into()));
+        assert!(has_toast(&a, ToastKind::Error, "occupé"));
+        let _ = a.update(Message::Check("/absent".into()));
+        assert!(has_toast(&a, ToastKind::Error, "introuvable"));
+    }
+
+    #[test]
+    fn check_all_while_running_is_explained_and_stale_queue_is_reset() {
+        let (mut a, _d) = three_repos();
+        let _ = a.update(Message::CheckAll);
+        let _ = a.update(Message::CheckAll);
+        assert!(has_toast(&a, ToastKind::Info, "déjà en cours"));
+        // File périmée : plus rien ne tourne.
+        for e in &mut a.entries {
+            e.busy = None;
+        }
+        a.queue.push_back("/zzz".into());
+        let _ = a.update(Message::CheckAll);
+        assert_eq!(a.entries[0].busy, Some(JobKind::Check));
+        assert!(!a.queue.contains(&PathBuf::from("/zzz")));
+    }
+
+    #[test]
+    fn config_save_errors_are_toasted_and_successes_confirmed() {
+        let (mut a, _d) = app();
+        let _ = a.update(Message::ConfigSaved(
+            Err("disque plein".into()),
+            None,
+            Box::default(),
+            0,
+        ));
+        assert!(has_toast(&a, ToastKind::Error, "disque plein"));
+        assert!(a.log.iter().any(|l| l.kind == LogKind::Error));
+        let _ = a.update(Message::ConfigSaved(
+            Ok(true),
+            Some("Réglage enregistré".into()),
+            Box::default(),
+            0,
+        ));
+        assert!(has_toast(&a, ToastKind::Success, "Réglage enregistré"));
+        let _ = a.update(Message::ConfigSaved(Ok(true), None, Box::default(), 0));
+        assert_eq!(
+            a.toasts.items().len(),
+            2,
+            "pas de toast sans texte de succès"
+        );
+    }
+
+    #[test]
+    fn successful_changes_toast_a_confirmation() {
+        // En démo, aucune écriture : le toast de succès est montré tout de suite.
+        let d = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            demo: true,
+            ..Cli::default()
+        };
+        let mut a = App::new(cli, Config::default(), d.path().join("c.toml"));
+        let _ = a.update(scanned(&a, demo::statuses(1_700_000_000)));
+        let p = a.entries[0].path.clone();
+        let _ = a.update(Message::Role(p, RoleAction::Track));
+        assert!(has_toast(&a, ToastKind::Success, "Rôle modifié"));
+        let _ = a.update(Message::Settings(settings::Msg::Depth(true)));
+        assert!(has_toast(&a, ToastKind::Success, "Profondeur de scan"));
+        let _ = a.update(Message::Settings(settings::Msg::Interval(true)));
+        assert!(has_toast(&a, ToastKind::Success, "Intervalle"));
+        let _ = a.update(Message::Settings(settings::Msg::TokenClear));
+        assert!(has_toast(&a, ToastKind::Success, "effacé"));
+    }
+
+    #[test]
+    fn adding_a_root_reports_errors_under_the_field() {
+        let (mut a, d) = app();
+        let missing = d.path().join("absent");
+        let _ = a.update(Message::Settings(settings::Msg::InputChanged(
+            missing.display().to_string(),
+        )));
+        let _ = a.update(Message::Settings(settings::Msg::AddRoot));
+        assert!(a.root_error.as_deref().unwrap().contains("n'existe pas"));
+        assert!(a.cfg.scan_roots.is_empty());
+        assert!(!a.new_root.is_empty(), "la saisie est conservée");
+        // Modifier la saisie efface l'erreur.
+        let _ = a.update(Message::Settings(settings::Msg::InputChanged(
+            d.path().display().to_string(),
+        )));
+        assert!(a.root_error.is_none());
+        let _ = a.update(Message::Settings(settings::Msg::AddRoot));
+        assert_eq!(a.cfg.scan_roots, [d.path().to_path_buf()]);
+        assert!(a.new_root.is_empty() && a.root_error.is_none());
+        assert!(a.scanning);
+        // Doublon.
+        let _ = a.update(Message::Settings(settings::Msg::InputChanged(
+            d.path().display().to_string(),
+        )));
+        let _ = a.update(Message::Settings(settings::Msg::AddRoot));
+        assert!(a.root_error.as_deref().unwrap().contains("existe déjà"));
+        let _ = a.update(Message::Settings(settings::Msg::ClearInput));
+        assert!(a.new_root.is_empty() && a.root_error.is_none());
+    }
+
+    #[test]
+    fn token_save_keeps_the_input_until_it_succeeds() {
+        let (mut a, _d) = app();
+        let _ = a.update(Message::Settings(settings::Msg::TokenInput(
+            settings::Secret("ghp_x".into()),
+        )));
+        let _ = a.update(Message::Settings(settings::Msg::TokenSave));
+        assert!(a.token_busy);
+        assert_eq!(a.token_input, "ghp_x", "pas vidée avant le résultat");
+        // Un second clic pendant l'enregistrement est ignoré.
+        let _ = a.update(Message::Settings(settings::Msg::TokenSave));
+        let _ = a.update(Message::TokenSaved(Err("permission refusée".into())));
+        assert!(!a.token_busy);
+        assert_eq!(a.token_input, "ghp_x", "la saisie survit à l'échec");
+        assert!(has_toast(&a, ToastKind::Error, "permission refusée"));
+        assert!(!a.token_saved);
+        let _ = a.update(Message::TokenSaved(Ok(())));
+        assert!(a.token_input.is_empty());
+        assert!(a.token_saved && a.token_source == TokenSource::Interface);
+        assert!(has_toast(&a, ToastKind::Success, "enregistré"));
+        // Le secret ne fuit ni dans le journal ni dans les toasts.
+        assert!(!a.log.iter().any(|l| l.text.contains("ghp_x")));
+        assert!(!toast_titles(&a).iter().any(|t| t.contains("ghp_x")));
+    }
+
+    #[test]
+    fn token_clear_result_updates_state_and_toasts() {
+        let (mut a, _d) = app();
+        a.token_saved = true;
+        a.token_source = TokenSource::Interface;
+        let _ = a.update(Message::Settings(settings::Msg::TokenClear));
+        assert!(a.token_busy);
+        let _ = a.update(Message::TokenCleared(Ok((false, TokenSource::Aucun))));
+        assert!(!a.token_busy && !a.token_saved);
+        assert!(has_toast(&a, ToastKind::Success, "effacé"));
+        let _ = a.update(Message::TokenCleared(Err("verrouillé".into())));
+        assert!(has_toast(&a, ToastKind::Error, "verrouillé"));
+    }
+
+    #[test]
+    fn startup_state_comes_from_background_tasks() {
+        let (mut a, _d) = app();
+        // `App::new` ne lit ni le jeton ni les préférences système.
+        assert!(!a.token_saved && a.token_source == TokenSource::Aucun);
+        assert_eq!(a.mode, Mode::Dark);
+        let _ = a.update(Message::TokenLoaded(true, TokenSource::Interface));
+        assert!(a.token_saved);
+        let _ = a.update(Message::ModeDetected(None));
+        assert_eq!(a.mode, Mode::Dark, "détection impossible : mode inchangé");
+        let _ = a.update(Message::ModeDetected(Some(Mode::Light)));
+        assert_eq!(a.mode, Mode::Light);
+        let _ = a.update(Message::ModeDetected(None));
+        assert_eq!(a.mode, Mode::Light, "None n'écrase pas un thème déjà reçu");
+    }
+
+    #[test]
+    fn daemon_check_without_daemon_explains_itself() {
+        let (mut a, _d) = app();
+        let _ = a.update(Message::DaemonCheckNow);
+        assert!(has_toast(&a, ToastKind::Error, "Démon absent"));
+    }
+
+    #[test]
+    fn inputs_read_errors_are_toasted() {
+        let (mut a, _d) = with_repo(Role::Tracked, GitState::default());
+        let _ = a.update(Message::InputsLoaded(
+            "/r".into(),
+            Err("lock illisible".into()),
+        ));
+        assert!(has_toast(&a, ToastKind::Error, "lock illisible"));
+    }
+
+    // -- aide, palette étendue, terminal ------------------------------------------
+
+    #[test]
+    fn question_mark_opens_the_help_and_escape_closes_it() {
+        let (mut a, _d) = three_repos();
+        let _ = a.update(Message::Key(
+            Key::Character("?".into()),
+            Modifiers::SHIFT,
+            false,
+        ));
+        assert!(a.help_open);
+        // L'aide capte le clavier : j ne déplace plus la sélection, Ctrl K n'ouvre rien.
+        let _ = a.update(key("j"));
+        assert_eq!(a.selected.as_deref(), Some(Path::new("/a")));
+        let _ = a.update(ctrl_k());
+        assert!(!a.palette_open);
+        let _ = a.update(named(Named::Escape));
+        assert!(!a.help_open);
+        // Aussi depuis la palette.
+        let _ = a.update(ctrl_k());
+        let _ = a.update(Message::PaletteInput("raccourcis".into()));
+        assert_eq!(a.palette_results()[0].command, Command::Help);
+        let _ = a.update(Message::PaletteRun(0));
+        assert!(a.help_open && !a.palette_open);
+        let _ = a.update(Message::Key(
+            Key::Character("?".into()),
+            Modifiers::SHIFT,
+            false,
+        ));
+        assert!(!a.help_open, "? ferme aussi l'aide");
+    }
+
+    #[test]
+    fn palette_lists_every_command_without_truncation() {
+        let (mut a, _d) = three_repos();
+        let _ = a.update(Message::Role("/a".into(), RoleAction::SetSystem));
+        a.daemon = Some(DaemonStatus::default());
+        let _ = a.update(ctrl_k());
+        let labels: Vec<String> = a.palette_results().into_iter().map(|i| i.label).collect();
+        for want in [
+            "Vérifier",
+            "Mettre à jour",
+            "Appliquer au système",
+            "Paquets",
+            "Terminal",
+            "Réglages",
+            "Tout vérifier",
+            "Rescanner",
+            "Vérifier via le démon",
+            "Raccourcis clavier",
+            "Afficher la console",
+        ] {
+            assert!(
+                labels.iter().any(|l| l.contains(want)
+                    || (want == "Afficher la console" && l.contains("console"))),
+                "manque : {want} ({labels:?})"
+            );
+        }
+        assert!(labels
+            .iter()
+            .any(|l| l == "Ignorer ce dépôt" || l == "Ne plus suivre ce dépôt"));
+        assert!(labels.len() > 9, "plus de neuf lignes : la liste défile");
+        assert!(
+            labels.iter().any(|l| l == "c"),
+            "les dépôts suivent les actions"
+        );
+    }
+
+    #[test]
+    fn palette_role_and_navigation_commands_run() {
+        let (mut a, _d) = three_repos();
+        let _ = a.update(ctrl_k());
+        let _ = a.update(Message::PaletteInput("ignorer".into()));
+        let _ = a.update(Message::PaletteRun(0));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm(ConfirmAction::Role(_, RoleAction::Ignore)))
+        ));
+        let _ = a.update(Message::ModalCancel);
+        let _ = a.update(ctrl_k());
+        let _ = a.update(Message::PaletteInput("paquets".into()));
+        let _ = a.update(Message::PaletteRun(0));
+        assert_eq!(a.page, Page::Packages);
+        let _ = a.update(ctrl_k());
+        let _ = a.update(Message::PaletteInput("terminal".into()));
+        let _ = a.update(Message::PaletteRun(0));
+        assert_eq!(a.page, Page::Terminal);
+    }
+
+    #[test]
+    fn ctrl_k_opens_the_palette_on_the_terminal_page_other_keys_go_to_the_shell() {
+        let (mut a, _d) = three_repos();
+        a.page = Page::Terminal;
+        let _ = a.update(key("j"));
+        let _ = a.update(key("?"));
+        let _ = a.update(key("a"));
+        let _ = a.update(named(Named::Escape));
+        assert_eq!(a.selected.as_deref(), Some(Path::new("/a")));
+        assert!(!a.help_open && a.modal.is_none());
+        assert_eq!(a.page, Page::Terminal, "Échap appartient au shell");
+        let _ = a.update(ctrl_k());
+        assert!(a.palette_open);
+        let _ = a.update(named(Named::Escape));
+        assert!(!a.palette_open);
+        assert_eq!(a.page, Page::Terminal);
+    }
+
+    #[test]
+    fn new_shortcuts_drive_tabs_and_settings() {
+        let (mut a, _d) = three_repos();
+        let _ = a.update(key("2"));
+        assert_eq!(a.tab, Tab::Git);
+        let _ = a.update(key("3"));
+        assert_eq!(a.tab, Tab::Repo);
+        let _ = a.update(key("1"));
+        assert_eq!(a.tab, Tab::Updates);
+        let _ = a.update(key(","));
+        assert_eq!(a.page, Page::Settings);
+        let _ = a.update(named(Named::Escape));
+        assert_eq!(a.page, Page::Main);
+    }
+
+    #[test]
+    fn escape_on_packages_cancels_the_flow_before_leaving() {
+        let (mut a, _d) = app();
+        a.page = Page::Packages;
+        a.packages.begin_op(packages::Op::Add {
+            name: "ripgrep".into(),
+        });
+        assert!(a.packages.flow.is_some());
+        let _ = a.update(named(Named::Escape));
+        assert!(a.packages.flow.is_none());
+        assert_eq!(a.page, Page::Packages);
+        let _ = a.update(named(Named::Escape));
+        assert_eq!(a.page, Page::Main);
+    }
+
+    #[test]
+    fn clearing_the_package_search_resets_results() {
+        let (mut a, _d) = app();
+        a.packages.query = "git".into();
+        let (seq, _) = a.packages.begin_search().unwrap();
+        a.packages.finish_search(seq, Err("hors ligne".into()));
+        assert!(a.packages.search_error.is_some());
+        let _ = a.update(Message::Packages(packages::Msg::ClearQuery));
+        assert!(a.packages.query.is_empty());
+        assert!(a.packages.search_error.is_none() && a.packages.results.is_empty());
+    }
+
+    #[test]
+    fn pages_from_the_sidebar_leave_the_narrow_sidebar() {
+        let (mut a, _d) = app();
+        a.sidebar_open = true;
+        let _ = a.update(Message::OpenSettings);
+        assert!(!a.sidebar_open);
+        a.sidebar_open = true;
+        let _ = a.update(Message::OpenTerminal);
+        assert!(!a.sidebar_open);
+        let _ = a.update(Message::GoMain);
+        assert_eq!(a.page, Page::Main);
+    }
+
+    // -- dépôt système configurable ------------------------------------------------
+
+    fn flake_dir(d: &Path, name: &str) -> PathBuf {
+        let p = d.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("flake.nix"), "{}").unwrap();
+        p
+    }
+
+    #[test]
+    fn saving_the_system_repo_persists_it_with_toast_and_attr() {
+        let (mut a, d) = app();
+        let repo = flake_dir(d.path(), "ma config");
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoInput(
+            repo.display().to_string(),
+        )));
+        let _ = a.update(Message::Settings(settings::Msg::SysAttrInput(
+            "laptop".into(),
+        )));
+        assert!(a.sys_error.is_none());
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoSave));
+        let canon = repo.canonicalize().unwrap();
+        assert_eq!(a.cfg.system_repo.as_deref(), Some(canon.as_path()));
+        assert_eq!(a.cfg.system_attr.as_deref(), Some("laptop"));
+        assert_eq!(a.system_repo_path(), Some(canon));
+        // L'écriture est asynchrone : le toast de succès arrive avec `ConfigSaved`.
+        let _ = a.update(Message::ConfigSaved(
+            Ok(true),
+            Some("Dépôt système enregistré".into()),
+            Box::default(),
+            0,
+        ));
+        assert!(has_toast(
+            &a,
+            ToastKind::Success,
+            "Dépôt système enregistré"
+        ));
+    }
+
+    #[test]
+    fn invalid_system_repo_input_shows_inline_error_and_saves_nothing() {
+        let (mut a, d) = app();
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoInput(
+            d.path().join("absent").display().to_string(),
+        )));
+        assert!(a.sys_error.as_deref().unwrap().contains("n'existe pas"));
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoSave));
+        assert!(a.cfg.system_repo.is_none());
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoInput(
+            "relatif".into(),
+        )));
+        assert!(a.sys_error.as_deref().unwrap().contains("absolu"));
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoInput(
+            d.path().display().to_string(),
+        )));
+        assert!(a.sys_error.as_deref().unwrap().contains("flake.nix"));
+    }
+
+    #[test]
+    fn reset_returns_to_the_system_default() {
+        let (mut a, d) = app();
+        let repo = flake_dir(d.path(), "depot");
+        a.cfg.system_repo = Some(repo);
+        a.cfg.system_attr = Some("x".into());
+        let _ = a.update(Message::Settings(settings::Msg::SysRepoReset));
+        assert!(a.cfg.system_repo.is_none() && a.cfg.system_attr.is_none());
+        assert!(a.sys_repo_input.is_empty() && a.sys_attr_input.is_empty());
+    }
+
+    #[test]
+    fn empty_state_and_palette_entry_lead_to_the_system_repo_setting() {
+        let (mut a, _d) = app();
+        // Palette : « Définir le dépôt système… » ouvre les réglages.
+        assert!(a
+            .palette_items()
+            .iter()
+            .any(|i| i.command == Command::SetSystemRepo));
+        let _ = a.update(Message::OpenSystemRepoSettings);
+        assert_eq!(a.page, Page::Settings);
+        // Sans dépôt système (hors machine ayant un défaut), l'écran principal propose le choix.
+        if a.system_repo_path().is_none() {
+            assert!(a.cfg.system_repo.is_none());
+        }
+    }
+
+    #[test]
+    fn apply_uses_the_system_attr_only_for_the_system_repo() {
+        let (mut a, _d) = app();
+        a.cfg.system_repo = Some("/sys".into());
+        a.cfg.system_attr = Some("laptop".into());
+        assert_eq!(a.apply_attr(Path::new("/sys")).as_deref(), Some("laptop"));
+        assert_eq!(a.apply_attr(Path::new("/autre")), None);
+    }
+
+    #[test]
+    fn failed_config_save_restores_the_persisted_state() {
+        let (mut a, _d) = app();
+        a.cfg.scan_depth = 3;
+        a.cfg_persisted = a.cfg.clone();
+        // Un réglage modifié en mémoire, puis l'écriture échoue : retour à l'état du disque.
+        a.cfg.scan_depth = 9;
+        let generation = a.save_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = a.update(Message::ConfigSaved(
+            Err("disque plein".into()),
+            None,
+            Box::new(a.cfg.clone()),
+            generation,
+        ));
+        assert_eq!(a.cfg.scan_depth, 3, "l'affichage reflète le disque");
+        assert!(has_toast(&a, ToastKind::Error, "disque plein"));
+        // Un échec périmé (un enregistrement plus récent est en vol) ne restaure rien.
+        a.cfg.scan_depth = 5;
+        let old = a.save_gen.fetch_add(2, Ordering::SeqCst) + 1;
+        let _ = a.update(Message::ConfigSaved(
+            Err("tard".into()),
+            None,
+            Box::new(a.cfg.clone()),
+            old,
+        ));
+        assert_eq!(a.cfg.scan_depth, 5);
+        // Un succès fait avancer l'état persisté.
+        let latest = a.save_gen.load(Ordering::SeqCst);
+        let _ = a.update(Message::ConfigSaved(
+            Ok(true),
+            None,
+            Box::new(a.cfg.clone()),
+            latest,
+        ));
+        assert_eq!(a.cfg_persisted.scan_depth, 5);
+    }
+
+    #[test]
+    fn enter_does_not_confirm_the_next_queued_modal_right_away() {
+        let (mut a, _d) = with_repo(Role::System, dirty());
+        a.open_modal(Modal::Confirm(ConfirmAction::Push("/r".into())));
+        a.open_modal(Modal::Confirm(ConfirmAction::Apply("/r".into())));
+        assert_eq!(a.modal_queue.len(), 1);
+        let _ = a.update(named(Named::Enter));
+        assert_eq!(a.entries[0].busy, Some(JobKind::Push));
+        assert!(
+            matches!(a.modal, Some(Modal::Confirm(ConfirmAction::Apply(_)))),
+            "le dialogue suivant est affiché"
+        );
+        // Deuxième Entrée dans le délai de garde : ignorée.
+        a.entries[0].busy = None;
+        let _ = a.update(named(Named::Enter));
+        assert!(a.modal.is_some(), "Entrée trop rapide ignorée");
+        assert_eq!(a.entries[0].busy, None);
+        // Les clics restent actifs pendant la garde.
+        let guard = a.modal_guard_until.unwrap();
+        assert!(a.now < guard);
+        // Après le délai, Entrée confirme.
+        a.now = guard + Duration::from_millis(1);
+        let _ = a.update(named(Named::Enter));
+        assert!(a.modal.is_none());
+        assert_eq!(a.entries[0].busy, Some(JobKind::Apply));
     }
 }

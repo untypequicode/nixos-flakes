@@ -77,15 +77,7 @@ pub fn write_upgrade_record(path: &Path, record: &UpgradeRecord) -> Result<()> {
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     let json = serde_json::to_string_pretty(record).map_err(|e| Error::Config(e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| Error::io(&tmp, e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| Error::io(&tmp, e))?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
+    crate::fsutil::write_atomic(path, json.as_bytes(), Some(0o644))
 }
 
 /// Lit le fichier d'état ; absent ou illisible => `None`.

@@ -1,17 +1,25 @@
 <!doctype html>
-<html>
+<html lang="fr">
     <head>
         <meta charset="utf-8" />
+        <meta name="color-scheme" content="light dark" />
         <link rel="stylesheet" href="popup.css" />
     </head>
     <body>
         <div id="header">
             <span id="title-text">Recherche...</span>
-            <button id="download-all" style="display: none">
-                Tout télécharger
-            </button>
+            <span class="header-actions">
+                <button id="refresh" type="button" title="Analyser à nouveau la page">
+                    Actualiser
+                </button>
+                <button id="download-all" type="button" hidden>
+                    Tout télécharger
+                </button>
+            </span>
         </div>
-        <div id="toolbar" style="display: none">
+        <div id="status" role="status" aria-live="polite" hidden></div>
+        <div id="notice" role="note" hidden></div>
+        <div id="toolbar" hidden>
             <label>
                 Trier :
                 <select id="sort-select">
@@ -25,7 +33,7 @@
                 <input type="number" id="min-size" min="0" step="10" placeholder="0" />
             </label>
         </div>
-        <div id="gallery">
+        <div id="gallery" aria-busy="true">
             <div id="loading" class="message">
                 Analyse de la page en cours...
             </div>

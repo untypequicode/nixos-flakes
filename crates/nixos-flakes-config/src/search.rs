@@ -2,9 +2,10 @@
 //! `nix search`, puis cache disque quand tout échoue.
 
 use crate::error::{Error, Result};
+use crate::run::{command, output_with_timeout, RunError};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Un paquet trouvé dans nixpkgs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +66,7 @@ fn resolve_backend(curl: &str) -> Backend {
 }
 
 fn fetch(curl: &str, url: &str) -> Option<String> {
-    run(curl, &["-fsSL", "-m", "15", url])
+    run(curl, &["-fsSL", "-m", "15", url], 20).ok()
 }
 
 fn script_path(html: &str) -> Option<String> {
@@ -98,33 +99,63 @@ fn parse_bundle(js: &str) -> Option<(String, String, String)> {
     Some((schema.into(), user.into(), pass.into()))
 }
 
-fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = command(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+/// Cause d'échec d'une source de recherche ; `timeout` = (programme, délai en s) si c'est un délai.
+#[derive(Debug)]
+struct Cause {
+    msg: String,
+    timeout: Option<(String, u64)>,
 }
 
-fn command(program: &str) -> Command {
-    const W: &str = "/run/wrappers/bin";
-    let path = match std::env::var("PATH") {
-        Ok(p) if p.split(':').any(|e| e == W) => p,
-        Ok(p) if !p.is_empty() => format!("{p}:{W}"),
-        _ => W.to_string(),
-    };
-    let mut c = Command::new(program);
-    c.env("PATH", path);
-    c
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl From<String> for Cause {
+    fn from(msg: String) -> Self {
+        Cause { msg, timeout: None }
+    }
+}
+
+/// Lance `program` avec un délai (en secondes) ; `Err` = cause lisible (stderr, délai…).
+fn run(program: &str, args: &[&str], timeout_secs: u64) -> std::result::Result<String, Cause> {
+    let mut cmd = command(program);
+    cmd.args(args);
+    match output_with_timeout(cmd, Duration::from_secs(timeout_secs)) {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let last = stderr
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_default()
+                .trim();
+            Err(Cause::from(if last.is_empty() {
+                format!("« {program} » a échoué ({})", o.status)
+            } else {
+                format!("« {program} » a échoué ({}) : {last}", o.status)
+            }))
+        }
+        Err(RunError::NotFound) => Err(format!("« {program} » est introuvable").into()),
+        Err(RunError::Timeout) => Err(Cause {
+            msg: format!("« {program} » : délai de {timeout_secs} s dépassé"),
+            timeout: Some((program.to_string(), timeout_secs)),
+        }),
+        Err(RunError::Io(e)) => Err(format!("« {program} » : {e}").into()),
+    }
+}
+
+/// Nombre de candidats demandés à la source : plus que `limit`, car le classement par
+/// pertinence se fait localement avant la troncature.
+fn candidates(limit: usize) -> usize {
+    limit.saturating_mul(5).clamp(50, 500)
 }
 
 fn query_body(query: &str, limit: usize) -> String {
     serde_json::json!({
-        "size": limit,
+        "size": candidates(limit),
         "query": {"bool": {
             "filter": [{"term": {"type": "package"}}],
             "must": [{"multi_match": {
@@ -136,7 +167,11 @@ fn query_body(query: &str, limit: usize) -> String {
     .to_string()
 }
 
-fn search_nixos_org(curl: &str, query: &str, limit: usize) -> Option<Vec<PackageHit>> {
+fn search_nixos_org(
+    curl: &str,
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<PackageHit>, Cause> {
     let b = resolve_backend(curl);
     let auth = format!("{}:{}", b.user, b.pass);
     let body = query_body(query, limit);
@@ -156,8 +191,9 @@ fn search_nixos_org(curl: &str, query: &str, limit: usize) -> Option<Vec<Package
             &body,
             &b.url,
         ],
+        25,
     )?;
-    parse_elastic(&out)
+    parse_elastic(&out).ok_or_else(|| "réponse de search.nixos.org illisible".to_string().into())
 }
 
 /// Lit la réponse `_search` d'Elasticsearch (`hits.hits[]._source`).
@@ -217,11 +253,32 @@ fn nix_search_args(query: &str) -> Vec<&str> {
     ]
 }
 
-fn search_nix(nix: &str, query: &str, limit: usize) -> Option<Vec<PackageHit>> {
-    let out = run(nix, &nix_search_args(query))?;
-    let mut hits = parse_nix_search(&out)?;
+fn search_nix(nix: &str, query: &str) -> std::result::Result<Vec<PackageHit>, Cause> {
+    let out = run(nix, &nix_search_args(query), 180)?;
+    parse_nix_search(&out).ok_or_else(|| "sortie de « nix search » illisible".to_string().into())
+}
+
+/// Rang de pertinence : 0 = attribut identique à la requête, 1 = préfixe, 2 = sous-chaîne
+/// (attribut ou nom), 3 = le reste (description).
+fn relevance(hit: &PackageHit, query: &str) -> u8 {
+    let q = query.trim().to_lowercase();
+    let attr = hit.attr.to_lowercase();
+    if attr == q {
+        0
+    } else if attr.starts_with(&q) {
+        1
+    } else if attr.contains(&q) || hit.name.to_lowercase().contains(&q) {
+        2
+    } else {
+        3
+    }
+}
+
+/// Classe par pertinence (puis attribut le plus court ; tri stable), puis tronque à `limit`.
+fn rank(mut hits: Vec<PackageHit>, query: &str, limit: usize) -> Vec<PackageHit> {
+    hits.sort_by_key(|h| (relevance(h, query), h.attr.len()));
     hits.truncate(limit);
-    Some(hits)
+    hits
 }
 
 /// Lit la sortie de `nix search --json` (attribut -> {pname, version, description}).
@@ -339,16 +396,27 @@ fn search_with(
     query: &str,
     limit: usize,
 ) -> Result<Vec<PackageHit>> {
-    let live = search_nixos_org(curl, query, limit).or_else(|| search_nix(nix, query, limit));
-    if let Some(hits) = live {
-        write_cache(cache, query, &hits);
-        return Ok(hits);
-    }
+    let live = match search_nixos_org(curl, query, limit) {
+        Ok(h) => Ok(h),
+        Err(e1) => search_nix(nix, query).map_err(|e2| (e1, e2)),
+    };
+    let (e1, e2) = match live {
+        Ok(hits) => {
+            let hits = rank(hits, query, limit);
+            write_cache(cache, query, &hits);
+            return Ok(hits);
+        }
+        Err(causes) => causes,
+    };
     read_cache(cache, query, limit).ok_or_else(|| {
-        Error::Search(
-            "ni search.nixos.org ni « nix search » n'ont répondu, et aucun résultat en cache"
-                .into(),
-        )
+        // Un délai dépassé reste un délai (code de sortie 5), pas une panne générique.
+        if let Some((program, secs)) = e2.timeout.clone().or_else(|| e1.timeout.clone()) {
+            return Error::Timeout { program, secs };
+        }
+        Error::Search(format!(
+            "search.nixos.org : {e1} ; nix search : {e2} ; aucun résultat en cache.\n\
+             Piste : vérifiez la connexion réseau (et que « curl » et « nix » sont installés), puis réessayez."
+        ))
     })
 }
 
@@ -413,7 +481,8 @@ mod tests {
     #[test]
     fn query_body_filters_packages() {
         let v: serde_json::Value = serde_json::from_str(&query_body("git", 5)).unwrap();
-        assert_eq!(v["size"], 5);
+        assert_eq!(v["size"], candidates(5));
+        assert!(candidates(5) >= 5);
         assert_eq!(v["query"]["bool"]["filter"][0]["term"]["type"], "package");
         assert_eq!(v["query"]["bool"]["must"][0]["multi_match"]["query"], "git");
     }
@@ -492,5 +561,52 @@ esac"#,
         assert_eq!(h.len(), 2);
         assert!(h.iter().all(|x| x.from_cache));
         assert!(search_with(&curl, &nix, &cache, "autre", 5).is_err());
+    }
+
+    fn hit(attr: &str, desc: &str) -> PackageHit {
+        PackageHit {
+            attr: attr.into(),
+            name: attr.into(),
+            version: String::new(),
+            description: desc.into(),
+            license: None,
+            from_cache: false,
+        }
+    }
+
+    #[test]
+    fn ranking_exact_then_prefix_then_substring_then_description() {
+        let hits = vec![
+            hit("other", "a tool like git"),
+            hit("libgit2", ""),
+            hit("git-lfs", ""),
+            hit("Git", ""),
+            hit("gitFull", ""),
+        ];
+        let ranked: Vec<String> = rank(hits.clone(), "git", 10)
+            .into_iter()
+            .map(|h| h.attr)
+            .collect();
+        assert_eq!(ranked, ["Git", "git-lfs", "gitFull", "libgit2", "other"]);
+        // La troncature se fait après le classement.
+        let top = rank(hits, "git", 2);
+        assert_eq!(top[0].attr, "Git");
+        assert_eq!(top.len(), 2);
+    }
+
+    #[test]
+    fn failure_message_has_causes_and_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let curl = script(
+            d.path(),
+            "bad-curl",
+            "echo 'Could not resolve host' >&2; exit 6",
+        );
+        let nix = script(d.path(), "bad-nix", "exit 1");
+        let e = search_with(&curl, &nix, &d.path().join("c"), "x", 5)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Could not resolve host"), "{e}");
+        assert!(e.contains("vérifiez la connexion réseau"), "{e}");
     }
 }

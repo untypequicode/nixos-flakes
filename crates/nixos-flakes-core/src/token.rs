@@ -155,10 +155,16 @@ pub fn source() -> Source {
     source_with(env_file(), path().ok().as_deref(), &system_path())
 }
 
+/// Le fichier du jeton de l'interface existe-t-il et contient-il un jeton (non vide) ?
+/// Cohérent avec `load_in` : un fichier vide ne compte pas comme jeton.
+fn has_own_token(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|s| !s.trim().is_empty())
+}
+
 fn source_with(env: Option<PathBuf>, own: Option<&Path>, system: &Path) -> Source {
     match env {
         Some(p) => Source::Fichier(p),
-        None if own.is_some_and(Path::is_file) => Source::Interface,
+        None if own.is_some_and(has_own_token) => Source::Interface,
         None => probe_system(system).unwrap_or(Source::Aucun),
     }
 }
@@ -167,7 +173,7 @@ fn source_with(env: Option<PathBuf>, own: Option<&Path>, system: &Path) -> Sourc
 /// l'interface, ou fichier système lisible contenant un jeton GitHub)
 pub fn exists() -> bool {
     match source() {
-        Source::Fichier(p) => p.is_file(),
+        Source::Fichier(p) => load_file(&p).is_ok_and(|t| t.is_some()),
         Source::Interface => true,
         Source::Systeme { lisible, .. } => lisible,
         Source::Aucun => false,
@@ -190,9 +196,13 @@ pub fn system_unreadable() -> Option<PathBuf> {
 pub fn load() -> Result<Option<Token>> {
     match env_file() {
         Some(p) => load_file(&p),
-        None => match load_in(&default_dir()?)? {
-            Some(t) => Ok(Some(t)),
-            None => Ok(load_system(&system_path())),
+        // HOME/XDG absents : pas de jeton d'interface, mais le fichier système reste utilisable.
+        None => match default_dir() {
+            Ok(dir) => match load_in(&dir)? {
+                Some(t) => Ok(Some(t)),
+                None => Ok(load_system(&system_path())),
+            },
+            Err(_) => Ok(load_system(&system_path())),
         },
     }
 }
@@ -275,7 +285,12 @@ pub(crate) fn load_in(dir: &Path) -> Result<Option<Token>> {
     match fs::read_to_string(&file) {
         Ok(s) => {
             let t = s.trim();
-            Ok((!t.is_empty()).then(|| Token(t.to_string())))
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                // Même validation qu'à l'enregistrement (pas de saut de ligne dans NIX_CONFIG).
+                validated(t).map(Some)
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::io(file, e)),
@@ -339,6 +354,33 @@ mod tests {
         save_in(&dir, "ghp_new").unwrap();
         assert_eq!(load_in(&dir).unwrap().unwrap().expose(), "ghp_new");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn empty_token_file_is_not_a_token() {
+        let d = tempfile::tempdir().unwrap();
+        let own = d.path().join("github-token");
+        let sys = d.path().join("access-tokens.conf");
+        fs::write(&own, "  \n").unwrap();
+        assert!(load_in(d.path()).unwrap().is_none());
+        // Un fichier vide ne masque ni ne simule un jeton : source() retombe sur le système.
+        assert_eq!(source_with(None, Some(&own), &sys), Source::Aucun);
+        fs::write(&sys, "access-tokens = github.com=ghp_sys\n").unwrap();
+        assert!(matches!(
+            source_with(None, Some(&own), &sys),
+            Source::Systeme { lisible: true, .. }
+        ));
+        fs::write(&own, "ghp_x\n").unwrap();
+        assert_eq!(source_with(None, Some(&own), &sys), Source::Interface);
+    }
+
+    #[test]
+    fn load_validates_like_save() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("github-token"), "a\nsubstituters = evil\n").unwrap();
+        assert!(load_in(d.path()).is_err());
+        fs::write(d.path().join("github-token"), "a b\n").unwrap();
+        assert!(load_in(d.path()).is_err());
     }
 
     #[test]

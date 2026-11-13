@@ -11,6 +11,10 @@ use std::time::Duration;
 
 /// Délai avant de réessayer la connexion quand le démon est absent.
 const RETRY: Duration = Duration::from_secs(5);
+/// Nombre d'essais de lecture de l'état avant de déclarer le démon absent.
+const STATUS_TRIES: u32 = 3;
+/// Pause entre deux essais de lecture.
+const STATUS_GAP: Duration = Duration::from_millis(700);
 /// Relecture périodique : détecte la disparition du démon (aucun signal n'est émis alors).
 const POLL: Duration = Duration::from_secs(15);
 
@@ -32,8 +36,8 @@ async fn session(out: &mut Sender<Option<DaemonStatus>>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let proxy = DaemonProxy::new(&conn).await.map_err(|e| e.to_string())?;
     // Absent => erreur « service inconnu » : on retombe sur le mode seul.
-    let mut last = DaemonStatus::from_json(&proxy.get_status().await.map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let mut last =
+        DaemonStatus::from_json(&get_status_tolerant(&proxy).await?).map_err(|e| e.to_string())?;
     out.send(Some(last.clone()))
         .await
         .map_err(|e| e.to_string())?;
@@ -49,12 +53,48 @@ async fn session(out: &mut Sender<Option<DaemonStatus>>) -> Result<(), String> {
                 let sig = sig.ok_or("flux de signaux terminé")?;
                 sig.args().map_err(|e| e.to_string())?.status.to_string()
             }
-            _ = poll.tick() => proxy.get_status().await.map_err(|e| e.to_string())?,
+            _ = poll.tick() => get_status_tolerant(&proxy).await?,
         };
         let status = DaemonStatus::from_json(&json).map_err(|e| e.to_string())?;
         if status != last {
             last = status.clone();
             out.send(Some(status)).await.map_err(|e| e.to_string())?;
+        }
+    }
+}
+
+// Compte les échecs consécutifs : une erreur ponctuelle (démon occupé, bus chargé) ne doit
+/// pas faire déclarer le démon absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Failures {
+    count: u32,
+    max: u32,
+}
+
+impl Failures {
+    fn new(max: u32) -> Self {
+        Failures { count: 0, max }
+    }
+
+    /// Enregistre un échec ; vrai quand il faut abandonner.
+    fn record(&mut self) -> bool {
+        self.count += 1;
+        self.count >= self.max
+    }
+}
+
+/// Lit l'état du démon en réessayant quelques fois avant d'abandonner.
+async fn get_status_tolerant(proxy: &DaemonProxy<'_>) -> Result<String, String> {
+    let mut failures = Failures::new(STATUS_TRIES);
+    loop {
+        match proxy.get_status().await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if failures.record() {
+                    return Err(e.to_string());
+                }
+                tokio::time::sleep(STATUS_GAP).await;
+            }
         }
     }
 }
@@ -117,6 +157,14 @@ mod tests {
             checking,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_single_failure_does_not_drop_the_daemon() {
+        let mut f = Failures::new(3);
+        assert!(!f.record(), "1er échec toléré");
+        assert!(!f.record(), "2e échec toléré");
+        assert!(f.record(), "3e échec : démon déclaré absent");
     }
 
     #[test]

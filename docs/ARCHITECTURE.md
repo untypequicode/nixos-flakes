@@ -26,14 +26,20 @@ Tout est synchrone. Les commandes longues prennent un callback `&mut dyn FnMut(&
 ### `config`
 ```rust
 pub struct Config {
-    pub scan_roots: Vec<PathBuf>,        // défaut: [~, /etc/nixos]
+    pub scan_roots: Vec<PathBuf>,        // défaut: [~, dépôt système par défaut s'il est hors de ~]
     pub scan_depth: u8,                  // défaut: 4
-    pub system_repo: Option<PathBuf>,    // défaut: /etc/nixos si présent
+    pub system_repo: Option<PathBuf>,    // choix de l'utilisateur ; absent : voir la résolution ci-dessous
+    pub system_attr: Option<String>,     // nixosConfigurations.<attr> ; absent : nom d'hôte
     pub tracked: BTreeSet<PathBuf>,      // dépôts suivis (hors système)
     pub ignored: BTreeSet<PathBuf>,      // ignorés définitivement
     pub check_interval_minutes: u32,     // défaut: 60
 }
 pub enum Role { System, Tracked, Detected, Ignored }
+```
+
+Résolution du dépôt système (`Config::system_repo_resolved()`, seule source de vérité ; aucun `/etc/nixos` en dur ailleurs), par priorité : (a) `system_repo` de la configuration utilisateur ; (b) variable `NIXOS_FLAKES_SYSTEM_REPO` (et `NIXOS_FLAKES_SYSTEM_ATTR`) ; (c) fichier de défauts système `/etc/nixos-flakes/config.toml` (mêmes clés `system_repo`, `system_attr`, écrit par le module NixOS ; chemin surchargeable par `NIXOS_FLAKES_SYSTEM_DEFAULTS`) ; (d) `/etc/nixos` seulement s'il contient `flake.nix`. Sinon aucun dépôt système : les commandes échouent avec la piste « nixos-flakes set-system <chemin> » ou `services.nixos-flakes.flakePath`. La provenance (`SystemRepoSource`) est affichée par `status`, `doctor` et la GUI. Les rôles sont comparés sur chemins canoniques (un lien `/etc/nixos` → `~/nixos` et sa cible désignent le même dépôt). Le dépôt système résolu est toujours listé, même hors des racines de scan.
+
+```rust
 impl Config {
     pub fn default_path() -> PathBuf;           // $XDG_CONFIG_HOME/nixos-flakes/config.toml
     pub fn load(path: &Path) -> Result<Config>; // fichier absent => Config::default()
@@ -141,11 +147,11 @@ nixos-flakes list [--all]                 dépôts (suivis par défaut ; --all =
 nixos-flakes scan                         met à jour le cache des dépôts détectés
 nixos-flakes check [PATH] [--waybar]      défaut: dépôt système
 nixos-flakes update [PATH] [--commit]     défaut: dépôt système
-nixos-flakes apply [PATH]
-nixos-flakes upgrade [PATH] [--notify]    mise à niveau automatique (utilisée par le timer systemd)
+nixos-flakes apply [PATH] [--attr NOM]
+nixos-flakes upgrade [PATH] [--attr NOM] [--notify]    mise à niveau automatique (utilisée par le timer systemd)
 nixos-flakes sync [PATH] [--check]       fetch, avance/retard, puis pull --ff-only (--check : sans pull)
 nixos-flakes track|untrack|ignore PATH    gestion des rôles
-nixos-flakes set-system PATH
+nixos-flakes set-system PATH [--attr NOM]   dépôt système (chemin relatif, ~, lien symbolique, espaces acceptés) et configuration nixosConfigurations.NOM
 nixos-flakes daemon [--gui-command CMD]   démon de session (voir plus bas)
 ```
 Codes de sortie : 0 ok, 1 erreur. `check --waybar` sort toujours 0 avec un JSON.
@@ -187,8 +193,8 @@ Options à plat sous `services.nixos-flakes` :
 
 - `enable` : démon + icône d'état (service utilisateur `nixos-flakes-daemon`, lié à `graphical-session.target`, restreint à `user` par `ConditionUser` s'il est défini) ;
 - `interval` (`null` par défaut) : si défini (`OnCalendar`), active le service root + minuteur qui exécutent `nixos-flakes upgrade --notify` ; le service a un `StateDirectory` (`/var/lib/nixos-flakes`, lisible par tous) pour le fichier d'état ;
-- `flakePath` (défaut `/etc/nixos`), `user` (utilisateur du démon et propriétaire de `flake.lock` après la mise à niveau) ;
+- `flakePath` (défaut `/etc/nixos` ; peut être n'importe où, y compris dans le dossier personnel de `user` ; écrit dans `/etc/nixos-flakes/config.toml`), `flakeAttr` (`null` : nom d'hôte ; passé au service par `--attr` et écrit dans ce fichier), `user` (utilisateur du démon et propriétaire de `flake.lock` après la mise à niveau) ;
 - `gui.enable` : installe la GUI (nécessite `enable`) et la propose dans le menu de l'icône ;
-- `systemRepo.{owner,path}` (`path` suit `flakePath` par défaut), `githubTokenFile`.
+- `systemRepo.{owner,path}` (`path` suit `flakePath` par défaut ; aucune ACL n'est posée quand `path` est dans le dossier personnel de `owner`, `safe.directory` l'est dès que `owner` ou `user` est défini), `githubTokenFile`. Le service root rend `flake.lock` et `.git/*` à leur propriétaire d'origine après chaque exécution.
 
 Alias avec avertissement : `services.nixos-auto-upgrade-custom.interval` et `services.nixos-flakes.autoUpgrade.{interval,flakePath,user}` sont renommés vers `interval`, `flakePath`, `user`. Les anciens `…enable` sont acceptés avec un avertissement : `true` sans `interval` vaut `interval = "daily"`. Pas d'alias pour l'ancien `gui.tray`.

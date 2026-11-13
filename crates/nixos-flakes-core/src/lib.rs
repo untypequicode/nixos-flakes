@@ -7,12 +7,14 @@
 pub mod config;
 pub mod daemon;
 pub mod error;
+mod fsutil;
 pub mod git;
 pub mod icon;
 pub mod lock;
 pub mod nix;
 pub mod notify;
 mod proc;
+pub mod repo_lock;
 pub mod scan;
 pub mod status;
 pub mod token;

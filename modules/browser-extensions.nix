@@ -49,6 +49,13 @@ in
       }
     ];
 
+    warnings =
+      lib.optional (!config.programs.firefox.enable)
+        "programs.image-downloader-visible.enable est actif mais programs.firefox.enable est faux : la policy ExtensionSettings n'aura aucun effet (sauf navigateur dérivé configuré à part, voir README.md)."
+      ++
+        lib.optional (!cfg.useSigned)
+          "programs.image-downloader-visible.useSigned = false : le .xpi non signé n'est accepté que par Firefox ESR/Nightly/Developer Edition avec `xpinstall.signatures.required = false` (par exemple via programs.firefox.preferences). Ce module ne force pas ce réglage.";
+
     # Garde : sans .xpi signé, c'est l'assertion ci-dessus qui s'affiche
     # (sinon l'évaluation échouerait avant, sur un attribut manquant).
     programs.firefox.policies.ExtensionSettings = lib.mkIf (!cfg.useSigned || hasSignedXpi) (

@@ -1,11 +1,14 @@
 //! Affichage : barre latérale, panneau de détail, console, dialogue, palette, toasts.
 
 use crate::anim;
-use crate::app::{App, InputSelect, LogKind, Message, Page, Tab, CONSOLE_HEIGHT};
+use crate::app::{
+    App, InputSelect, LogKind, Message, Page, Tab, CONSOLE_HEIGHT, PALETTE_LIST,
+    PALETTE_LIST_HEIGHT,
+};
 use crate::daemon_link;
 use crate::model::{
     self, badge, format_opt_date, format_relative, group_entries, role_singular, role_title,
-    short_rev, Badge, Modal, RepoEntry, RoleAction, Tone,
+    short_rev, Badge, ConfirmAction, Modal, RepoEntry, RoleAction, Tone,
 };
 use crate::packages;
 use crate::palette::Item;
@@ -81,6 +84,9 @@ impl App {
         }
         if let Some(l) = self.palette_layer(&ui) {
             layers.push(l);
+        }
+        if self.help_open {
+            layers.push(self.help_layer(&ui));
         }
         if !self.toasts.is_empty() {
             layers.push(toast_layer(&ui, &self.toasts));
@@ -322,7 +328,13 @@ impl App {
             Page::Settings => settings::view(
                 ui,
                 &self.cfg,
+                settings::SysForm {
+                    repo: &self.sys_repo_input,
+                    attr: &self.sys_attr_input,
+                    error: self.sys_error.as_deref(),
+                },
                 &self.new_root,
+                self.root_error.as_deref(),
                 &self.token_input,
                 self.token_saved,
                 &self.token_source,
@@ -330,18 +342,27 @@ impl App {
             Page::Packages => packages::view(
                 ui,
                 &self.packages,
-                self.cfg.system_repo.as_deref(),
-                self.cfg
-                    .system_repo
-                    .as_ref()
+                self.system_repo_path().as_deref(),
+                self.system_repo_path()
                     .filter(|p| self.actions_for(p).apply)
-                    .map(|p| Message::Apply(p.clone())),
+                    .map(|p| Message::Ask(ConfirmAction::Apply(p))),
             ),
             Page::Terminal => self.terminal_page(ui),
             Page::Main => match self.selected_entry() {
                 Some(e) => self.repo_detail(ui, e, narrow, width),
                 None => self.no_selection(ui, narrow),
             },
+        };
+        // Pages hors dépôt : accès au retour et, en mode étroit, à la liste des dépôts.
+        let content: Element<'_, Message> = match self.page {
+            Page::Main => content,
+            Page::Terminal => column![self.terminal_bar(ui, narrow), content]
+                .height(Fill)
+                .into(),
+            _ if narrow => column![container(self.nav_toggle(ui)).padding([10, 16]), content]
+                .height(Fill)
+                .into(),
+            _ => content,
         };
         container(
             column![
@@ -387,7 +408,7 @@ impl App {
         );
 
         let mut col = column![section_label_pad(tk, "Démon"), daemon_row].spacing(2);
-        if self.cfg.system_repo.is_some() {
+        if self.system_repo_path().is_some() {
             let failed = matches!(self.sync, SyncState::Failed(_));
             let can_pull = matches!(&self.sync, SyncState::Ready(s) if s.behind > 0) || failed;
             let tone = match &self.sync {
@@ -428,6 +449,29 @@ impl App {
         container(col).padding([8, 8]).into()
     }
 
+    /// Barre de la page Terminal : retour (le shell garde Échap) et, en mode étroit, les dépôts.
+    fn terminal_bar(&self, ui: &Ui<'_>, narrow: bool) -> Element<'_, Message> {
+        let tk = ui.tk;
+        let mut bar = row![action(
+            ui,
+            "terminal:back",
+            "← Retour",
+            Btn::Ghost,
+            None,
+            Some(Message::GoMain)
+        )]
+        .spacing(8)
+        .align_y(iced::Center);
+        if narrow {
+            bar = bar.push(self.nav_toggle(ui));
+        }
+        bar = bar
+            .push(title(tk, "Terminal", 16.0))
+            .push(space::horizontal())
+            .push(faint(tk, "Ctrl K : palette"));
+        container(bar).padding([8, 16]).into()
+    }
+
     /// Terminal intégré (shell de l'utilisateur dans le dépôt de config).
     fn terminal_page(&self, ui: &Ui<'_>) -> Element<'_, Message> {
         if let Some(term) = &self.terminal {
@@ -464,6 +508,18 @@ impl App {
                 sk = sk.push(skeleton(ui, Fill, 38.0));
             }
             Element::from(sk)
+        } else if self.system_repo_path().is_none() {
+            empty_state(
+                ui,
+                "Aucun dépôt système",
+                "Indiquez le dossier de votre configuration NixOS (celui qui contient flake.nix) : \
+                 il peut être n'importe où, par exemple ~/nixos-config ou /srv/nixos.",
+                Some((
+                    "cta:system-repo",
+                    "Choisir le dépôt système",
+                    Message::OpenSystemRepoSettings,
+                )),
+            )
         } else if self.entries.is_empty() {
             empty_state(
                 ui,
@@ -541,8 +597,8 @@ impl App {
                 "btn:apply",
                 "Appliquer",
                 Btn::Danger,
-                None,
-                msg(a.apply, Message::Apply(p.clone())),
+                Some("A"),
+                msg(a.apply, Message::Ask(ConfirmAction::Apply(p.clone()))),
             ));
         }
         buttons = buttons.push(action(
@@ -963,10 +1019,11 @@ impl App {
         col = col.push(row![action(
             ui,
             "btn:push",
-            "Push",
+            "Pousser",
             Btn::Secondary,
             None,
-            a.push.then(|| Message::Push(e.path.clone())),
+            a.push
+                .then(|| Message::Ask(ConfirmAction::Push(e.path.clone()))),
         )]);
         col.into()
     }
@@ -1011,7 +1068,7 @@ impl App {
                     label,
                     Btn::Secondary,
                     None,
-                    Some(Message::Role(p.clone(), act)),
+                    Some(Message::Ask(ConfirmAction::Role(p.clone(), act))),
                 ));
             }
         }
@@ -1128,13 +1185,22 @@ impl App {
         let tk = ui.tk;
         let card = fade_in(self.modal_card(ui, m), tk.raised, k);
         let offset = (1.0 - k) * 28.0;
+        // Un clic sur le fond annule une confirmation ; un dialogue de commit (texte saisi) reste.
+        let backdrop = if m.is_confirm() {
+            Message::ModalCancel
+        } else {
+            Message::Noop
+        };
         Some(opaque(
             mouse_area(
                 container(
-                    container(card)
-                        .padding(22)
-                        .max_width(620)
-                        .style(theme::floating(tk)),
+                    mouse_area(
+                        container(card)
+                            .padding(22)
+                            .max_width(620)
+                            .style(theme::floating(tk)),
+                    )
+                    .on_press(Message::Noop),
                 )
                 .center(Fill)
                 .padding(Padding {
@@ -1145,7 +1211,7 @@ impl App {
                 })
                 .style(theme::scrim(tk, k)),
             )
-            .on_press(Message::Noop),
+            .on_press(backdrop),
         ))
     }
 
@@ -1157,7 +1223,21 @@ impl App {
             .padding(10)
             .size(13)
             .style(theme::editor_style(tk));
-        let name = model::short_name(m.repo());
+        let name = m.repo().map(model::short_name).unwrap_or_default();
+        let can_commit = match m {
+            Modal::CommitDirty { message, .. } | Modal::CommitLock { message, .. } => {
+                model::commit_message_ok(message)
+            }
+            Modal::Confirm(_) => true,
+        };
+        let empty_hint: Element<'a, Message> = if can_commit {
+            space::vertical().height(0).into()
+        } else {
+            text("Le message du commit ne peut pas être vide.")
+                .size(12)
+                .color(tk.danger)
+                .into()
+        };
         match m {
             Modal::CommitDirty { dirty, .. } => {
                 let mut files = column![].spacing(3);
@@ -1187,6 +1267,7 @@ impl App {
                         .style(theme::outlined(tk)),
                     section_label(tk, "Message du commit"),
                     editor,
+                    empty_hint,
                     row![
                         action(ui, "m:cancel", "Annuler", Btn::Ghost, Some("Échap"), Some(Message::ModalCancel)),
                         space::horizontal(),
@@ -1204,7 +1285,7 @@ impl App {
                             "Committer puis mettre à jour",
                             Btn::Primary,
                             None,
-                            Some(Message::ModalCommit)
+                            can_commit.then_some(Message::ModalCommit)
                         ),
                     ]
                     .spacing(8),
@@ -1212,6 +1293,36 @@ impl App {
                 .spacing(12)
                 .into()
             }
+            Modal::Confirm(a) => column![
+                title(tk, a.title(), 16.0),
+                dim(tk, a.body()),
+                row![
+                    space::horizontal(),
+                    action(
+                        ui,
+                        "m:cancel",
+                        "Annuler",
+                        Btn::Ghost,
+                        Some("Échap"),
+                        Some(Message::ModalCancel)
+                    ),
+                    action(
+                        ui,
+                        "m:confirm",
+                        a.confirm_label(),
+                        if a.is_danger() {
+                            Btn::Danger
+                        } else {
+                            Btn::Primary
+                        },
+                        Some("↵"),
+                        Some(Message::ModalConfirm)
+                    ),
+                ]
+                .spacing(8),
+            ]
+            .spacing(12)
+            .into(),
             Modal::CommitLock { .. } => column![
                 title(tk, "Committer flake.lock ?", 16.0),
                 dim(
@@ -1223,6 +1334,7 @@ impl App {
                 ),
                 section_label(tk, "Message du commit"),
                 editor,
+                empty_hint,
                 row![
                     space::horizontal(),
                     action(
@@ -1239,7 +1351,7 @@ impl App {
                         "Committer flake.lock",
                         Btn::Primary,
                         None,
-                        Some(Message::ModalCommit)
+                        can_commit.then_some(Message::ModalCommit)
                     ),
                 ]
                 .spacing(8),
@@ -1247,6 +1359,53 @@ impl App {
             .spacing(12)
             .into(),
         }
+    }
+
+    // -- aide des raccourcis ------------------------------------------------------------
+
+    /// Fenêtre d'aide listant tous les raccourcis (Échap, `?` ou un clic sur le fond la ferment).
+    fn help_layer<'a>(&'a self, ui: &Ui<'_>) -> Element<'a, Message> {
+        let tk = ui.tk;
+        let mut col = column![row![
+            title(tk, "Raccourcis clavier", 16.0),
+            space::horizontal(),
+            action(
+                ui,
+                "help:close",
+                "Fermer",
+                Btn::Ghost,
+                Some("Échap"),
+                Some(Message::CloseHelp)
+            ),
+        ]
+        .align_y(iced::Center),]
+        .spacing(10);
+        for (group, docs) in crate::keys::SHORTCUT_GROUPS {
+            col = col.push(section_label(tk, group));
+            for d in *docs {
+                col = col.push(
+                    row![
+                        container(kbd(ui, d.keys, false)).width(110),
+                        dim(tk, d.what),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Center),
+                );
+            }
+        }
+        let card = container(col)
+            .padding(22)
+            .max_width(520)
+            .style(theme::floating(tk));
+        opaque(
+            mouse_area(
+                container(mouse_area(card).on_press(Message::Noop))
+                    .center(Fill)
+                    .padding(16)
+                    .style(theme::scrim(tk, 1.0)),
+            )
+            .on_press(Message::CloseHelp),
+        )
     }
 
     // -- palette ------------------------------------------------------------------------
@@ -1307,7 +1466,18 @@ impl App {
         .padding([8, 14]);
 
         let card = fade_in(
-            column![input, hairline(ui), list, hairline(ui), footer],
+            column![
+                input,
+                hairline(ui),
+                container(
+                    scrollable(list)
+                        .id(PALETTE_LIST)
+                        .style(theme::scroll_style(tk))
+                )
+                .max_height(PALETTE_LIST_HEIGHT),
+                hairline(ui),
+                footer
+            ],
             tk.raised,
             k,
         );
@@ -1486,8 +1656,8 @@ fn toast_layer<'a>(ui: &Ui<'_>, toasts: &Toasts) -> Element<'a, Message> {
             texts = texts.push(text(b.clone()).size(12).color(tk.text2));
         }
         let id = t.id;
-        let close = button(text("×").size(15).color(tk.text3))
-            .padding([0, 6])
+        let close = button(text("×").size(18).color(tk.text2))
+            .padding([2, 10])
             .style(theme::tab_style(
                 tk,
                 false,
@@ -1498,7 +1668,12 @@ fn toast_layer<'a>(ui: &Ui<'_>, toasts: &Toasts) -> Element<'a, Message> {
             row![
                 container(dot(color, 7.0)).padding([5, 0]),
                 texts,
-                hoverable(format!("toast:{id}"), close),
+                tip(
+                    ui,
+                    hoverable(format!("toast:{id}"), close),
+                    "Fermer",
+                    tooltip::Position::Left
+                ),
             ]
             .spacing(10)
             .align_y(iced::alignment::Vertical::Top),

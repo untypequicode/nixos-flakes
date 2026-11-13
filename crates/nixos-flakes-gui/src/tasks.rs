@@ -12,7 +12,9 @@ use nixos_flakes_core::nix::{self, Privilege, UpdateReport};
 use nixos_flakes_core::scan;
 use nixos_flakes_core::status::{self, RepoStatus};
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Commande demandée.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +23,8 @@ pub enum Job {
     Update,
     /// Mise à jour limitée à ces inputs racine (jamais vide : sinon `Update`).
     UpdateInputs(Vec<String>),
-    Apply,
+    /// Application ; l'attribut `nixosConfigurations.<attr>` éventuel (sinon nom d'hôte).
+    Apply(Option<String>),
     Commit(String),
     CommitLock(String),
     Push,
@@ -32,7 +35,7 @@ impl Job {
         match self {
             Job::Check => JobKind::Check,
             Job::Update | Job::UpdateInputs(_) => JobKind::Update,
-            Job::Apply => JobKind::Apply,
+            Job::Apply(_) => JobKind::Apply,
             Job::Commit(_) => JobKind::Commit,
             Job::CommitLock(_) => JobKind::CommitLock,
             Job::Push => JobKind::Push,
@@ -47,6 +50,19 @@ pub enum Outcome {
     /// Inputs demandés (vide = tous) et résultat.
     Update(Vec<String>, Result<UpdateReport, String>),
     Done(JobKind, Result<(), String>),
+    /// Le travail a paniqué ou son thread n'a pas pu démarrer (« tâche interrompue »).
+    Aborted(JobKind, String),
+}
+
+impl Outcome {
+    /// Texte d'erreur d'un travail interrompu (détail technique éventuel après les deux-points).
+    pub fn aborted_text(detail: &str) -> String {
+        if detail.trim().is_empty() {
+            "tâche interrompue".to_string()
+        } else {
+            format!("tâche interrompue : {}", detail.trim())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,9 +89,9 @@ pub fn execute(repo: &Path, job: &Job, out: &mut dyn FnMut(&str)) -> Outcome {
             names.clone(),
             nix::update_inputs(repo, names, out).map_err(s),
         ),
-        Job::Apply => Outcome::Done(
+        Job::Apply(attr) => Outcome::Done(
             JobKind::Apply,
-            nix::apply(repo, Privilege::Pkexec, out).map_err(s),
+            nix::apply(repo, attr.as_deref(), Privilege::Pkexec, out).map_err(s),
         ),
         Job::Commit(m) => Outcome::Done(JobKind::Commit, git::commit_all(repo, m, out).map_err(s)),
         Job::CommitLock(m) => Outcome::Done(
@@ -86,36 +102,73 @@ pub fn execute(repo: &Path, job: &Job, out: &mut dyn FnMut(&str)) -> Outcome {
     }
 }
 
-/// Lance `work` dans un thread ; le flux produit les lignes puis un `Finished`.
-pub fn spawn_stream<W>(repo: PathBuf, work: W) -> impl Stream<Item = JobEvent>
+/// Message d'une panique (`&str` ou `String`), vide sinon.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+/// Lance `work` dans un thread ; le flux produit les lignes puis toujours un `Finished` :
+/// si le travail panique (ou si le thread ne démarre pas), c'est `Outcome::Aborted`, pour
+/// que le dépôt ne reste jamais « occupé ».
+pub fn spawn_stream<W>(repo: PathBuf, kind: JobKind, work: W) -> impl Stream<Item = JobEvent>
 where
     W: FnOnce(&Path, &mut dyn FnMut(&str)) -> Outcome + Send + 'static,
 {
     let (tx, rx) = mpsc::unbounded();
-    std::thread::spawn(move || {
-        let line_tx = tx.clone();
-        let outcome = work(&repo, &mut |l| {
-            let _ = line_tx.unbounded_send(JobEvent::Line(l.to_string()));
+    let fail_tx = tx.clone();
+    let fail_repo = repo.clone();
+    let spawned = std::thread::Builder::new()
+        .name("flakes-job".into())
+        .spawn(move || {
+            let line_tx = tx.clone();
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                work(&repo, &mut |l| {
+                    let _ = line_tx.unbounded_send(JobEvent::Line(l.to_string()));
+                })
+            }))
+            .unwrap_or_else(|p| Outcome::Aborted(kind, panic_text(p.as_ref())));
+            let git = catch_unwind(AssertUnwindSafe(|| git::state(&repo).unwrap_or_default()))
+                .unwrap_or_default();
+            let _ = tx.unbounded_send(JobEvent::Finished(Box::new(Finished { outcome, git })));
         });
-        let git = git::state(&repo).unwrap_or_default();
-        let _ = tx.unbounded_send(JobEvent::Finished(Box::new(Finished { outcome, git })));
-    });
+    if let Err(e) = spawned {
+        let git = git::state(&fail_repo).unwrap_or_default();
+        let _ = fail_tx.unbounded_send(JobEvent::Finished(Box::new(Finished {
+            outcome: Outcome::Aborted(kind, e.to_string()),
+            git,
+        })));
+    }
     rx
 }
 
 pub fn run_job(repo: PathBuf, job: Job) -> impl Stream<Item = JobEvent> {
-    spawn_stream(repo, move |r, out| execute(r, &job, out))
+    let kind = job.kind();
+    spawn_stream(repo, kind, move |r, out| execute(r, &job, out))
 }
 
 /// Exécute une fermeture bloquante dans un thread et attend son résultat.
+/// `None` = le thread a paniqué ou n'a pas pu démarrer : à ne jamais confondre avec un
+/// résultat vide (l'appelant affiche une erreur et conserve l'état précédent).
 pub fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> impl Future<Output = Option<T>> {
     let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    async move { rx.await.ok() }
+    let spawned = std::thread::Builder::new()
+        .name("flakes-blocking".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    let ok = spawned.is_ok();
+    async move {
+        if ok {
+            rx.await.ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// Scan complet : dépôts trouvés + dépôts de la config, avec leur état git (sans `nix`).
@@ -135,9 +188,25 @@ pub fn load_inputs(repo: &Path) -> Result<Vec<nixos_flakes_core::lock::RootInput
     nix::list_inputs(repo).map_err(|e| e.to_string())
 }
 
-/// Sauvegarde la config (retourne un message d'erreur éventuel).
-pub fn save_config(cfg: &Config, path: &Path) -> Result<(), String> {
-    cfg.save(path).map_err(|e| e.to_string())
+/// Verrou : deux enregistrements successifs ne s'entrelacent pas sur le disque.
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sauvegarde la config, sauf si un enregistrement plus récent a été demandé depuis
+/// (`counter` ne vaut plus `generation`) : le verrou ne garantit pas l'ordre des threads,
+/// la génération évite qu'une ancienne version écrase la nouvelle.
+/// Renvoie `Ok(true)` si le fichier a été écrit, `Ok(false)` si l'appel était périmé.
+pub fn save_config(
+    counter: &AtomicU64,
+    generation: u64,
+    cfg: &Config,
+    path: &Path,
+) -> Result<bool, String> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if counter.load(Ordering::SeqCst) != generation {
+        return Ok(false);
+    }
+    cfg.save(path).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -157,7 +226,7 @@ mod tests {
     #[test]
     fn stream_emits_lines_then_finished() {
         let d = tempfile::tempdir().unwrap();
-        let s = spawn_stream(d.path().to_path_buf(), |_, out| {
+        let s = spawn_stream(d.path().to_path_buf(), JobKind::Push, |_, out| {
             out("un");
             out("deux");
             Outcome::Done(JobKind::Push, Ok(()))
@@ -178,6 +247,65 @@ mod tests {
     #[test]
     fn blocking_returns_value() {
         assert_eq!(block_on(blocking(|| 40 + 2)), Some(42));
+    }
+
+    #[test]
+    fn blocking_panic_is_none_not_an_empty_result() {
+        let r: Option<Vec<u8>> = block_on(blocking(|| -> Vec<u8> { panic!("boum") }));
+        assert_eq!(r, None);
+        assert_eq!(block_on(blocking(Vec::<u8>::new)), Some(vec![]));
+    }
+
+    #[test]
+    fn a_panicking_job_still_finishes_with_aborted() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spawn_stream(d.path().to_path_buf(), JobKind::Check, |_, out| {
+            out("début");
+            panic!("boum");
+        });
+        let events: Vec<JobEvent> = block_on(s.collect());
+        assert_eq!(events.len(), 2);
+        match &events[1] {
+            JobEvent::Finished(f) => match &f.outcome {
+                Outcome::Aborted(JobKind::Check, why) => assert_eq!(why, "boum"),
+                o => panic!("inattendu : {o:?}"),
+            },
+            e => panic!("inattendu : {e:?}"),
+        }
+    }
+
+    #[test]
+    fn aborted_text_mentions_the_interruption() {
+        assert_eq!(Outcome::aborted_text(""), "tâche interrompue");
+        assert_eq!(Outcome::aborted_text(" boum "), "tâche interrompue : boum");
+    }
+
+    #[test]
+    fn config_save_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        let cfg = Config {
+            scan_depth: 7,
+            ..Config::default()
+        };
+        let counter = AtomicU64::new(1);
+        assert_eq!(save_config(&counter, 1, &cfg, &p), Ok(true));
+        assert_eq!(Config::load(&p).unwrap().scan_depth, 7);
+    }
+
+    #[test]
+    fn stale_config_save_never_overwrites_a_newer_one() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        let with_depth = |scan_depth| Config {
+            scan_depth,
+            ..Config::default()
+        };
+        let counter = AtomicU64::new(2);
+        // Le deuxième enregistrement passe en premier ; le premier arrive en retard.
+        assert_eq!(save_config(&counter, 2, &with_depth(8), &p), Ok(true));
+        assert_eq!(save_config(&counter, 1, &with_depth(3), &p), Ok(false));
+        assert_eq!(Config::load(&p).unwrap().scan_depth, 8);
     }
 
     #[test]

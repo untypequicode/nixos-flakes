@@ -3,17 +3,25 @@
 mod cli;
 mod commands;
 mod daemon;
+mod dbus;
+mod doctor;
+mod failure;
 mod pkg;
+mod report;
+mod ui;
 
-use clap::Parser;
+use clap::FromArgMatches;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match commands::run(cli::Cli::parse()) {
+    // Erreur d'usage : clap affiche le message et sort avec le code 2.
+    let matches = cli::command().get_matches();
+    let cli = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    match commands::run(cli) {
         Ok(code) => code,
-        Err(message) => {
-            eprintln!("erreur : {message}");
-            ExitCode::FAILURE
+        Err(failure) => {
+            eprintln!("{}", failure.render());
+            failure.exit_code()
         }
     }
 }

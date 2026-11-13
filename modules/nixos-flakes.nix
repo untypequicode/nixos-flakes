@@ -11,7 +11,32 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   inherit (lib) mkOption mkEnableOption types;
 
+  # Chemin absolu en `str` (et non `path`) : un chemin d'exécution ne doit pas être copié dans le store.
+  absPath = types.strMatching "/.*";
+
+  hasUser = name: config.users.users ? ${name};
+
   guiExe = lib.getExe' cfg.guiPackage "nixos-flakes-gui";
+
+  # Le dépôt système est dans le dossier personnel de son propriétaire déclaré : il lui appartient
+  # déjà, inutile d'y poser une ACL.
+  ownerHome =
+    if cfg.systemRepo.owner != null && hasUser cfg.systemRepo.owner then
+      config.users.users.${cfg.systemRepo.owner}.home
+    else
+      null;
+  repoOwnedByOwner =
+    ownerHome != null
+    && ownerHome != ""
+    && lib.hasPrefix "${lib.removeSuffix "/" ownerHome}/" cfg.systemRepo.path;
+
+  # Défauts système lus par la CLI, le démon et l'interface (mêmes clés que le config.toml utilisateur).
+  systemDefaults = ''
+    system_repo = ${builtins.toJSON cfg.flakePath}
+  ''
+  + lib.optionalString (cfg.flakeAttr != null) ''
+    system_attr = ${builtins.toJSON cfg.flakeAttr}
+  '';
 
   # Anciens `enable` (booléens) : la mise à niveau automatique s'active désormais
   # en donnant une valeur à `services.nixos-flakes.interval`.
@@ -105,9 +130,28 @@ in
     };
 
     flakePath = mkOption {
-      type = types.str;
+      type = absPath;
       default = "/etc/nixos";
-      description = "Chemin du dépôt système (dépôt flake de la configuration NixOS).";
+      example = "/home/alice/nixos-config";
+      description = ''
+        Chemin absolu du dépôt système (dépôt flake de la configuration NixOS). Il peut se
+        trouver n'importe où, par exemple dans le dossier personnel de `user` ou sous `/srv`.
+        Il est écrit dans `/etc/nixos-flakes/config.toml`, lu par la CLI, le démon et l'interface
+        comme défaut système (une valeur choisie par l'utilisateur dans sa configuration prime).
+        Si le flake est dans un sous-dossier d'un dépôt git qui appartient à un autre
+        utilisateur que root, ajoutez aussi la racine du dépôt à `programs.git.config.safe.directory`.
+      '';
+    };
+
+    flakeAttr = mkOption {
+      type = types.nullOr (types.strMatching "[A-Za-z0-9_][A-Za-z0-9._-]*");
+      default = null;
+      example = "laptop";
+      description = ''
+        Nom de la configuration `nixosConfigurations.<nom>` à appliquer. `null` : le nom
+        d'hôte de la machine (comportement de `nixos-rebuild`). Transmis à la mise à niveau
+        automatique (`--attr`) et écrit dans `/etc/nixos-flakes/config.toml`.
+      '';
     };
 
     user = mkOption {
@@ -131,24 +175,27 @@ in
         description = ''
           Utilisateur autorisé à écrire dans le dépôt système (`systemRepo.path`) sans
           être root, par exemple pour que la GUI lance `nix flake update` et valide
-          `flake.lock`. Le dépôt reste la propriété de root : on accorde une ACL
-          (lecture/écriture, héritée par les nouveaux fichiers) via systemd-tmpfiles,
+          `flake.lock`. Quand le dépôt appartient à root (par exemple `/etc/nixos`), on accorde une
+          ACL (lecture/écriture, héritée par les nouveaux fichiers) via systemd-tmpfiles,
           et git accepte ce dépôt (`safe.directory`, chemin exact, jamais `*`).
           Nécessite un système de fichiers avec ACL (ext4, btrfs, xfs…).
+          Quand `systemRepo.path` est dans le dossier personnel de cet utilisateur, il en est
+          déjà propriétaire : aucune ACL n'est posée.
           `null` : aucune modification des droits.
         '';
       };
 
       path = mkOption {
-        type = types.str;
+        type = absPath;
         default = cfg.flakePath;
         defaultText = lib.literalExpression "config.services.nixos-flakes.flakePath";
-        description = "Chemin du dépôt système concerné par `systemRepo.owner`.";
+        example = "/home/alice/nixos-config";
+        description = "Chemin absolu du dépôt système concerné par `systemRepo.owner`.";
       };
     };
 
     githubTokenFile = mkOption {
-      type = types.nullOr types.str;
+      type = types.nullOr absPath;
       default = null;
       example = "/run/secrets/github-token";
       description = ''
@@ -179,6 +226,11 @@ in
   };
 
   config = lib.mkMerge [
+    (lib.mkIf (cfg.enable || cfg.gui.enable || cfg.interval != null) {
+      # Dépôt système par défaut de la machine : l'emplacement n'est pas figé à /etc/nixos.
+      environment.etc."nixos-flakes/config.toml".text = systemDefaults;
+    })
+
     (lib.mkIf cfg.enable {
       environment.systemPackages = [ cfg.package ];
 
@@ -187,14 +239,19 @@ in
         wantedBy = [ "graphical-session.target" ];
         partOf = [ "graphical-session.target" ];
         after = [ "graphical-session.target" ];
-        unitConfig = lib.optionalAttrs (cfg.user != null) {
+        unitConfig = {
+          # Au plus 5 démarrages en 60 s : évite une boucle de redémarrage serrée.
+          StartLimitIntervalSec = 60;
+          StartLimitBurst = 5;
+        }
+        // lib.optionalAttrs (cfg.user != null) {
           # Réservé à l'utilisateur configuré ; les autres sessions ne le lancent pas.
           ConditionUser = cfg.user;
         };
         # Binaires externes (git, nix, notify-send) résolus via PATH.
         path = [
           pkgs.git
-          pkgs.nix
+          config.nix.package
           pkgs.libnotify
         ];
         environment = lib.optionalAttrs (cfg.githubTokenFile != null) {
@@ -214,6 +271,8 @@ in
           Restart = "on-failure";
           # Si WAYLAND_DISPLAY ou le bus ne sont pas encore prêts, on retente un peu plus tard.
           RestartSec = 2;
+          TimeoutStopSec = 10;
+          # Ni NoNewPrivileges ni filtre seccomp : le démon lance pkexec et la GUI.
         };
       };
     })
@@ -232,33 +291,46 @@ in
         description = "Mise à niveau automatique du système NixOS via flakes";
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        # Ne jamais redémarrer le service en plein `switch` (il se tuerait lui-même).
+        restartIfChanged = false;
         # Les binaires externes (git, nix, nixos-rebuild, notify-send) sont résolus via PATH.
         path = [
           pkgs.git
-          pkgs.nix
-          pkgs.nixos-rebuild
+          config.nix.package
+          config.system.build.nixos-rebuild
           pkgs.libnotify
         ];
-        environment =
-          lib.optionalAttrs (cfg.user != null) {
-            GIT_CONFIG_COUNT = "1";
-            GIT_CONFIG_KEY_0 = "safe.directory";
-            GIT_CONFIG_VALUE_0 = cfg.flakePath;
-          }
-          // lib.optionalAttrs (cfg.githubTokenFile != null) {
-            NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
-          };
+        environment = {
+          # root lit un dépôt qui peut appartenir à l'utilisateur : git l'accepte (chemin exact).
+          GIT_CONFIG_COUNT = "1";
+          GIT_CONFIG_KEY_0 = "safe.directory";
+          GIT_CONFIG_VALUE_0 = cfg.flakePath;
+        }
+        // lib.optionalAttrs (cfg.githubTokenFile != null) {
+          NIXOS_FLAKES_GITHUB_TOKEN_FILE = cfg.githubTokenFile;
+        };
         serviceConfig = {
           Type = "oneshot";
-          ExecStart = "${lib.getExe cfg.package} upgrade --notify ${lib.escapeShellArg cfg.flakePath}";
+          # Reconstruction longue possible, mais pas indéfinie.
+          TimeoutStartSec = "6h";
+          # Travail de fond. Aucun bac à sable : le service doit pouvoir tout faire.
+          Nice = 10;
+          IOSchedulingClass = "idle";
+          ExecStart =
+            "${lib.getExe cfg.package} upgrade --notify"
+            + lib.optionalString (cfg.flakeAttr != null) " --attr ${lib.escapeShellArg cfg.flakeAttr}"
+            + " ${lib.escapeShellArg cfg.flakePath}";
           # /var/lib/nixos-flakes/status.json : état de la dernière exécution, lu par le démon
           # de session (d'où le dossier lisible par tous).
           StateDirectory = "nixos-flakes";
           StateDirectoryMode = "0755";
         }
         // lib.optionalAttrs (cfg.user != null) {
-          # `+` : exécuté avec tous les privilèges, même après un échec de l'upgrade.
-          ExecStopPost = "-+${pkgs.coreutils}/bin/chown ${lib.escapeShellArg cfg.user} ${lib.escapeShellArg "${cfg.flakePath}/flake.lock"}";
+          # `+` : exécuté avec tous les privilèges, même après un échec ou un kill de l'upgrade
+          # (le garde de propriétaire de nixos-flakes ne tourne alors pas). `flake.lock` est dans un
+          # dépôt que l'utilisateur contrôle : `find` (sans suivre de lien) ne retient que le
+          # fichier régulier, et `chown -h` ne suit jamais un lien. Un lien symbolique est ignoré.
+          ExecStopPost = "-+${pkgs.findutils}/bin/find ${lib.escapeShellArg "${cfg.flakePath}/flake.lock"} -maxdepth 0 -type f -exec ${pkgs.coreutils}/bin/chown -h ${lib.escapeShellArg cfg.user} {} +";
         };
       };
 
@@ -272,16 +344,23 @@ in
       };
     })
 
-    (lib.mkIf (cfg.systemRepo.owner != null) {
+    (lib.mkIf (cfg.systemRepo.owner != null && !repoOwnedByOwner) {
+      # Chemin absent (pas encore créé) : systemd-tmpfiles ignore silencieusement la ligne.
       systemd.tmpfiles.rules = [
         # `A+` : ACL récursive (X = exécution sur les dossiers seulement) ; `d:` = ACL par défaut
         # héritée par les nouveaux fichiers.
         "A+ ${cfg.systemRepo.path} - - - - u:${cfg.systemRepo.owner}:rwX,d:u:${cfg.systemRepo.owner}:rwX"
       ];
+    })
 
+    # root (service de mise à niveau) et les outils lisent un dépôt qui n'est pas à lui : git et
+    # nix (libgit2, qui lit /etc/gitconfig) doivent l'accepter malgré le propriétaire différent.
+    (lib.mkIf (cfg.systemRepo.owner != null || cfg.user != null) {
       programs.git = {
         enable = true;
-        config.safe.directory = [ cfg.systemRepo.path ];
+        config.safe.directory = lib.unique (
+          [ cfg.flakePath ] ++ lib.optional (cfg.systemRepo.owner != null) cfg.systemRepo.path
+        );
       };
     })
 
@@ -291,6 +370,21 @@ in
 
     {
       assertions = [
+        {
+          assertion = cfg.user == null || hasUser cfg.user;
+          message = "services.nixos-flakes.user = \"${toString cfg.user}\" n'existe pas dans users.users.";
+        }
+        {
+          assertion = cfg.systemRepo.owner == null || hasUser cfg.systemRepo.owner;
+          message = "services.nixos-flakes.systemRepo.owner = \"${toString cfg.systemRepo.owner}\" n'existe pas dans users.users.";
+        }
+        {
+          assertion =
+            cfg.systemRepo.owner == null
+            || repoOwnedByOwner
+            || builtins.match "[^[:space:],:]+" cfg.systemRepo.path != null;
+          message = "services.nixos-flakes.systemRepo.path ne doit contenir ni espace, ni `:`, ni `,` quand une ACL est posée (règle systemd-tmpfiles/ACL ; hors du dossier personnel de systemRepo.owner).";
+        }
         {
           assertion = !cfg.gui.enable || cfg.enable;
           message = "services.nixos-flakes.gui.enable nécessite services.nixos-flakes.enable (l'interface se connecte au démon).";

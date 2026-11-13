@@ -28,7 +28,7 @@ stdenvNoCC.mkDerivation {
   meta = with lib; {
     description = "Extension Firefox/Zen : télécharge les images et vidéos visibles à l'écran (xpi non signé, à usage de test/ESR)";
     homepage = "https://github.com/untypequicode/nixos-flakes";
-    license = licenses.gpl3Only;
+    license = licenses.gpl3Plus;
     platforms = platforms.all;
   };
 }

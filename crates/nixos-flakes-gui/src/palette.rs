@@ -1,5 +1,6 @@
 //! Palette de commandes : éléments, filtrage flou, sélection. Logique pure.
 
+use crate::model::RoleAction;
 use std::path::PathBuf;
 
 /// Action déclenchée par un élément de la palette.
@@ -10,9 +11,24 @@ pub enum Command {
     CheckAll,
     Update,
     Apply,
+    Push,
+    /// Changement de rôle du dépôt sélectionné (confirmé si nécessaire).
+    Role(RoleAction),
     Settings,
+    /// Ouvre les réglages sur le champ du dépôt système.
+    SetSystemRepo,
+    Packages,
+    Terminal,
     Rescan,
     ToggleConsole,
+    /// `git pull` du dépôt système.
+    SyncPull,
+    /// `git fetch` du dépôt système.
+    SyncFetch,
+    /// Vérification immédiate demandée au démon.
+    DaemonCheck,
+    /// Aide des raccourcis clavier.
+    Help,
 }
 
 /// Une ligne de la palette.
@@ -193,6 +209,28 @@ mod tests {
         let a = score("mj", "Mettre à jour").unwrap();
         let b = score("mj", "Aimerajouter").unwrap_or(i32::MIN);
         assert!(a > b);
+    }
+
+    #[test]
+    fn new_commands_are_findable_by_name() {
+        let mut items = sample();
+        items.push(item(Command::Packages, "Paquets", ""));
+        items.push(item(Command::Terminal, "Terminal", ""));
+        items.push(item(Command::Help, "Raccourcis clavier", ""));
+        items.push(item(Command::DaemonCheck, "Vérifier via le démon", ""));
+        items.push(item(Command::Role(RoleAction::Ignore), "Ignorer", "nixos"));
+        items.push(item(Command::SyncPull, "Synchroniser", ""));
+        assert_eq!(filter(&items, "paq")[0].command, Command::Packages);
+        assert_eq!(filter(&items, "racc")[0].command, Command::Help);
+        assert_eq!(filter(&items, "clavier")[0].command, Command::Help);
+        assert_eq!(filter(&items, "demon")[0].command, Command::DaemonCheck);
+        assert_eq!(
+            filter(&items, "ignor")[0].command,
+            Command::Role(RoleAction::Ignore)
+        );
+        assert_eq!(filter(&items, "sync")[0].command, Command::SyncPull);
+        // Aucune troncature : tous les éléments sont rendus, la liste défile.
+        assert_eq!(filter(&items, "").len(), items.len());
     }
 
     #[test]
